@@ -2441,6 +2441,21 @@ export default defineComponent({
   },
   watch: {
     /**
+     * 进壁纸模式就先把所有弹窗收掉
+     *
+     * 踩过：壁纸模式下窗口在桌面层、标题栏和控制栏都隐藏了，弹窗却还开着 ——
+     * 它既点不动也关不掉，用户只能先回窗口模式关掉它再重新进壁纸模式。
+     * 所以只要 `wallpaperEnabled` 变 true，就把列表 / 歌单管理 / 设置 / 关于 / 添加视频全关掉。
+     */
+    wallpaperEnabled(enabled: boolean): void {
+      if (!enabled) return;
+      this.listType = 'none';
+      this.playlistManagerVisible = false;
+      this.settingsVisible = false;
+      this.aboutVisible = false;
+      this.addVideoVisible = false;
+    },
+    /**
      * 配置可能在别处被改动（多窗口同步、托盘、恢复默认），
      * 所以要把 Pinia 里的音量/静音同步回本地播放状态，并作用到 <video> 上。
      *

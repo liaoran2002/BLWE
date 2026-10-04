@@ -26,7 +26,6 @@ import {
   initSetting,
   flushSetting,
   getSetting,
-  updateSetting,
   onSettingChange,
 } from './utils/setting'
 import * as biliApi from './biliApi'
@@ -513,9 +512,17 @@ async function toggleWallpaper(): Promise<boolean> {
   if (!asWallpaper || !mainWindow || mainWindow.isDestroyed()) return wallpaperEnabled
   wallpaperEnabled = !wallpaperEnabled
 
-  // 同步写回配置，这样下次启动能记住壁纸模式（配置由主进程持有）
-  updateSetting({ 'common.wallpaperMode': wallpaperEnabled })
-
+  /**
+   * **不再**顺手改写「启动时进入桌面壁纸模式」
+   *
+   * 踩过：这里原来每次都 `updateSetting({'common.wallpaperMode': wallpaperEnabled})`，
+   * 于是用按钮/托盘切一下壁纸模式，设置里那个「启动时进入」开关就跟着自己翻 ——
+   * 用户看到的是「我没动它，它自己打开了」，而且下次开机会莫名进壁纸模式。
+   *
+   * 现在两件事分开：
+   *  - 按钮/托盘 = 这次运行进不进壁纸（`wallpaperEnabled`，不落盘）；
+   *  - 设置里那个开关 = 要不要**开机就进**，改动由 onSettingChange 实时应用（见下）。
+   */
   await applyWallpaperMode(wallpaperEnabled)
 
   sendToMain('wallpaper:state', wallpaperEnabled)
@@ -1120,7 +1127,14 @@ void app.whenReady().then(async () => {
   initSetting()
   initPlaylists()
 
-  // 配置变化时同步托盘菜单（例如壁纸模式被另一处改动）
+  /**
+   * 配置变化时同步托盘菜单
+   *
+   * 注意「启动时进入桌面壁纸模式」这个 key **故意什么都不做**：
+   * 它是「下次开机进不进壁纸」的开关，不该在打开/关闭的瞬间改变当前状态
+   * （用户明确要求：打开这个开关也不要立刻进壁纸模式）。
+   * 当前状态只由按钮/托盘切换（`toggleWallpaper`），那边也**不回写**这个设置 —— 两件事互不干涉。
+   */
   onSettingChange(() => {
     refreshTray()
   })
