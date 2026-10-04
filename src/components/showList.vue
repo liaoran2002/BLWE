@@ -34,11 +34,32 @@
         <!-- 中：标题 + 项数 -->
         <div class="lt-center">
           <span class="lt-name">{{ title }}</span>
-          <span class="lt-count">{{ list.length }} 项</span>
+          <span class="lt-count">{{ countText }}</span>
         </div>
-        <!-- 右：加号（只有视频列表有，打开「添加视频」） -->
+        <!--
+          右：歌曲列表是「放大镜 -> 点开搜索框」，视频列表是加号
+          选中一首之后会自动清空并收回放大镜（见 onItemClick）
+        -->
         <div class="lt-side lt-end">
-          <button v-if="!isSongList" class="lt-icon" title="添加视频" @click="$emit('addVideo')">
+          <template v-if="isSongList">
+            <el-input
+              v-if="searchOpen"
+              ref="searchInput"
+              v-model="keyword"
+              size="small"
+              class="lt-search"
+              placeholder="搜索歌名 / 歌手 / 专辑"
+              clearable
+              @keydown.esc.stop="closeSearch"
+            />
+            <button v-else class="lt-icon" title="搜索歌曲" @click="openSearch">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+                <circle cx="7.2" cy="7.2" r="4.4" />
+                <path d="M10.6 10.6L13.6 13.6" />
+              </svg>
+            </button>
+          </template>
+          <button v-else class="lt-icon" title="添加视频" @click="$emit('addVideo')">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
               <path d="M8 3.2v9.6M3.2 8h9.6" />
             </svg>
@@ -50,20 +71,20 @@
     <div id="songListPanel" class="listBody" ref="listBody">
       <ul class="lists">
         <li
-          v-for="(item, index) in list"
-          :key="index"
-          :ref="(el) => setItemRef(index, el)"
-          :class="{ active: index === currentIndex }"
-          @click="onItemClick(item, index)"
+          v-for="row in rows"
+          :key="row.index"
+          :ref="(el) => setItemRef(row.index, el)"
+          :class="{ active: row.index === currentIndex }"
+          @click="onItemClick(row.item, row.index)"
         >
-          <div class="index">{{ index + 1 }}</div>
+          <div class="index">{{ row.index + 1 }}</div>
 
           <!-- 封面：歌单取平台专辑图，视频取 B 站缩略图 -->
           <div class="cover">
             <img
-              v-if="coverOf(item) && !failedCovers[coverOf(item) as string]"
-              :src="coverOf(item) as string"
-              :alt="nameOf(item)"
+              v-if="coverOf(row.item) && !failedCovers[coverOf(row.item) as string]"
+              :src="coverOf(row.item) as string"
+              :alt="nameOf(row.item)"
               referrerpolicy="no-referrer"
               loading="lazy"
               @error="onCoverError($event)"
@@ -85,17 +106,17 @@
 
           <!-- 文本区 -->
           <div class="meta">
-            <div class="title" :title="plainTitleOf(item)" v-html="titleHtmlOf(item)"></div>
+            <div class="title" :title="plainTitleOf(row.item)" v-html="titleHtmlOf(row.item)"></div>
             <div class="sub">
-              <span v-if="singerOf(item)" class="singer">{{ singerOf(item) }}</span>
-              <span v-if="albumOf(item)" class="album" :title="albumOf(item)">
-                {{ albumOf(item) }}
+              <span v-if="singerOf(row.item)" class="singer">{{ singerOf(row.item) }}</span>
+              <span v-if="albumOf(row.item)" class="album" :title="albumOf(row.item)">
+                {{ albumOf(row.item) }}
               </span>
             </div>
           </div>
 
           <!-- 时长 -->
-          <div v-if="durationOf(item)" class="duration">{{ durationOf(item) }}</div>
+          <div v-if="durationOf(row.item)" class="duration">{{ durationOf(row.item) }}</div>
 
           <!--
             收藏（空心爱心 / 实心爱心）：只在视频列表里出现
@@ -104,15 +125,15 @@
           <div
             v-if="!isSongList"
             class="fav"
-            :class="{ on: isFav(item) }"
-            :title="isFav(item) ? '取消收藏' : '收藏'"
-            @click.stop="$emit('toggleFavorite', bvidOf(item))"
+            :class="{ on: isFav(row.item) }"
+            :title="isFav(row.item) ? '取消收藏' : '收藏'"
+            @click.stop="$emit('toggleFavorite', bvidOf(row.item))"
           >
             <svg
               width="15"
               height="15"
               viewBox="0 0 16 16"
-              :fill="isFav(item) ? 'currentColor' : 'none'"
+              :fill="isFav(row.item) ? 'currentColor' : 'none'"
               stroke="currentColor"
               stroke-width="1.4"
               stroke-linejoin="round"
@@ -120,6 +141,10 @@
               <path d="M8 13.1S2.3 9.7 2.3 6.2c0-1.7 1.3-3 3-3 1.2 0 2.2.7 2.7 1.7.5-1 1.5-1.7 2.7-1.7 1.7 0 3 1.3 3 3 0 3.5-5.7 6.9-5.7 6.9z" />
             </svg>
           </div>
+        </li>
+        <!-- 过滤之后一条都不剩：给个明确交代，别让人以为列表空了 -->
+        <li v-if="rows.length === 0" class="empty">
+          {{ isSongList && keyword.trim() ? '没有匹配的歌曲' : '列表是空的' }}
         </li>
       </ul>
     </div>
@@ -232,6 +257,15 @@ export default defineComponent({
       /** 刷新图标正在转圈（0.5s） */
       spinning: false,
       _spinTimer: null as ReturnType<typeof setTimeout> | null,
+      /**
+       * 歌曲列表的过滤词（配合 searchOpen 使用）
+       *
+       * 只在歌曲列表生效（视频列表右上角是加号）；
+       * 与歌单管理里的过滤保持一致：匹配 歌名 / 歌手 / 专辑。
+       */
+      keyword: '',
+      /** 搜索框是不是展开着（收起时显示放大镜图标） */
+      searchOpen: false,
       itemRefs: {} as Record<number, HTMLElement>,
       /**
        * 加载失败的封面地址集合
@@ -274,12 +308,43 @@ export default defineComponent({
     isSongList(): boolean {
       return this.listType === 'list';
     },
+    /**
+     * 实际渲染的行
+     *
+     * 带着**原始下标**一起给模板：列表点击、高亮、「第几首」都必须用原始下标，
+     * 否则过滤之后点第 1 行会去播整张歌单里的第 1 首（而不是过滤结果里的第 1 首）。
+     */
+    rows(): { item: ListItem; index: number }[] {
+      const all = this.list.map((item, index) => ({ item, index }));
+      if (!this.isSongList) return all;
+      const kw = this.keyword.trim().toLowerCase();
+      if (!kw) return all;
+      return all.filter(({ item }) => {
+        const song = item as PlaylistSong;
+        return (
+          (song.name ?? '').toLowerCase().includes(kw) ||
+          (song.singer ?? '').toLowerCase().includes(kw) ||
+          (song.album ?? '').toLowerCase().includes(kw)
+        );
+      });
+    },
+    /** 头部计数：过滤时显示「命中 / 总数」 */
+    countText(): string {
+      if (this.isSongList && this.keyword.trim()) {
+        return `${this.rows.length} / ${this.list.length} 项`;
+      }
+      return `${this.list.length} 项`;
+    },
   },
   watch: {
     listType(val: string) {
       if (val !== 'none') {
         // 弹窗挂载 + 过渡要一点时间，等一拍再滚到当前项
         setTimeout(() => this.scrollToActive(), 120);
+      } else {
+        // 关掉时收起搜索并清掉过滤词：下次打开是完整列表 + 放大镜
+        this.keyword = '';
+        this.searchOpen = false;
       }
     },
   },
@@ -358,19 +423,52 @@ export default defineComponent({
       });
       this.$emit('refresh');
     },
+    /** 展开搜索框并聚焦（放大镜点一下） */
+    openSearch(): void {
+      this.searchOpen = true;
+      void this.$nextTick(() => {
+        const input = this.$refs.searchInput as { focus?: () => void } | undefined;
+        input?.focus?.();
+      });
+    },
+    /** 收起搜索：清空过滤词，回到放大镜状态 */
+    closeSearch(): void {
+      this.keyword = '';
+      this.searchOpen = false;
+    },
     onItemClick(item: ListItem, index: number) {
-      if (this.isSongList) this.$emit('changeSong', index);
-      else this.$emit('changeVideo', (item as VideoListItem).bvid, this.title);
+      if (this.isSongList) {
+        this.$emit('changeSong', index);
+        this.closeSearch();
+        /**
+         * 收回搜索后，滚到**刚点的这首**（不是 currentIndex）
+         *
+         * 踩过两次：
+         *  1. 不滚的话，浏览器保住滚动锚点，点的那行被钉在列表顶部，看着像「它变成了第一首」；
+         *  2. 滚 `currentIndex` 也不行 —— 那是父组件的 prop，切歌是异步的，
+         *     这一刻它还是**上一首**的下标，于是滚到了上一首的位置（用户反馈：没滚到正在播的这首）。
+         * 自己点的下标是确定的，直接用它；再补一次延迟滚动，防父组件稍后重渲染把位置带偏。
+         */
+        const scrollToPicked = (): void => this.scrollToIndex(index, false);
+        void this.$nextTick(() => {
+          scrollToPicked();
+          setTimeout(scrollToPicked, 120);
+        });
+        return;
+      }
+      this.$emit('changeVideo', (item as VideoListItem).bvid, this.title);
     },
     /** el-dialog 关掉时（点空白处 / Esc）通知父组件把 listType 置回 none */
     onVisibleChange(visible: boolean): void {
       if (!visible) this.$emit('showList', 'none');
     },
+    /** 把第 index 行滚进视野（默认居中、平滑） */
+    scrollToIndex(index: number, smooth = true): void {
+      const el = this.itemRefs[index];
+      if (el) el.scrollIntoView({ block: 'center', behavior: smooth ? 'smooth' : 'auto' });
+    },
     scrollToActive() {
-      const el = this.itemRefs[this.currentIndex];
-      if (el) {
-        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      }
+      this.scrollToIndex(this.currentIndex);
     },
   },
 });
@@ -402,6 +500,10 @@ export default defineComponent({
 }
 .lt-end {
   justify-content: flex-end;
+}
+/* 歌曲列表右上角的搜索框（和歌单管理里那个一样的作用） */
+.lt-search {
+  width: 180px;
 }
 .lt-center {
   display: flex;
@@ -478,6 +580,13 @@ export default defineComponent({
 .listBody {
   max-height: 56vh;
   overflow-y: auto;
+  /*
+   * 关掉滚动锚定
+   *
+   * 过滤时行数从 200+ 变成几行、再变回来，浏览器会「保住锚点」自己跳位置，
+   * 表现就是被点的那一行顶在列表最上面（看着像它变成了第一首）。定位我们自己做。
+   */
+  overflow-anchor: none;
 }
 
 .lists {
@@ -593,6 +702,17 @@ export default defineComponent({
   font-size: 11px;
   opacity: 0.6;
   font-variant-numeric: tabular-nums;
+}
+
+/* 过滤后一条都不剩 / 列表本身为空 */
+.lists li.empty {
+  justify-content: center;
+  font-size: 12px;
+  opacity: 0.55;
+  cursor: default;
+}
+.lists li.empty:hover {
+  background: transparent;
 }
 
 .lists li:nth-child(2n) .index {

@@ -469,6 +469,15 @@ async function applyWallpaperMode(enabled: boolean): Promise<void> {
       console.error('[wallpaper] attach 失败:', err)
     }
 
+    /**
+     * 壁纸模式 = 没有任务栏按钮
+     *
+     * 窗口这时是「桌面的一部分」，留在任务栏上就像多开了一个程序（用户的要求：
+     * 和最小化到托盘一样干净）。要回到窗口模式走托盘：左键单击图标 =
+     * `restoreWindow()`，或右键菜单里的「窗口模式」。
+     */
+    mainWindow.setSkipTaskbar(true)
+
     // 4) 刷新托盘提示（壁纸模式下操作都在托盘菜单里）
     applyTrayMode()
   } else {
@@ -485,6 +494,8 @@ async function applyWallpaperMode(enabled: boolean): Promise<void> {
     }
 
     mainWindow.setVisibleOnAllWorkspaces(false)
+    // 任务栏按钮恢复（进入壁纸模式时被 setSkipTaskbar(true) 摘掉了）
+    mainWindow.setSkipTaskbar(false)
 
     // 等壁纸层把窗口还回来，再还原尺寸，否则 setBounds 会被忽略
     await new Promise((resolve) => setTimeout(resolve, 80))
@@ -706,8 +717,14 @@ function refreshTray(): void {
   if (!tray || tray.isDestroyed()) return
   // 视频标题里可能带 B 站搜索的 <em> 高亮标签，托盘提示要的是纯文本
   const title = (trayTitle || '未在播放').replace(/<[^>]*>/g, '').trim() || '未在播放'
+  /**
+   * 悬浮提示要说**现在的**左键行为
+   *
+   * 踩过：左键早就从「播放 / 暂停」改成「回到窗口」了，壁纸模式这句提示还留着旧文案，
+   * 用户按提示点了一下，结果窗口直接跳出来 —— 提示与实际不一致比没有提示更糟。
+   */
   const tip = wallpaperEnabled
-    ? `BiLiMusicVideo-desktop · 壁纸模式\n${title}\n单击：播放 / 暂停　右键：菜单（媒体键可切歌）`
+    ? `BiLiMusicVideo-desktop · 壁纸模式\n${title}\n单击：回到窗口　右键：菜单`
     : `BiLiMusicVideo-desktop\n${title}\n单击：显示窗口　右键：菜单`
   if (tip !== lastTrayTip) {
     tray.setToolTip(tip)

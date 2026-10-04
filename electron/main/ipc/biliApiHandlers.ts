@@ -52,12 +52,17 @@ interface SearchPayload {
 }
 
 /**
+ * 「缓存地址已过期」的原因
+ *
+ * 直链寿命约 2 小时、缓存却有 3 天，隔一阵再听就会成片过期
+ */
+
+/**
  * 取 durl（渐进式 mp4）地址
  *
  * dash 的双轨不在这里处理 —— 它需要两条流一起给，见 `extractDashStreams`。
  */
-const extractDurl = (playData: BiliApiResponse | undefined): string | null => {
-  const durl = (playData?.data as { durl?: Array<{ url?: string }> } | undefined)?.durl
+const extractDurl = (playData: BiliApiResponse | undefined): string | null => {  const durl = (playData?.data as { durl?: Array<{ url?: string }> } | undefined)?.durl
   const url = durl?.[0]?.url
   return typeof url === 'string' && url ? url : null
 }
@@ -243,7 +248,11 @@ export const registerApiHandlers = (context: ApiContext): void => {
             console.log('[video] 缓存的地址是未登录时取的，现已登录，重新解析:', bvid)
           }
           if (!urlUsable && (cachedDurl || cachedDash)) {
-            console.log('[video] 缓存的播放地址已过期，重新解析:', bvid)
+            /**
+             * 这条是**预期内**的，不是故障：实测 B 站直链签名寿命中位正好 120 分钟，而搜索缓存默认留 3 天。
+             * 所以「隔一阵再听」必然碰到，重新解析即可 —— 不解析反而会拿死链去播。
+             */
+            console.log(`[video] 缓存地址已过期，重新解析:`, bvid)
           }
           if (needDashUpgrade) {
             console.log(

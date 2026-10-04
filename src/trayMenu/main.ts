@@ -245,6 +245,7 @@ const paintVolume = (v: number, muted: boolean): void => {
   volumeThumb.style.left = `${v}%`
   volumeNum.textContent = String(v)
   volumeBtn.className = muted || v <= 0 ? 'iconfont icon-sound-off' : 'iconfont icon-sound-on'
+  volumeBtn.title = muted || v <= 0 ? '取消静音' : '静音'
 }
 
 const volumeFromEvent = (e: PointerEvent): number => {
@@ -302,16 +303,21 @@ volumeBtn.addEventListener('mouseup', (e) => {
 
 // #region 四个控制按钮
 
-const bind = (el: HTMLElement, action: TrayMenuAction): void => {
+const bind = (el: HTMLElement, action: TrayMenuAction, title?: string): void => {
+  if (title) el.title = title
   el.addEventListener('mouseup', (e) => {
     if (e.button !== 0) return
     void api.trayMenuAction(action)
   })
 }
-bind(prevBtn, 'prev')
+bind(prevBtn, 'prev', '上一首')
 bind(playBtn, 'playControl')
-bind(nextBtn, 'next')
+bind(nextBtn, 'next', '下一首')
 bind(modeBtn, 'toggleMode')
+// 播放按钮的提示要跟着状态走（悬停提示写错比没有更误导）
+playBtn.title = '播放 / 暂停'
+volumeBtn.title = '静音 / 取消静音'
+seekTrack.title = '拖动跳转到指定位置'
 
 const MODE_ICONS = ['icon-liebiaoxunhuan', 'icon-danquxunhuan', 'icon-suijibofang']
 
@@ -323,8 +329,9 @@ const apply = (state: TrayMenuState): void => {
   titleEl.textContent = state.title || '未在播放'
   titleEl.title = state.title || ''
   playBtn.className = `iconfont ${state.paused ? 'icon-play' : 'icon-pause'}`
+  playBtn.title = state.paused ? '播放' : '暂停'
   modeBtn.className = `iconfont ${MODE_ICONS[state.loopModeIndex] ?? MODE_ICONS[0]}`
-  modeBtn.title = state.loopModeName
+  modeBtn.title = `当前：${state.loopModeName}（点击切换）`
   volValue = state.volume
   if (state.volume > 0) lastNonZeroVol = state.volume
   if (!volDragging) paintVolume(state.volume, state.muted)
