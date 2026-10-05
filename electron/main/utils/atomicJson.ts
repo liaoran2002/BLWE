@@ -35,5 +35,20 @@ export const writeJsonAtomic = (
       throw err
     }
   }
-  fs.renameSync(tempPath, filePath)
+  try {
+    fs.renameSync(tempPath, filePath)
+  } catch (err) {
+    /**
+     * rename 失败（Windows 上被杀软/其它进程占住很常见）要把临时文件清掉
+     *
+     * 否则残骸会一直堆在 userData 里，而且它的名字以 `.temp` 结尾 ——
+     * 缓存那套清理/统计全按 `.json` 过滤，既看不见也清不掉。
+     */
+    try {
+      fs.unlinkSync(tempPath)
+    } catch {
+      /* 删不掉就算了，别把原始错误盖掉 */
+    }
+    throw err
+  }
 }

@@ -31,6 +31,12 @@ import {
 import * as biliApi from './biliApi'
 import { initPlaylists, flushPlaylists } from './utils/playlist'
 import { PLAY_LOOP_MODES } from '@common/constants'
+import {
+  installProtectedProtocol,
+  protectionEnabled,
+  protectedRendererUrl,
+  registerProtectedScheme,
+} from './protection'
 import type { IpcEvent, IpcEventPayload, TrayMenuAction, TrayMenuState } from '@common/types/ipc'
 
 // electron-as-wallpaper 是原生模块，且只在 Windows 有意义，加载失败不应该影响主功能
@@ -168,6 +174,9 @@ function createMainWindow(): void {
 
   if (isDev && process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  } else if (protectionEnabled()) {
+    // 打包后渲染层产物是加密的，走自定义协议边解密边喂给页面
+    void mainWindow.loadURL(protectedRendererUrl('index.html'))
   } else {
     void mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
@@ -181,7 +190,11 @@ function createMainWindow(): void {
    * 而渲染层现在没有任何站外跳转需求 —— 打开外链一律走 `app:openExternal`。
    */
   const appOrigin =
-    isDev && process.env.ELECTRON_RENDERER_URL ? process.env.ELECTRON_RENDERER_URL : 'file://'
+    isDev && process.env.ELECTRON_RENDERER_URL
+      ? process.env.ELECTRON_RENDERER_URL
+      : protectionEnabled()
+        ? protectedRendererUrl('')
+        : 'file://'
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!url.startsWith(appOrigin)) {
       event.preventDefault()
@@ -195,14 +208,13 @@ function createMainWindow(): void {
     if (!mainWindow) return
     mainWindow.show()
     // 配置里的壁纸模式优先，命令行 --wallpaper-mode 作为兜底
-    wallpaperEnabled =
+    const wantWallpaper =
       getSetting()['common.wallpaperMode'] || process.argv.includes('--wallpaper-mode')
-    if (wallpaperEnabled) {
+    if (wantWallpaper) {
       // 开机即壁纸模式：applyWallpaperMode 会把此刻的普通窗口尺寸记成还原点，
-      // 这样用户切回「应用程序」时能还原成正常窗口而不是被困在全屏
-      void applyWallpaperMode(true).then(() => {
-        sendToMain('wallpaper:state', true)
-      })
+      // 这样用户切回「窗口模式」时能还原成正常窗口而不是被困在全屏。
+      // 走 setWallpaperMode（唯一入口）：它会广播状态、也会和用户在启动瞬间的点击串行化。
+      void setWallpaperMode(true)
     }
   })
 
@@ -432,8 +444,8 @@ const captureWallpaperRestore = (): void => {
  *     （原本是全屏就回到全屏，原本是最大化就回到最大化），
  *     不会再出现「退不出去的全屏」。
  */
-async function applyWallpaperMode(enabled: boolean): Promise<void> {
-  if (!mainWindow || mainWindow.isDestroyed()) return
+async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
+  if (!mainWindow || mainWindow.isDestroyed()) return false
 
   if (enabled) {
     // 1) 先记住进入前的状态（已有记录则保留更早的那个）
@@ -466,6 +478,28 @@ async function applyWallpaperMode(enabled: boolean): Promise<void> {
       })
     } catch (err) {
       console.error('[wallpaper] attach 失败:', err)
+    }
+
+    /**
+     * attach 之后校验一下**真的挂上了没有**
+     *
+     * 库会在窗口上写 `wallpaperState.isAttached`（见
+     * node_modules/electron-as-wallpaper/dist/main.js:23）。只看有没有抛异常是不够的：
+     * 静默失败时窗口已经处于「解除宽高比 + 铺满 + 置顶 + 无任务栏按钮」的状态，
+     * 却不在壁纸层 —— 用户得到的是一块盖住桌面、又没法从任务栏找回来的普通窗口，
+     * 而托盘和渲染层都还显示「壁纸模式」。
+     * 这种情况直接回滚成窗口模式，别把状态留在半空中。
+     */
+    if (!mainWindow.wallpaperState?.isAttached) {
+      console.error('[wallpaper] attach 没有生效，回滚到窗口模式')
+      mainWindow.setSkipTaskbar(false)
+      mainWindow.setAlwaysOnTop(false)
+      mainWindow.setVisibleOnAllWorkspaces(false)
+      exitWallpaperGeometry()
+      isFullScreen = false
+      applyTrayMode()
+      // 状态由调用方（setWallpaperMode）按返回值纠正，这里不自己改 wallpaperEnabled
+      return false
     }
 
     /**
@@ -506,27 +540,49 @@ async function applyWallpaperMode(enabled: boolean): Promise<void> {
 
   // 通知渲染进程同步状态（全屏标志可能变了）
   syncFullScreenState()
+  return true
+}
+
+/**
+ * 切换壁纸模式的**唯一入口**（串行 + 合并）
+ *
+ * 踩过：`toggleWallpaper` 先翻转 `wallpaperEnabled` 再 `await applyWallpaperMode`，
+ * 全程没有互斥 —— 连点（标题栏按钮 + 托盘项）或与「开机即壁纸」那次启动 apply 相撞时，
+ * 两次 apply 会交错：先进壁纸的那次在 120ms 延时后才 attach，而退出的那次早已 detach
+ * 并还原几何，最后 `wallpaperEnabled = false` 但窗口真的挂在桌面层、任务栏按钮也没了 ——
+ * 状态与实际长期漂移，托盘左键（按标志判断）还救不回来。
+ *
+ * 现在：目标状态记在 `wallpaperWant`，同一时刻只跑一个 apply；跑完回头再看一眼
+ * 「期间有没有被改成别的目标」，有就再跑一次 —— 即「以最后一次目标为准」。
+ */
+let wallpaperBusy = false
+let wallpaperWant: boolean | null = null
+
+async function setWallpaperMode(want: boolean): Promise<void> {
+  wallpaperWant = want
+  if (wallpaperBusy) return
+  wallpaperBusy = true
+  try {
+    while (wallpaperWant !== null) {
+      const target = wallpaperWant
+      wallpaperWant = null
+      wallpaperEnabled = target
+      // 失败（attach 没生效）时 applyWallpaperMode 会回滚窗口状态并返回 false
+      const ok = await applyWallpaperMode(target)
+      if (!ok) wallpaperEnabled = !target
+      sendToMain('wallpaper:state', wallpaperEnabled)
+      refreshTray()
+    }
+  } finally {
+    wallpaperBusy = false
+  }
 }
 
 async function toggleWallpaper(): Promise<boolean> {
   if (!asWallpaper || !mainWindow || mainWindow.isDestroyed()) return wallpaperEnabled
-  wallpaperEnabled = !wallpaperEnabled
-
-  /**
-   * **不再**顺手改写「启动时进入桌面壁纸模式」
-   *
-   * 踩过：这里原来每次都 `updateSetting({'common.wallpaperMode': wallpaperEnabled})`，
-   * 于是用按钮/托盘切一下壁纸模式，设置里那个「启动时进入」开关就跟着自己翻 ——
-   * 用户看到的是「我没动它，它自己打开了」，而且下次开机会莫名进壁纸模式。
-   *
-   * 现在两件事分开：
-   *  - 按钮/托盘 = 这次运行进不进壁纸（`wallpaperEnabled`，不落盘）；
-   *  - 设置里那个开关 = 要不要**开机就进**，改动由 onSettingChange 实时应用（见下）。
-   */
-  await applyWallpaperMode(wallpaperEnabled)
-
-  sendToMain('wallpaper:state', wallpaperEnabled)
-  refreshTray()
+  // 基准取「最后一次目标」：连点时第二次应基于第一次的目标反向，而不是基于旧的实际值
+  const want = !(wallpaperWant ?? wallpaperEnabled)
+  await setWallpaperMode(want)
   return wallpaperEnabled
 }
 
@@ -548,7 +604,25 @@ function createLoginWindow(): void {
     },
   })
 
-  void loginWindow.loadURL('https://passport.bilibili.com/login')
+  /**
+   * 登录窗口加载的是真实 B 站页面，必须自己带护栏
+   *
+   * 主窗口那套 `setWindowOpenHandler` + `will-navigate` 是给自家页面用的，
+   * 远程页面一旦 window.open / 被重定向，就会开出应用不跟踪的新窗口
+   * （共用 defaultSession，用户看到的是一个凭空冒出来的浏览器窗口）。
+   * 外链一律走 `app:openExternal`，所以这里直接拒绝。
+   */
+  loginWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  loginWindow.webContents.on('will-navigate', (event, url) => {
+    const ok = url.startsWith('https://passport.bilibili.com/') || url.startsWith('https://www.bilibili.com/')
+    if (!ok) {
+      console.warn('[win] 登录窗口已拦截站外导航:', url)
+      event.preventDefault()
+    }
+  })
+  loginWindow.loadURL('https://passport.bilibili.com/login').catch((err) => {
+    console.warn('[win] 登录页加载失败:', err)
+  })
 
   let loginAutoCloseTimer: ReturnType<typeof setTimeout> | null = null
   let loginPollTimer: ReturnType<typeof setInterval> | null = null
@@ -800,6 +874,7 @@ function createTrayMenuWindow(): BrowserWindow {
 
   const devUrl = trayMenuUrl()
   if (devUrl) void win.loadURL(devUrl)
+  else if (protectionEnabled()) void win.loadURL(protectedRendererUrl('tray-menu.html'))
   else void win.loadFile(path.join(__dirname, '../renderer/tray-menu.html'))
   return win
 }
@@ -819,6 +894,17 @@ function createTrayMenuWindow(): BrowserWindow {
 function showTrayMenu(): void {
   if (!tray) return
   trayMenuShown = false
+  /**
+   * 重新弹出时把「失焦收起」的定时器清掉
+   *
+   * 踩过：菜单显示着再右键一次托盘，`blur` 先排了一个 400ms 的收起判断，
+   * 而这里的 120ms 兜底又把菜单 show + focus 回来 —— 400ms 到点时按光标位置
+   * （在托盘图标上 = 菜单外）判定成「点了别处」，于是菜单弹出来约 400ms 后自己消失。
+   */
+  if (blurHideTimer) {
+    clearTimeout(blurHideTimer)
+    blurHideTimer = null
+  }
   if (!trayMenuWindow || trayMenuWindow.isDestroyed()) {
     trayMenuWindow = createTrayMenuWindow()
   }
@@ -899,6 +985,16 @@ function hideTrayMenu(): void {
     clearTimeout(blurHideTimer)
     blurHideTimer = null
   }
+  /**
+   * 兜底显示的定时器也要清
+   *
+   * 不清的话：显示后 120ms 内按 Esc（或菜单被别的原因收起），那个定时器到点
+   * 还会 `placeAndShowTrayMenu()` 把菜单又弹回来 —— 用户按了 Esc，菜单却自己冒出来。
+   */
+  if (trayMenuFallbackTimer) {
+    clearTimeout(trayMenuFallbackTimer)
+    trayMenuFallbackTimer = null
+  }
   if (trayMenuWindow && !trayMenuWindow.isDestroyed() && trayMenuWindow.isVisible()) {
     trayMenuWindow.hide()
   }
@@ -913,8 +1009,12 @@ function hideTrayMenu(): void {
  *
  * 光标还在菜单上 = 正在点菜单（壁纸模式的鼠标转发抢走了激活），等它点完；
  * 光标已经移开 = 真的点了别处，收起。
+ *
+ * 注意有**次数上限**：光标一直停在菜单上时不能再无限重排（那是每 400ms 一次的轮询），
+ * 观察几轮就放手 —— 真在点菜单的话，抬起/移开都会让这个循环自然结束。
  */
-function scheduleHideAfterBlur(): void {
+const BLUR_RECHECK_LIMIT = 5
+function scheduleHideAfterBlur(recheck = 0): void {
   if (!trayMenuWindow || trayMenuWindow.isDestroyed() || !trayMenuWindow.isVisible()) return
   if (blurHideTimer) clearTimeout(blurHideTimer)
   blurHideTimer = setTimeout(() => {
@@ -928,8 +1028,8 @@ function scheduleHideAfterBlur(): void {
       hideTrayMenu()
       return
     }
-    // 还在菜单里：继续观察，别把正在进行的这一下点掉
-    scheduleHideAfterBlur()
+    // 还在菜单里：继续观察（有上限），别把正在进行的这一下点掉
+    if (recheck < BLUR_RECHECK_LIMIT) scheduleHideAfterBlur(recheck + 1)
   }, 400)
 }
 
@@ -1030,7 +1130,15 @@ function createTray(): void {
    * 之前壁纸模式把左键当播放/暂停，和用户预期不符，已经去掉。
    */
   tray.on('click', () => {
-    void restoreWindow()
+    /**
+     * 左键 = 「我要用窗口了」
+     *
+     * 除了把窗口弄出来（壁纸模式先退出壁纸层），还要顺手**解锁界面** ——
+     * 窗口模式 + 锁定状态下界面只剩左下右下两个角按钮，用户会更自然地点托盘图标，
+     * 以前那一下什么都不发生（窗口本来就可见），看着像卡住了。
+     * 解锁与否由渲染层判定，没锁时这个广播是无害的。
+     */
+    void restoreWindow().then(() => sendToMain('tray:unlock'))
   })
   // 右键（两种模式都是）：弹自绘菜单
   tray.on('right-click', () => showTrayMenu())
@@ -1071,6 +1179,22 @@ async function grabCookiesSilently(): Promise<void> {
       resolve()
     }
 
+    /**
+     * 绝对超时兜底
+     *
+     * 这个隐藏窗口只要还在世，`window-all-closed` 就不会触发 —— 而它是 `app.quit()`
+     * 的唯一入口。原来的「20 × 500ms 轮询」只在 `did-finish-load` 之后才开始跑：
+     * 万一 `did-finish-load` / `did-fail-load` 都不来（加载卡死），这个窗口永不销毁，
+     * 用户此后**再也无法通过关窗退出应用**（启动后十几秒内点 X 也会卡住）。
+     * 所以这里给一个独立于加载事件的硬超时。
+     */
+    const hardTimeout = setTimeout(() => settle(), 8000)
+
+    const wrappedSettle = (): void => {
+      clearTimeout(hardTimeout)
+      settle()
+    }
+
     let pollCount = 0
     const poll = async (): Promise<void> => {
       if (settled) return
@@ -1078,23 +1202,27 @@ async function grabCookiesSilently(): Promise<void> {
       try {
         const cookies = await session.defaultSession.cookies.get({})
         if (cookies.some((c) => c.name === 'buvid3')) {
-          settled = true
-          if (!cookieWindow.isDestroyed()) cookieWindow.destroy()
-          resolve()
+          wrappedSettle()
           return
         }
       } catch {
         /* ignore */
       }
       if (pollCount < 20) setTimeout(() => void poll(), 500)
-      else settle()
+      else wrappedSettle()
     }
 
     cookieWindow.webContents.on('did-finish-load', () => {
       setTimeout(() => void poll(), 1000)
     })
-    cookieWindow.webContents.on('did-fail-load', () => settle())
-    cookieWindow.loadURL('https://www.bilibili.com/').catch(() => settle())
+    cookieWindow.webContents.on('did-fail-load', () => wrappedSettle())
+    cookieWindow.webContents.on('render-process-gone', () => wrappedSettle())
+    // 隐藏窗口加载的是真实 B 站页面：不许它开新窗口（弹出来会凭空出现在用户桌面上）
+    cookieWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    cookieWindow.webContents.on('will-navigate', (event, url) => {
+      if (!url.startsWith('https://www.bilibili.com/')) event.preventDefault()
+    })
+    cookieWindow.loadURL('https://www.bilibili.com/').catch(() => wrappedSettle())
   })
 }
 
@@ -1122,10 +1250,21 @@ async function executeLogout(): Promise<void> {
 // 第 1 步：必须最早执行，改写 userData 之后再碰任何路径相关的 API
 setupUserDataPath()
 
+/**
+ * 第 1.5 步：注册加密资源协议
+ *
+ * 必须在 `app.whenReady()` **之前** —— 只有这时注册的 privileges（standard / secure）才生效，
+ * 否则 `blmv://` 会被当成普通自定义协议，页面拿不到正常的安全上下文（fetch / MSE 都会受限）。
+ */
+registerProtectedScheme()
+
 void app.whenReady().then(async () => {
   // 第 2 步：初始化配置（读盘 + 迁移 + 合并默认值）与歌单集合
   initSetting()
   initPlaylists()
+
+  // 第 2.5 步：装上加密资源的请求处理器（要在创建窗口之前）
+  installProtectedProtocol()
 
   /**
    * 配置变化时同步托盘菜单
@@ -1155,6 +1294,47 @@ void app.whenReady().then(async () => {
     },
   )
 
+  /**
+   * 给 B 站媒体直链的响应**统一改** CORS 头
+   *
+   * 渲染层是用 `fetch()` 把 dash 音视频流拉下来喂给 MSE 的（见 `src/utils/dashPlayer.ts`），
+   * 所以受同源策略约束。实测两种翻车：
+   *  1. 有些 CDN 响应**不带** `Access-Control-Allow-Origin` → 直接拦；
+   *  2. 有些 CDN 会把**第一个请求者的 Origin** 写进 ACAO 并按 URL 缓存下来
+   *     （报错原话：`ACAO has a value 'http://localhost:5173' that is not equal to the supplied origin`，
+   *     那个 5173 就是开发服务器），于是别的来源（打包后的 `blmv://app`、或 `file://`）拿到一个对不上的值。
+   * 所以这里**不判断、一律覆盖成 `*`**，并且删掉 `Access-Control-Allow-Credentials`
+   * —— `*` 和「允许带凭据」是浏览器眼里的非法组合。
+   *
+   * 安全性：这些直链是带签名的时效地址，请求本身不带 cookie（要凭据的接口都在主进程 `net.fetch` 里），
+   * 因此开放 `*` 不会把带凭据的响应暴露给任意站点。只动媒体域，不碰 `*.bilibili.com` 接口域。
+   */
+  session.defaultSession.webRequest.onHeadersReceived(
+    { urls: ['*://*.bilivideo.com/*', '*://*.bilivideo.cn/*'] },
+    (details, callback) => {
+      const headers = details.responseHeaders ?? {}
+      /**
+       * 必须先按**大小写不敏感**把原来的删掉再设
+       *
+       * 踩过：CDN 回的是小写 `access-control-allow-origin`，我直接
+       * `headers['Access-Control-Allow-Origin'] = ['*']` 等于**又加了一条**，
+       * 浏览器看到的是 `ACAO: blmv://app, *` —— 两个值直接判非法，
+       * 本来能用的那些请求也被我搞挂了（报错从 1 条变成 20 条）。
+       */
+      for (const key of Object.keys(headers)) {
+        const lower = key.toLowerCase()
+        if (
+          lower === 'access-control-allow-origin' ||
+          lower === 'access-control-allow-credentials'
+        ) {
+          delete headers[key]
+        }
+      }
+      headers['Access-Control-Allow-Origin'] = ['*']
+      callback({ responseHeaders: headers })
+    },
+  )
+
   // 第 3 步：注册 IPC
   registerIpcHandlers({
     getMainWindow: () => mainWindow,
@@ -1165,7 +1345,9 @@ void app.whenReady().then(async () => {
     isWallpaperEnabled: () => wallpaperEnabled,
     startWindowDrag,
     moveWindow: (x, y) => {
-      mainWindow?.setPosition(Math.round(x), Math.round(y))
+      // 窗口已销毁时 setPosition 会抛，而渲染层拿到的会是 rejected promise
+      if (!mainWindow || mainWindow.isDestroyed()) return
+      mainWindow.setPosition(Math.round(x), Math.round(y))
     },
     getScreenWorkArea,
     setLoggedIn: (loggedIn) => {
@@ -1294,7 +1476,7 @@ function startWindowDrag(): { offsetX: number; offsetY: number } | null {
 }
 
 function getScreenWorkArea(): Electron.Rectangle | null {
-  if (!mainWindow) return null
+  if (!mainWindow || mainWindow.isDestroyed()) return null
   const bounds = mainWindow.getBounds()
   return screen.getDisplayMatching(bounds).workArea
 }
@@ -1308,12 +1490,50 @@ app.on('activate', () => {
 })
 
 /**
+ * 把一块矩形夹回「当前还存在的某个显示器」的工作区里
+ *
+ * 用途：拔掉一块屏 / 改分辨率之后，进入全屏或壁纸时记下的还原点可能落在
+ * **已经不存在的坐标**上。退出全屏（或退出壁纸）时照它 `setBounds`，窗口就跑到屏幕外，
+ * 用户点托盘也救不回来，只能手改配置文件。
+ */
+function clampBoundsToDisplay(bounds: Electron.Rectangle): Electron.Rectangle {
+  const displays = screen.getAllDisplays()
+  const stillVisible = displays.some((d) => {
+    const a = d.workArea
+    // 只要有足够面积还落在某块屏上就认为可见（允许部分越界，比如贴边）
+    const overlapX = Math.max(0, Math.min(a.x + a.width, bounds.x + bounds.width) - Math.max(a.x, bounds.x))
+    const overlapY = Math.max(0, Math.min(a.y + a.height, bounds.y + bounds.height) - Math.max(a.y, bounds.y))
+    return overlapX * overlapY > 100 * 100
+  })
+  if (stillVisible) return bounds
+
+  const area = (screen.getDisplayMatching(bounds) ?? screen.getPrimaryDisplay()).workArea
+  const width = Math.min(bounds.width, area.width)
+  const height = Math.min(bounds.height, area.height)
+  const clamped = {
+    x: Math.min(Math.max(bounds.x, area.x), area.x + area.width - width),
+    y: Math.min(Math.max(bounds.y, area.y), area.y + area.height - height),
+    width,
+    height,
+  }
+  console.warn('[win] 还原点已不在任何屏幕上，夹回主屏:', JSON.stringify(bounds), '->', JSON.stringify(clamped))
+  return clamped
+}
+
+/**
  * 显示器变化（拔屏 / 改分辨率 / 改缩放）后，全屏与壁纸的几何是按进入时的屏幕算的，
  * 不重算就会停在旧 bounds 上（甚至落在已经拔掉的显示器坐标里）。
  * 这里只处理「正在全屏 / 壁纸」的情况：普通窗口交给 Windows 自己钳制，别乱动用户摆好的位置。
  */
 const handleDisplayChange = (): void => {
   if (!mainWindow || mainWindow.isDestroyed()) return
+  // 还原点先夹一遍：这和当前是否全屏无关，留着坏的还原点迟早会用到
+  if (fullScreenRestore) {
+    fullScreenRestore.bounds = clampBoundsToDisplay(fullScreenRestore.bounds)
+  }
+  if (wallpaperRestore) {
+    wallpaperRestore.bounds = clampBoundsToDisplay(wallpaperRestore.bounds)
+  }
   if (!isFullScreen && !wallpaperEnabled) return
   try {
     // 两种情况都是「窗口应该铺满所在屏幕」，所以同一个几何函数；
@@ -1341,6 +1561,21 @@ const watchDisplayChanges = (): void => {
 app.on('before-quit', () => {
   // 置位后「关闭到托盘」就不再拦截窗口关闭了，否则会永远退不掉
   isQuitting = true
+  /**
+   * 壁纸模式下退出：先把窗口从桌面层摘下来
+   *
+   * 不摘的话，BrowserWindow 是带着 `SetParent(WorkerW)` 被直接销毁的，
+   * 库提供的 `reset()`（恢复原始壁纸层）永远不会执行 —— 桌面壁纸/图标层可能停在
+   * 非正常状态，用户重启前都能看到。必须在窗口销毁**之前**做。
+   */
+  if (wallpaperEnabled && mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      asWallpaper?.detach(mainWindow)
+      asWallpaper?.reset()
+    } catch (err) {
+      console.warn('[wallpaper] 退出前 detach 失败（忽略）:', err)
+    }
+  }
   flushSetting()
   flushPlaylists()
 })

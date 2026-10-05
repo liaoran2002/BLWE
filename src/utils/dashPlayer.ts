@@ -222,6 +222,17 @@ export class DashSession {
       try {
         // Uint8Array 与 BufferSource 的泛型在 TS 5.9 里不完全兼容，这里收窄
         buffer.appendBuffer(chunk as unknown as BufferSource)
+        /**
+         * 等这次 append 真正结束再返回
+         *
+         * `appendBuffer` 是异步的（`updating` 立刻变 true，`updateend` 才结束）。
+         * 原来直接 return，`pump` 的最后一轮立刻返回、循环因 `done` 退出，
+         * `Promise.allSettled` 随即 resolve —— 接着调用的 `endOfStream()` 会撞上
+         * 「还在 updating」抛 InvalidStateError，被上面的空 catch 吞掉，
+         * 于是 MediaSource 永远不会 end：`ended` 不触发、duration 也可能停在未定值
+         * （正是片尾看门狗要兜的那个场景，等于让所有兜底都建立在不确定状态上）。
+         */
+        await this.waitIdle(buffer)
         return
       } catch (err) {
         if (!isQuotaError(err)) {

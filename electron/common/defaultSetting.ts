@@ -51,7 +51,6 @@ const defaultSetting = {
   'player.volume': 70,
   'player.isMute': false,
   'player.loopMode': 'listLoop',
-  'player.playIndex': 0,
   /**
    * 记住播放进度：下次打开回到上次的歌单 / 歌曲 / 播放位置
    *
@@ -63,6 +62,12 @@ const defaultSetting = {
   'player.resumeTime': 0,
   /** 声音输出设备变化时暂停，默认开（避免声音跑到刚插上的设备上） */
   'player.pauseOnDeviceChange': true,
+  /**
+   * 全屏时自动锁定界面，默认关
+   *
+   * 锁定 = 标题栏 / 控制栏全隐藏，只留左下（锁定）和右下（全屏）两个按钮。
+   */
+  'player.lockOnFullscreen': false,
   /** 默认视频清晰度：1080P 60帧（实际会按登录态/会员/视频可用档位降级） */
   'player.videoQuality': DEFAULT_VIDEO_QN,
   /** 默认音质：192K */

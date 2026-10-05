@@ -14,10 +14,13 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "pack": "npm run build:only && electron-builder --dir",
-    "dist": "npm run build:only && electron-builder"
+    "protect": "node scripts/protect.mjs",
+    "build:protected": "npm run build:only && npm run protect",
+    "pack": "npm run build:protected && electron-builder --dir",
+    "dist": "npm run build:protected && electron-builder"
   },
   "dependencies": {
+    "bytenode": "^1.7.0",
     "electron-as-wallpaper": "^2.0.3"
   },
   "devDependencies": {
@@ -27,6 +30,7 @@
     "electron-builder": "^26.15.3",
     "electron-vite": "^6.0.0-beta.1",
     "element-plus": "^2.14.2",
+    "javascript-obfuscator": "^5.9.0",
     "pinia": "^3.0.4",
     "typescript": "^5.9.3",
     "vite": "^8.0.16",

@@ -61,6 +61,8 @@ export interface RendererAPI {
   onTrayToggleMute: (cb: () => void) => RemoveListener
   onTrayShowPlaylist: (cb: () => void) => RemoveListener
   onTrayShowLogoutConfirm: (cb: () => void) => RemoveListener
+  /** 左键点了托盘图标：让界面解锁（没锁时无事发生） */
+  onTrayUnlock: (cb: () => void) => RemoveListener
   // #endregion
 
   // #region 自绘托盘菜单（菜单窗口用它渲染与回报尺寸；主窗口用 visibility 吞掉合成点击）

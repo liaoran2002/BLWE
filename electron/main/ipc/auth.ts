@@ -13,7 +13,13 @@ export const registerAuthHandlers = (context: IpcContext): void => {
   })
 
   mainHandle('auth:setLoggedIn', ({ loggedIn }) => {
-    context.setLoggedIn(loggedIn)
+    /**
+     * 收窄成布尔再往下传
+     *
+     * 主进程这份 `isLoggedIn` 决定托盘菜单显示「登录」还是「退出登录」，
+     * 渲染层一旦传了非布尔值（类型 bug / 误调），两份状态就会漂移。
+     */
+    context.setLoggedIn(loggedIn === true)
   })
 
   mainHandle('auth:executeLogout', async () => {

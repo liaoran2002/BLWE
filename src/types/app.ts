@@ -108,6 +108,8 @@ export interface AppData {
   isMaximized: boolean
   isFullscreen: boolean
   wallpaperEnabled: boolean
+  /** 界面锁定：隐藏标题栏 / 控制栏，只留左下锁定与右下全屏两个按钮（快捷键 S） */
+  locked: boolean
 
   // ---- 窗口拖拽 ----
   isDragging: boolean
@@ -140,6 +142,8 @@ export interface AppData {
   removeTrayToggleMode: RemoveListener | null
   removeTrayShowPlaylist: RemoveListener | null
   removeTrayShowLogoutConfirm: RemoveListener | null
+  /** 左键点托盘图标 -> 解锁界面的监听摘除函数 */
+  removeTrayUnlock: RemoveListener | null
   removeWallpaperState: RemoveListener | null
   /** 托盘菜单（迷你控制台）：进度条 / 音量 / 静音 */
   removeTraySeek: RemoveListener | null
@@ -193,6 +197,8 @@ export interface AppData {
   _bufferOverlayTimer: ReturnType<typeof setTimeout> | null
   /** 预热槽位：上一首 / 下一首各一个 */
   _warm: { next: WarmInfo | null; prev: WarmInfo | null }
+  /** 某个方向是否已经拉过开头那几秒（拉过就不再重复，避免每 3 秒重建一次 MSE） */
+  _warmed: { next: boolean; prev: boolean }
   /** 正在预热哪几个方向（避免同一方向并发重复请求） */
   _warming: { next: boolean; prev: boolean }
   /** 预热媒体用的隐藏 <video>（每个方向一个，长期复用） */
@@ -207,6 +213,14 @@ export interface AppData {
   _progressPos: number
   /** 本次源是否已按「播完」处理过，避免看门狗重复触发 */
   _endStallHandled: boolean
+  /** 播放停滞看门狗：停滞起始时间戳（0 = 没在停滞） */
+  _stallSince: number
+  /** 播放停滞看门狗：本次已恢复几次（开始播了就清零） */
+  _stallRecoveries: number
+  /** 播放停滞看门狗：单曲歌单反复停滞时放弃这条流，不再周期性告警 */
+  _stallGivenUp: boolean
+  /** 这次锁定是不是「进全屏时自动锁的」，退出全屏要跟着解开 */
+  _lockedByFullscreen: boolean
 }
 
 /**
@@ -232,6 +246,8 @@ export interface WarmInfo {
 export interface VideoElement {
   /** durl 播放时由 applyVideoSource 赋值；dash 播放时是 MediaSource 的 blob 地址 */
   src: string
+  /** 当前真正加载的地址（空 = 还没设过源）；停滞看门狗用它区分「起播等待」和「卡住」 */
+  readonly currentSrc: string
   /** MSE 缓冲区裁剪时要用 */
   readonly buffered: TimeRanges
   /** 停滞看门狗用：0=HAVE_NOTHING … 4=HAVE_ENOUGH_DATA */

@@ -52,9 +52,10 @@ interface SearchPayload {
 }
 
 /**
- * 「缓存地址已过期」的原因
+ * 「缓存地址已过期」的原因（写在注释里，日志保持一行）
  *
- * 直链寿命约 2 小时、缓存却有 3 天，隔一阵再听就会成片过期
+ * 直链寿命约 2 小时、缓存却有 3 天，隔一阵再听就会成片过期 ——
+ * 属于预期内现象，所以不单独做日志闸门，直接在下面注释说明。
  */
 
 /**
@@ -177,6 +178,8 @@ export const registerApiHandlers = (context: ApiContext): void => {
       const wantQn = qn ?? getSetting()['player.videoQuality']
       const wantAudioId = audioId ?? getSetting()['player.audioQuality']
 
+      /** 本次是不是真的重新解析过（决定要不要写缓存，见下面的保存处） */
+      let resolvedFresh = false
       /** durl（渐进式 mp4）地址；走 dash 时为 null */
       let videoUrl: string | null = null
       /** dash 双轨（音视频分开）；走 durl 时为 null */
@@ -261,6 +264,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
             )
           }
           // 缓存数据失效 / 地址过期，重新拉取
+          resolvedFresh = true
           const resolved = await biliApi.resolveVideoUrl(bvid, {
             noDash,
             qn: wantQn,
@@ -291,6 +295,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
         }
       } else {
         // 无缓存项 / 强制跳过缓存：直接调用接口解析
+        resolvedFresh = true
         const resolved = await biliApi.resolveVideoUrl(bvid, {
             noDash,
             qn: wantQn,
@@ -332,7 +337,15 @@ export const registerApiHandlers = (context: ApiContext): void => {
       }
 
       // 有 keyword 时统一更新缓存（selectedBvid + 数据）
-      if (keyword && cached) {
+      /**
+       * 只有**真的重新解析过**才写回
+       *
+       * 踩过：原来只要读到过这个 keyword 的缓存就无条件整包 `save` ——
+       * 纯缓存命中、续播、预热下一首都会触发一次「同步 stringify + 写盘 + rename」
+       * （这个 JSON 最大能到几 MB），既阻塞主进程又白白磨损磁盘，而且什么都没改。
+       * （`backfillFromView` 那种老条目修补属于极少数情况，交给下次重解析一并落盘。）
+       */
+      if (keyword && cached && resolvedFresh) {
         /**
          * 这里存的必须是**整包返回体**（`{ code, data: { result, selectedBvid } }`），
          * 不是里面的 `data` —— `api:searchSong` 与渲染层都按外层结构读。
@@ -352,8 +365,16 @@ export const registerApiHandlers = (context: ApiContext): void => {
           const freshResults = Array.isArray(freshPayload?.data?.result)
             ? [...(freshPayload.data.result as CachedSearchItem[])]
             : [...results]
-          // 以刚读到的为准，把本次解析出来的条目按 bvid 覆盖进去
-          for (const item of results) {
+          /**
+           * 只把**本次真正动过的那一个条目**覆盖进去
+           *
+           * 踩过：这里原来遍历整份本地快照 `results`，逐条 `{...fresh, ...item}` ——
+           * 等于把「开始解析之前看到的其它条目」也一起写回去。快速连点两个候选视频
+           * （同 keyword、不同 bvid）或预热与切歌重叠时，后写的一方会用它快照里别的 bvid 的
+           * 旧 view/playurl 回滚对方刚解析出的新地址，表现就是「地址刚解析完又没了、反复重新解析」。
+           */
+          const changed = targetVideo?.bvid ? [targetVideo] : []
+          for (const item of changed) {
             if (!item?.bvid) continue
             const at = freshResults.findIndex((x) => x?.bvid === item.bvid)
             if (at >= 0) freshResults[at] = { ...freshResults[at], ...item }

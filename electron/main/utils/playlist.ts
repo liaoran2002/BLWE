@@ -15,7 +15,6 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PLAYLIST_DATA_VERSION, STORE_NAMES } from '@common/constants'
 import type {
-  DuplicatePolicy,
   FavoriteVideo,
   PlaylistRecord,
   PlaylistSaveParams,
@@ -24,7 +23,7 @@ import type {
   SyncResult,
 } from '@common/types/playlist'
 import { parseSearchKey, toSearchKey } from '@common/types/playlist'
-import { debounce } from '@common/utils/common'
+import { compareVer, debounce } from '@common/utils/common'
 import { getStore } from './store'
 import { resolvePlaylist } from '../music'
 
@@ -202,10 +201,36 @@ export const initPlaylists = (): void => {
   const raw = store.get('playlists')
   let loaded: PlaylistRecord[] = []
   if (Array.isArray(raw)) {
-    loaded = raw
-      .map((item) => normalizeRecord(item as Partial<PlaylistRecord>))
-      .filter((item): item is PlaylistRecord => item !== null)
+    /**
+     * 逐条记数：`normalizeRecord` 返回 null 就是「整条丢弃」
+     *
+     * 以前是 map + filter 一把过，丢了多少条、哪一条完全没有痕迹 ——
+     * 渲染层一个结构 bug 就能把整份歌单集合静默从内存里抹掉（并且随后落盘），
+     * 事后只能靠用户说「我的歌单没了」。至少要留下日志。
+     */
+    let dropped = 0
+    for (const item of raw) {
+      const record = normalizeRecord(item as Partial<PlaylistRecord>)
+      if (record) loaded.push(record)
+      else dropped += 1
+    }
+    if (dropped > 0) {
+      console.warn(
+        `[playlist] 有 ${dropped} 条歌单记录结构不合法已丢弃（原文件 ${filePath}，本次未覆盖前可先备份）`,
+      )
+    }
   }
+
+  /**
+   * 磁盘上记的版本号
+   *
+   * 下面那个「同步策略一次性升级」**必须**靠它做闸门：升级本身会把 off 改成 startup，
+   * 而用户也完全可能**故意**选「手动同步」—— 没有闸门就会每次启动都把用户的选择推翻，
+   * 还会顺手联网同步覆盖曲目（用户看到的是「我明明设了手动，它自己又开始同步了」）。
+   */
+  const storedVersion = store.get('version')
+  const isUpgradeFromOlder =
+    typeof storedVersion !== 'string' || compareVer(storedVersion, PLAYLIST_DATA_VERSION) < 0
 
   let currentId = store.get('currentId')
   if (typeof currentId !== 'string') currentId = null
@@ -230,8 +255,13 @@ export const initPlaylists = (): void => {
    * 背景：同步策略原先有一半由全局设置（playlist.syncOnStartup）控制，
    * 现在改成完全由每个歌单自己决定。如果不做这一步，老用户那些
    * mode === 'off' 的歌单会突然完全不再自动同步。
+   *
+   * 只在**从更老的数据版本升上来**时做一次（见上面的 isUpgradeFromOlder）：
+   * 否则用户每次启动手动设的「手动同步」都会被无声改回启动同步。
    */
-  const upgraded = loaded.filter((p) => p.sourceUrl && p.sync.mode === 'off')
+  const upgraded = isUpgradeFromOlder
+    ? loaded.filter((p) => p.sourceUrl && p.sync.mode === 'off')
+    : []
   if (upgraded.length > 0) {
     for (const p of upgraded) {
       p.sync = { mode: 'startup', intervalMs: 0 }
@@ -258,7 +288,22 @@ export const savePlaylists = (params: PlaylistSaveParams): PlaylistStoreData => 
   if (Array.isArray(params?.playlists)) {
     for (const item of params.playlists) {
       const record = normalizeRecord(item)
-      if (record) normalized.push(record)
+      if (!record) continue
+      /**
+       * 正在同步的歌单：曲目以主进程内存里的为准
+       *
+       * 渲染层这份是它开始同步之前读到的旧列表，直接覆盖会把刚同步完的曲目丢掉，
+       * 而界面还在提示「同步完成 +N/-M」（用户看到的是「同步了个寂寞」）。
+       */
+      if (syncingIds.has(record.id)) {
+        const live = data.playlists.find((p) => p.id === record.id)
+        if (live) {
+          console.warn(`[playlist] ${record.name} 正在同步，保存时保留内存里的曲目`)
+          record.songs = live.songs
+          record.lastSyncAt = live.lastSyncAt
+        }
+      }
+      normalized.push(record)
     }
   }
   let currentId =
@@ -282,10 +327,17 @@ const songKey = (song: PlaylistSong): string =>
  *
  * @returns 同步结果，其中 added/removed 供界面提示
  */
-export const syncPlaylist = async (
-  id: string,
-  duplicatePolicy: DuplicatePolicy = 'dedupe',
-): Promise<SyncResult> => {
+/**
+ * 正在同步中的歌单 id
+ *
+ * `savePlaylists` 是渲染层**全量覆盖**，而 `syncPlaylist` 是主进程**就地改内存**：
+ * 同步要跑好几秒网络请求，期间渲染层任何一次 `persist`（收藏视频、切歌单、编辑歌单）
+ * 都会拿它手里的旧曲目列表把同步结果盖掉，随后界面还照样提示「同步完成 +N/-M」。
+ * 记下正在同步的 id，覆盖时把这些歌单的曲目**以主进程内存里的为准**。
+ */
+const syncingIds = new Set<string>()
+
+export const syncPlaylist = async (id: string): Promise<SyncResult> => {
   const index = data.playlists.findIndex((p) => p.id === id)
   if (index < 0) return { id, name: '', ok: false, error: '歌单不存在' }
 
@@ -299,6 +351,8 @@ export const syncPlaylist = async (
     }
   }
 
+  syncingIds.add(id)
+
   try {
     const detail = await resolvePlaylist({ input: target.sourceUrl })
     // 直接保留结构化字段（封面/专辑/歌手/时长），不再压成字符串
@@ -311,7 +365,14 @@ export const syncPlaylist = async (
     }))
     if (songs.length > MAX_SYNC_SONGS) songs = songs.slice(0, MAX_SYNC_SONGS)
 
-    if (duplicatePolicy === 'dedupe') {
+    /**
+     * 固定去重
+     *
+     * 曾经有个 `duplicatePolicy` 参数（`'keep' | 'dedupe'`），但 IPC 只传 `{ ids }`、
+     * 主进程也从来没人传第二个参数 —— `'keep'` 是不可达的死分支，还让人以为「保留重复」可配。
+     * 现在直接写明：同步一律去重。
+     */
+    {
       const seen = new Set<string>()
       songs = songs.filter((song) => {
         const key = songKey(song)
@@ -357,6 +418,9 @@ export const syncPlaylist = async (
       ok: false,
       error: (err as Error)?.message ?? '同步失败',
     }
+  } finally {
+    // 不管成功失败都要摘掉标记，否则这个歌单以后的覆盖保存都会被拦
+    syncingIds.delete(id)
   }
 }
 
@@ -365,13 +429,10 @@ export const syncPlaylist = async (
  *
  * 串行执行，避免同时打多个平台的接口被限流。
  */
-export const syncPlaylists = async (
-  ids: string[],
-  duplicatePolicy: DuplicatePolicy = 'dedupe',
-): Promise<SyncResult[]> => {
+export const syncPlaylists = async (ids: string[]): Promise<SyncResult[]> => {
   const results: SyncResult[] = []
   for (const id of ids) {
-    results.push(await syncPlaylist(id, duplicatePolicy))
+    results.push(await syncPlaylist(id))
   }
   return results
 }

@@ -223,6 +223,13 @@ export interface IpcEventMap {
   'tray:toggleMode': void
   'tray:showPlaylist': void
   'tray:showLogoutConfirm': void
+  /**
+   * 左键点了托盘图标：让界面解锁
+   *
+   * 锁定状态只在渲染层，主进程不知道也不该去猜，所以这里只是「通知一下」，
+   * 渲染层没锁就什么都不做（`toggleLock(false)` 本身是幂等的）。
+   */
+  'tray:unlock': void
   /** 托盘菜单拖动进度条：payload 是 0~1 的比例 */
   'tray:seek': number
   /** 托盘菜单调音量：payload 是 0~100 */
@@ -260,19 +267,6 @@ export interface UserInfo {
   name: string
 }
 
-/**
- * 歌单里的一项
- *
- * 本项目的歌单由「音乐平台歌单解析」（electron/main/music）产出，
- * 统一转换成 `"歌名-歌手"` 字符串，再交给 B 站搜索。
- * B 站搜索出来的视频项是对象形状，用 BiliVideo（见 renderer 侧 types/app.ts）。
- */
-export type PlaylistSong = string
-
-export interface Playlist {
-  name: string
-  songs: PlaylistSong[]
-}
 
 export interface TrayState {
   paused?: boolean

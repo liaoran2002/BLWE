@@ -70,6 +70,8 @@ const api = {
   onTrayShowPlaylist: (cb: () => void): RemoveListener => rendererOn('tray:showPlaylist', cb),
   onTrayShowLogoutConfirm: (cb: () => void): RemoveListener =>
     rendererOn('tray:showLogoutConfirm', cb),
+  /** 左键点了托盘图标：让界面解锁（没锁时无事发生） */
+  onTrayUnlock: (cb: () => void): RemoveListener => rendererOn('tray:unlock', cb),
   // #endregion
 
   // #region 自绘托盘菜单

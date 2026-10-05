@@ -27,8 +27,9 @@
       <div class="np-text">
         <div class="videoName-container">
           <div :class="['videoName-scroll', paused ? 'paused' : '']">
-            <span v-html="videoName"></span>
-            <span v-html="videoName"></span>
+            <!-- 用净化过的 HTML：标题是第三方数据，不能直接 v-html（见 utils/title.ts） -->
+            <span v-html="safeVideoName"></span>
+            <span v-html="safeVideoName"></span>
           </div>
         </div>
         <div v-if="subtitle || quality || audioQuality" class="np-sub">
@@ -95,6 +96,8 @@
         @pointerdown.prevent="onProgressDown"
         @pointermove="onPointerMove"
         @pointerup="onPointerUp"
+        @pointercancel="onPointerUp"
+        @lostpointercapture="onPointerUp"
       >
         <div
           class="progressBar"
@@ -156,6 +159,8 @@
             @pointerdown.prevent="onVolumeDown"
             @pointermove="onPointerMove"
             @pointerup="onPointerUp"
+            @pointercancel="onPointerUp"
+            @lostpointercapture="onPointerUp"
           >
             <div
               class="volume-progress"
@@ -203,6 +208,7 @@
 import { defineComponent } from 'vue';
 import type { QualityOptionPayload, QualityOptionsPayload } from '@common/types/ipc';
 import { normalizeImageUrl } from '../utils/image';
+import { sanitizeTitleHtml } from '../utils/title';
 
 export default defineComponent({
   name: 'biliVideoControls',
@@ -302,14 +308,24 @@ export default defineComponent({
       else if (this.isSoundDragging) this.calcVolume(e);
     },
     onPointerUp(e: PointerEvent) {
-      if (this.activeEl) {
+      this.endDrag(e);
+    },
+    /**
+     * 拖拽收尾：`pointerup` / `pointercancel` / `lostpointercapture` 都走这里
+     *
+     * 只挂 `pointerup` 是不够的：指针被系统取消（触控被打断、拖动中锁屏 / Alt+Tab、
+     * 窗口失焦）时不会再有 `pointerup`，`isVideoDragging` / `isSoundDragging` 会永久为真 ——
+     * 进度显示被冻在 `draggingTime`、真实播放进度再也不更新，音量条也被钉在展开态。
+     */
+    endDrag(e?: PointerEvent) {
+      if (e && this.activeEl) {
         try {
           this.activeEl.releasePointerCapture(e.pointerId);
         } catch {
           /* 指针可能已经释放，忽略 */
         }
-        this.activeEl = null;
       }
+      this.activeEl = null;
       if (this.isVideoDragging) {
         this.isVideoDragging = false;
       }
@@ -340,6 +356,15 @@ export default defineComponent({
     },
   },
   computed: {
+    /**
+     * 跑马灯标题（净化过的 HTML）
+     *
+     * 保留 B 站搜索结果的 `<em>` 关键词高亮，其余标签一律转义 —— 标题是第三方数据，
+     * 直接 `v-html="videoName"` 是可以注入的（`<img src=x onerror=…>`）。
+     */
+    safeVideoName(): string {
+      return sanitizeTitleHtml(this.videoName);
+    },
     /** 封面地址（规整成绝对 https，避免协议相对 URL 在 file:// 下坏掉） */
     coverUrl(): string {
       return normalizeImageUrl(this.cover) ?? '';
@@ -376,10 +401,16 @@ export default defineComponent({
       return this.audioChoices.length > 1 ? `${base}（点击切换）` : base;
     },
     progress(): number {
-      return (
+      /**
+       * 必须收口到 0~1
+       *
+       * 切清晰度、重新解析期间 `duration` 会短暂为 0 或变小，此时 `currentTime > duration`，
+       * 不收口就会算出 >100% 的宽度 —— 进度条和右侧滑块直接画到容器外面去。
+       */
+      const raw =
         (this.isVideoDragging ? this.draggingTime : this.currentTime) /
-        (this.duration || 1)
-      );
+        (this.duration || 1);
+      return Math.min(1, Math.max(0, Number.isFinite(raw) ? raw : 0));
     },
   },
   watch: {

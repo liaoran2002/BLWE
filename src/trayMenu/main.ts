@@ -142,15 +142,45 @@ const ITEMS: Item[] = [
  * 用户按下和抬起之间元素被换掉，`mouseup` 就落不到同一个元素上（点不动）。
  * 每个元素自己记住当前动作，只有文案随状态变。
  */
+/**
+ * 统一包一层失败处理
+ *
+ * 托盘菜单页里所有调用都是「发出去就不管」的：主进程 handler 一旦抛错，
+ * 渲染侧就是未处理的 promise rejection —— 而动作的前半段（收起菜单）已经执行了，
+ * 用户看到的是「点了没反应」，也没有任何地方能看出失败。
+ */
+const run = (action: TrayMenuAction, value?: number): void => {
+  api.trayMenuAction(action, value).catch((err) => {
+    console.warn(`[tray] 动作 ${action} 失败:`, err);
+  });
+}
+
 const listEls: { el: HTMLElement; current: TrayMenuAction }[] = ITEMS.map((item) => {
   const el = document.createElement('div')
   el.className = item.danger ? 'item danger' : 'item'
   const entry = { el, current: 'showPlaylist' as TrayMenuAction }
-  // 用 `mouseup` 而不是 `click`：壁纸模式下的鼠标转发可能抢走 mousedown，
-  // down / up 不在同一元素上时浏览器不合成 `click`。mouseup 一定收得到。
+  /**
+   * 用 `mouseup` 而不是 `click`：壁纸模式下的鼠标转发可能抢走 mousedown，
+   * down / up 不在同一元素上时浏览器不合成 `click`。mouseup 一定收得到。
+   *
+   * 但正因为靠 `mouseup`，必须自己校验「按下与抬起是同一项」：
+   * 从「设置歌单」按下、滑到「退出程序」再松手（托盘菜单这种小面板很常见），
+   * 原来会执行抬起那一项 —— 直接把应用退掉。所以记下按下的元素，抬起时比对。
+   */
+  let pressedOn: HTMLElement | null = null
+  el.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return
+    pressedOn = el
+  })
   el.addEventListener('mouseup', (e) => {
     if (e.button !== 0) return
-    void api.trayMenuAction(entry.current)
+    const same = pressedOn === el
+    pressedOn = null
+    if (!same) {
+      console.warn('[tray] 按下与抬起不在同一项，忽略这次点击')
+      return
+    }
+    run(entry.current)
   })
   listEl.appendChild(el)
   return entry
@@ -224,7 +254,7 @@ const finishSeek = (e: PointerEvent): void => {
     /* 忽略 */
   }
   // 主进程会顺手收起菜单
-  void api.trayMenuAction('seek', seekRatio)
+  run('seek', seekRatio)
   repaintSeekDrag()
 }
 seekTrack.addEventListener('pointerup', finishSeek)
@@ -270,7 +300,7 @@ volumeTrack.addEventListener('pointermove', (e) => {
   if (!volDragging) return
   volValue = volumeFromEvent(e)
   paintVolume(volValue, false)
-  void api.trayMenuAction('volume', volValue)
+  run('volume', volValue)
 })
 const finishVolume = (e: PointerEvent): void => {
   if (!volDragging) return
@@ -280,7 +310,7 @@ const finishVolume = (e: PointerEvent): void => {
   } catch {
     /* 忽略 */
   }
-  void api.trayMenuAction('volume', volValue)
+  run('volume', volValue)
 }
 volumeTrack.addEventListener('pointerup', finishVolume)
 volumeTrack.addEventListener('pointercancel', finishVolume)
@@ -296,7 +326,7 @@ volumeBtn.addEventListener('mouseup', (e) => {
   const muted = volumeBtn.className.includes('icon-sound-off')
   if (muted) paintVolume(lastNonZeroVol || 70, false)
   else paintVolume(0, true)
-  void api.trayMenuAction('toggleMute')
+  run('toggleMute')
 })
 
 // #endregion
@@ -307,7 +337,7 @@ const bind = (el: HTMLElement, action: TrayMenuAction, title?: string): void => 
   if (title) el.title = title
   el.addEventListener('mouseup', (e) => {
     if (e.button !== 0) return
-    void api.trayMenuAction(action)
+    run(action)
   })
 }
 bind(prevBtn, 'prev', '上一首')
@@ -347,7 +377,7 @@ const reportHeight = (): void => {
   const height = Math.ceil(root.getBoundingClientRect().height)
   if (height === reportedHeight) return
   reportedHeight = height
-  void api.trayMenuReady(height)
+  api.trayMenuReady(height).catch((err) => console.warn('[tray] 回报高度失败:', err))
 }
 
 api.onTrayMenuState((state) => {
@@ -357,11 +387,18 @@ api.onTrayMenuState((state) => {
 
 // Esc 收起（和原生菜单一致）
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') void api.trayMenuClose()
+  if (e.key === 'Escape') api.trayMenuClose().catch(() => {})
 })
 
 // 首帧先要一次状态：主进程可能在我们监听之前就推过了
-void api.trayMenuGetState().then((state) => {
-  apply(state)
-  reportHeight()
-})
+void api
+  .trayMenuGetState()
+  .then((state) => {
+    apply(state)
+    reportHeight()
+  })
+  .catch((err) => {
+    // 拿不到状态也别让菜单空着：留一句提示，至少知道出事了
+    console.warn('[tray] 获取菜单状态失败:', err)
+    titleEl.textContent = '（读取状态失败）'
+  })

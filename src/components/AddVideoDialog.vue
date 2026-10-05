@@ -94,6 +94,8 @@ export default defineComponent({
       parsed: false,
       info: null as ParsedVideoInfo | null,
       coverFailed: false,
+      /** 解析请求序号：关闭弹窗 / 重新解析都会 +1，用来丢弃过期响应 */
+      _req: 0,
     };
   },
   computed: {
@@ -109,6 +111,17 @@ export default defineComponent({
         this.parsed = false;
         this.info = null;
         this.coverFailed = false;
+        this.parsing = false;
+      } else {
+        /**
+         * 关闭时把在飞的解析请求作废
+         *
+         * 组件实例是复用的（el-dialog 只是收起内容），点「解析」后立刻关掉再打开时，
+         * 旧响应会写进已经重置过的新表单 —— 表现是「一打开就冒出上次的视频预览」，
+         * 接着点「确认」就把那个不相干的视频收藏进了当前歌曲。
+         */
+        this._req += 1;
+        this.parsing = false;
       }
     },
   },
@@ -122,16 +135,21 @@ export default defineComponent({
         ElMessage.warning('请先粘贴视频链接或 BV 号');
         return;
       }
+      // 请求序号：回来时对不上就丢弃（弹窗已关闭 / 又发起了一次解析）
+      const req = ++this._req;
       this.parsing = true;
       this.coverFailed = false;
       try {
-        this.info = await api.parseVideo(text);
+        const info = await api.parseVideo(text);
+        if (req !== this._req) return;
+        this.info = info;
         this.parsed = true;
       } catch (err) {
+        if (req !== this._req) return;
         this.info = null;
         ElMessage.error(this.errMsg(err));
       } finally {
-        this.parsing = false;
+        if (req === this._req) this.parsing = false;
       }
     },
     confirm(): void {

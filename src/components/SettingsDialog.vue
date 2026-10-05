@@ -59,6 +59,15 @@
             "
           />
         </div>
+        <div class="st-row">
+          <div class="st-name">全屏自动锁定</div>
+          <el-switch
+            :model-value="setting['player.lockOnFullscreen']"
+            @update:model-value="
+              (v: string | number | boolean) => setBool('player.lockOnFullscreen', v)
+            "
+          />
+        </div>
       </div>
 
       <!-- 界面 -->
@@ -303,6 +312,7 @@ export default defineComponent({
       key:
         | 'player.resumeOnStart'
         | 'player.pauseOnDeviceChange'
+        | 'player.lockOnFullscreen'
         | 'common.wallpaperMode'
         | 'common.closeToTray'
         | 'common.taskbarProgress',

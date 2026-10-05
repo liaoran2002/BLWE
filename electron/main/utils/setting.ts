@@ -128,11 +128,33 @@ export const updateSetting = (partial?: Partial<AppSetting> | null): Partial<App
     return {}
   }
 
+  /**
+   * 轻量 schema 校验：只接受「已知 key + 与默认值同类型」的项
+   *
+   * `mergeSetting` 已经会丢掉未知 key，但**不校验值的类型** —— 渲染层一个类型 bug
+   * （或以后做「导入配置」）就能把 `player.tagBonus` 写成字符串、`player.volume` 写成对象，
+   * 而且会被下次启动当成权威值直接信任（`App.vue` 里 `Object.entries(tagBonusConfig)` 会炸）。
+   * `version` 一律不接受渲染层写入，它由迁移逻辑自己维护。
+   */
+  const defaults = defaultSetting as unknown as Record<string, unknown>
+  const safe: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(partial as Record<string, unknown>)) {
+    if (key === 'version') continue
+    const expected = defaults[key]
+    if (expected === undefined) continue
+    if (typeof expected !== typeof value) {
+      console.warn(`[setting] 忽略类型不符的配置项 ${key}:`, value)
+      continue
+    }
+    safe[key] = value
+  }
+  if (Object.keys(safe).length === 0) return {}
+
   // 关键：必须先对当前值做深拷贝再合并。
   // 否则 updateSetting({...}) 只改引用相同的嵌套对象（如 player.tagBonus），
   // mergeSetting 会因为引用相等而判定"没有变化"，导致更新静默丢失。
   const current = structuredClone(appSetting)
-  const { setting, updatedSetting, updatedSettingKeys } = mergeSetting(current, partial)
+  const { setting, updatedSetting, updatedSettingKeys } = mergeSetting(current, safe)
 
   // 没有任何变化就不写盘、不广播，避免无意义的 IO 与多窗口抖动
   if (updatedSettingKeys.length === 0) return {}

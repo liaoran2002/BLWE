@@ -57,14 +57,14 @@ export interface AppSetting {
   'player.isMute': boolean
   /** 切歌模式 */
   'player.loopMode': (typeof import('../constants').PLAY_LOOP_MODES)[number]
-  /** 上次播放到第几首 */
-  'player.playIndex': number
   /** 记住播放进度：启动时回到上次的歌单 / 歌曲 / 播放位置 */
   'player.resumeOnStart': boolean
   /** 上次播放到的秒数（用于续播） */
   'player.resumeTime': number
   /** 声音输出设备变化（插拔耳机 / 切默认设备）时暂停播放 */
   'player.pauseOnDeviceChange': boolean
+  /** 进全屏时自动锁定界面（隐藏标题栏与控制栏，只留左下/右下两个按钮） */
+  'player.lockOnFullscreen': boolean
   /** 默认视频清晰度（B 站 qn 档位代码，如 116 = 1080P 60帧） */
   'player.videoQuality': number
   /** 默认音质（dash 音频流 id，如 30280 = 192K） */

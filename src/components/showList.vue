@@ -155,6 +155,7 @@
 import { defineComponent } from 'vue';
 import type { PlaylistSong } from '@common/types/playlist';
 import { normalizeImageUrl } from '../utils/image';
+import { sanitizeTitleHtml, stripTags } from '../utils/title';
 
 /**
  * 视频列表项（B 站搜索结果）
@@ -206,38 +207,11 @@ const durationText = (raw: number | string | null | undefined): string => {
   return '';
 };
 
-/** 把文本里的 HTML 特殊字符全部转义，杜绝注入 */
-const escapeHtml = (text: string): string =>
-  text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-
-/** 去掉所有标签，得到纯文本（用于 title 提示） */
-const stripTags = (html: string): string => html.replace(/<[^>]*>/g, '');
-
-/**
- * 净化标题 HTML
- *
- * B 站的搜索接口会在标题里用 `<em class="keyword">` 高亮命中的关键词，
- * 这个高亮要保留（原实现直接 v-html 渲染）。
- * 但歌单曲目名来自音乐平台/用户输入，直接 v-html 有注入风险。
- *
- * 做法：先整体转义，再把**仅有的 `<em ...>` / `</em>`** 还原。
- * 这样既留住 B 站高亮，其余一切标签都会被当作文本显示。
- *
- * 注意：转义后属性里的引号会变成 `&quot;`，所以匹配属性时
- * **必须允许 `&`**（用 `[\s\S]*?`），否则 `<em class="keyword">` 这种
- * 带属性的开标签会匹配不上，只剩闭标签被还原，反而产生破损 HTML。
+/*
+ * 标题的转义 / 净化（`stripTags` / `sanitizeTitleHtml`）已经抽到 `utils/title.ts`，
+ * 因为控制栏的跑马灯标题也要用同一套净化 —— 之前这份只在这里，
+ * 那边直接用 v-html 渲染原始标题，等于留了个注入点。
  */
-const sanitizeTitleHtml = (raw: string): string => {
-  const escaped = escapeHtml(raw);
-  return escaped
-    .replace(/&lt;em(?:\s[\s\S]*?)?&gt;/gi, '<em>')
-    .replace(/&lt;\/em&gt;/gi, '</em>');
-};
 
 export default defineComponent({
   name: 'showList',
@@ -339,6 +313,14 @@ export default defineComponent({
   watch: {
     listType(val: string) {
       if (val !== 'none') {
+        /**
+         * 每次打开都清掉「封面加载失败」的记录
+         *
+         * 那份记录以 URL 为键、跨整个界面生命周期累积：某张封面一次网络抖动失败后，
+         * 该 URL 在**后续任何列表里**都永远显示兜底图标（即使这次已经能加载了），
+         * 用户看到的是「封面时好时坏」。重新打开弹窗就是一次新的机会。
+         */
+        this.failedCovers = {};
         // 弹窗挂载 + 过渡要一点时间，等一拍再滚到当前项
         setTimeout(() => this.scrollToActive(), 120);
       } else {

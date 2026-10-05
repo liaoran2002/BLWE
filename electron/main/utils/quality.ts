@@ -12,6 +12,7 @@
  * 那是 B 站自己播放器显示的文字（例如「1080P」/「1080P 高清」/「1080P 60帧」），
  * 比按分辨率反推更准确，也能区分 60 帧、高码率这些同分辨率的档位。
  */
+import { VIDEO_QUALITY_OPTIONS } from '@common/constants'
 
 /** playurl 响应的形状（字段很多，只声明用到的） */
 interface PlayUrlLike {
@@ -33,21 +34,15 @@ interface PlayUrlLike {
   }
 }
 
-/** qn 代码 -> 标签（`support_formats` 缺失时才用到） */
-const QUALITY_LABELS: Record<number, string> = {
-  6: '240P',
-  16: '360P',
-  32: '480P',
-  64: '720P',
-  74: '720P60',
-  80: '1080P',
-  112: '1080P+',
-  116: '1080P60',
-  120: '4K',
-  125: 'HDR',
-  126: '杜比视界',
-  127: '8K',
-}
+/**
+ * qn 代码 -> 标签（`support_formats` 缺失时才用到）
+ *
+ * 直接复用 `@common/constants` 的档位表，**别再抄一份**：同一份映射写两处，
+ * 以后加档位（比如 8K 的变体）只改一处就会出现「设置里叫 X、角标里叫 Y」。
+ */
+const QUALITY_LABELS: Record<number, string> = Object.fromEntries(
+  VIDEO_QUALITY_OPTIONS.map((opt) => [opt.id, opt.label]),
+)
 
 export interface VideoQualityInfo {
   /** qn 代码，便于排查 */

@@ -129,8 +129,6 @@ export interface SyncResult {
   error?: string
 }
 
-/** 重复歌曲的处理方式（同步时固定去重，保留该类型供主进程参数使用） */
-export type DuplicatePolicy = 'keep' | 'dedupe'
 
 /**
  * 一个歌单是否可以自动同步

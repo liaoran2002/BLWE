@@ -5,7 +5,7 @@
       所有操作走托盘菜单；退出壁纸模式再显示回来。
       用 class 而不是 v-if：组件不卸载，内部状态（音量拖动等）不会丢。
     -->
-    <div class="titlebar" :class="{ 'wm-hidden': wallpaperEnabled }">
+    <div class="titlebar" :class="{ 'wm-hidden': wallpaperEnabled || locked }">
       <!-- 左侧：歌单入口（点一下直接打开歌单管理弹窗，没有二级菜单） -->
       <div class="titlebar-left">
         <PlaylistPanel @manage="playlistManagerVisible = true" />
@@ -120,7 +120,7 @@
     <!-- 「添加视频」：解析链接后加到这首歌的收藏里 -->
     <AddVideoDialog v-model="addVideoVisible" @confirm="onAddVideo" />
     <biliVideoControls
-      :class="{ 'wm-hidden': wallpaperEnabled }"
+      :class="{ 'wm-hidden': wallpaperEnabled || locked }"
       :videoName="videoName || songName"
       :cover="currentCover() || ''"
       :subtitle="controlsSubtitle"
@@ -157,6 +157,35 @@
       ></i>
     </div>
 
+    <!--
+      左下角：锁定按钮（和右下角全屏按钮同一套样式与逻辑）
+      锁定后把标题栏、控制栏、歌单入口全隐藏，只留左下/右下这两个按钮；
+      再点一次（或按 S）解锁。图标字体里没有锁，用内联 SVG。
+    -->
+    <div
+      class="corner-btn lock-btn"
+      :class="{ locked }"
+      @click="toggleLock()"
+      v-if="!wallpaperEnabled"
+      :title="locked ? '解锁（S）' : '锁定（S）'"
+    >
+      <svg
+        width="18"
+        height="18"
+        viewBox="0 0 20 20"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <rect x="4.2" y="8.6" width="11.6" height="8" rx="2" />
+        <path v-if="locked" d="M7 8.6V6.4a3 3 0 0 1 6 0v2.2" />
+        <path v-else d="M7 8.6V6.4a3 3 0 0 1 5.9-.7" />
+        <circle cx="10" cy="12.6" r="1" fill="currentColor" stroke="none" />
+      </svg>
+    </div>
+
     <!-- 歌单管理：新建 / 编辑 / 同步 / 曲目浏览全部在这一个弹窗里 -->
     <PlaylistManager
       v-model="playlistManagerVisible"
@@ -176,7 +205,7 @@
 </template>
 
 <script lang="ts">
-import { defineComponent } from 'vue';
+import { defineComponent, markRaw } from 'vue';
 import type { AppSetting } from '@common/types/app_setting';
 import defaultSetting from '@common/defaultSetting';
 import { PLAY_LOOP_MODES } from '@common/constants';
@@ -213,6 +242,13 @@ const LEAD_S = 3;
  * 留 15 秒足够，也不至于太早 —— 太早拿到的播放地址可能已经过期。
  */
 const PREFETCH_AHEAD_S = 15;
+/**
+ * 播放位置停住多久算「这条流不行了」
+ *
+ * 取 12 秒：正常网络波动、CDN 换节点都不会连着 12 秒一个字节都不来；
+ * 而用户手动点下一首的忍耐时间大概也就这么长。命中后先重解析一次，再不行才跳歌。
+ */
+const STALL_MS = 12000;
 import type {
   AppData,
   BiliVideo,
@@ -368,6 +404,8 @@ export default defineComponent({
       isMaximized: false,
       isFullscreen: false,
       wallpaperEnabled: false,
+      /** 界面锁定（只留左下锁定 + 右下全屏两个按钮），快捷键 S 或左下角按钮切换 */
+      locked: false,
       /** 自绘托盘菜单是否正开着（开着时吞掉窗口内点击） */
       trayMenuOpen: false,
       isDragging: false,
@@ -394,6 +432,8 @@ export default defineComponent({
       removeTrayToggleMode: null,
       removeTrayShowPlaylist: null,
       removeTrayShowLogoutConfirm: null,
+      /** 左键点托盘图标 -> 解锁 */
+      removeTrayUnlock: null as null | (() => void),
       removeWallpaperState: null,
       removeTraySeek: null,
       removeTrayVolume: null,
@@ -451,6 +491,16 @@ export default defineComponent({
       _bufferOverlayTimer: null as ReturnType<typeof setTimeout> | null,
       /** 预热槽位：上一首 / 下一首各一个 */
       _warm: { next: null, prev: null } as AppData['_warm'],
+      /**
+       * 某个方向是否已经「热」过了
+       *
+       * 必须有这个标志：预热媒体只拉 2 秒就 `stopWarmMedia()`，而 `_warm[dir]`（接口结果）
+       * 还要留着给切歌用 —— 只看 `_warmSession/_warmTimer` 的话，心跳每秒都会认为
+       * 「这个方向还没预热」，于是**每 3 秒重建一次 MediaSource 并重新拉流**，
+       * 一首歌下来几十次（next/prev 各一份），白白吃带宽和 CPU。
+       * 只在 `clearWarm`（切进那首 / 换歌单）里清掉。
+       */
+      _warmed: { next: false, prev: false },
       _warming: { next: false, prev: false },
       _warmEl: { next: null, prev: null } as AppData['_warmEl'],
       _warmSession: { next: null, prev: null } as AppData['_warmSession'],
@@ -461,6 +511,14 @@ export default defineComponent({
       _progressPos: 0,
       /** 本次源已经按「播完」处理过，避免看门狗重复触发 */
       _endStallHandled: false,
+      /** 停滞看门狗的起始时间戳（0 = 当前没在停滞） */
+      _stallSince: 0,
+      /** 本次停滞已经恢复过几次（真的开始播了就清零） */
+      _stallRecoveries: 0,
+      /** 单曲歌单下反复停滞：已放弃这条流，不再周期性告警 */
+      _stallGivenUp: false,
+      /** 当前这次锁定是「进全屏自动锁的」，退出全屏时要跟着解开（手工锁的不动） */
+      _lockedByFullscreen: false,
     };
   },
   methods: {
@@ -867,7 +925,6 @@ export default defineComponent({
       this.seekAfterLoad = 0;
       this.seekAfterLoadFor = '';
       await this.settingStore.update({
-        'player.playIndex': this.currentIndex,
         'player.resumeTime': 0,
       });
 
@@ -919,10 +976,25 @@ export default defineComponent({
       this._videoErrorCount = 0;
       // 任务栏进度也跟着清掉（没有在播的东西了）
       this.updateTaskbarProgress();
-      // 片尾看门狗的状态也属于上一首：换源时重新计时
+      // 片尾/停滞看门狗的状态也属于上一首：换源时重新计时
       this._endStallHandled = false;
+      this._stallSince = 0;
+      this._stallRecoveries = 0;
       this._progressPos = 0;
       this._lastProgressAt = Date.now();
+      /**
+       * 缓冲 UI 也要一起清干净
+       *
+       * 踩过：这里只清视频元素，`buffering` / 百分比 / ticker 都留着 ——
+       * 元素被 removeAttribute('src') + load() 之后 readyState = 0、buffered 为空，
+       * `syncBufferState` 的「够播了」永远不成立，于是缓冲圈以 0% 永久挂在屏幕上，
+       * 250ms 的 ticker 也一直空转。触发路径很常见：搜索失败、歌单删空、没搜到视频。
+       */
+      this.clearBufferOverlayTimer();
+      this.stopBufferTicker();
+      this.buffering = false;
+      this.bufferPercent = 0;
+      this.bufferSeconds = 0;
       // 预热结果（含隐藏的预热流）属于上一首的上下文，一起清掉
       this.clearAllWarm();
       this.syncTrayState();
@@ -1016,6 +1088,40 @@ export default defineComponent({
       );
     },
     /**
+     * 锁定 / 解锁
+     *
+     * 锁定 = 把标题栏、控制栏、歌单入口全藏起来（`.wm-hidden`），窗口只剩画面，
+     * 只留左下（锁定）和右下（全屏）两个按钮 —— 那俩是唯一的解锁入口，不能一起藏。
+     * 快捷键 S 走同一个方法。
+     *
+     * 提示文案照全屏那条抄（同样的语气与「按 X 可以…」结构）。
+     */
+    toggleLock(force?: boolean): void {
+      const next = typeof force === 'boolean' ? force : !this.locked;
+      if (next === this.locked) return;
+      this.locked = next;
+      // 手工解锁之后就别再让「退出全屏」把它又改回去
+      if (!next) this._lockedByFullscreen = false;
+      this.$message.info(
+        next ? '已锁定,按S键或点左下角按钮可以解锁' : '已解锁,按S键可以再次锁定',
+      );
+    },
+    /**
+     * 有没有弹窗开着
+     *
+     * 弹窗是模态的（遮罩挡住整窗），这时按 S 锁定会在弹窗底下藏界面，
+     * 所以快捷键在这种情况下直接不响应 —— 锁定按钮本来也点不到。
+     */
+    anyDialogOpen(): boolean {
+      return (
+        this.listType !== 'none' ||
+        this.playlistManagerVisible ||
+        this.settingsVisible ||
+        this.aboutVisible ||
+        this.addVideoVisible
+      );
+    },
+    /**
      * 缓冲提示
      *
      * 显示时机只由 `<video>` 自己的信号决定（waiting / stalled / seeking / 换源），
@@ -1042,10 +1148,27 @@ export default defineComponent({
       // 已经出画：撤掉还没到点的换源提示
       this.clearBufferOverlayTimer();
     },
-    /** 已经缓冲到第几秒（取最后一段的末尾；没数据返回 0） */
+    /** 已经缓冲到第几秒（取**包含当前播放点**的那一段的末尾） */
     lastBufferedEnd(): number {
       const el = this.videoEl();
       if (!el || !el.buffered.length) return 0;
+      const t = el.currentTime;
+      /**
+       * 为什么要挑「包含播放点」的那一段
+       *
+       * 往前拖到未缓冲区域后，`buffered` 会出现第二段区间（比如 [0,10] 和 [60,90]）。
+       * 直接取最后一段的末尾（90）会把「已缓冲 80 秒」这种虚高的数字报给界面，
+       * 于是「够播了」可能提前成立、缓冲提示被撤掉；预热那边「自己缓冲是否充足」的
+       * 带宽闸门也会被骗着在真缺数据时去抢带宽。
+       */
+      for (let i = 0; i < el.buffered.length; i += 1) {
+        if (t >= el.buffered.start(i) && t <= el.buffered.end(i)) return el.buffered.end(i);
+      }
+      /**
+       * 播放点不在任何缓冲段里（刚开始加载 / 正在拖动）：沿用「最后一段末尾」的老行为。
+       * 这里刻意保守 —— 换成返回 0 会让起播瞬间的 `bufferSeconds` 变成 0，
+       * 「够播了」不成立，缓冲提示反而不该亮的时候亮着。
+       */
       return el.buffered.end(el.buffered.length - 1);
     },
     /**
@@ -1091,8 +1214,108 @@ export default defineComponent({
       if (this._endWatchTimer) return;
       this._endWatchTimer = setInterval(() => {
         this.checkEndOfStream();
+        // 片尾看门狗之外，再管「中途/刚开播就不动了」的情况
+        this.checkPlaybackStall();
         this.maybeWarm();
       }, 1000);
+    },
+    /**
+     * 播放停滞看门狗（不只是片尾）
+     *
+     * 用户反馈：偶尔一打开就显示「99% 缓冲」卡住，点一下下一首就好了。
+     * 那种情况是「有数据但不继续来」：`syncBufferState` 的隐藏条件是
+     * `readyState >= 3` 且余量够 1 秒，数据不来就永远不满足；而百分比被夹在 99
+     * （分母是「播放点 + 余量」，没下完就不会到 100），于是圈一直挂着。
+     *
+     * 判据（1 秒心跳里看，都要满足）：
+     *  - 没暂停 / 没拖动 / 已经拿到时长（真的在放一条片子）
+     *  - 不在最后 2 秒（片尾另有 `checkEndOfStream`）
+     *  - 播放位置连续 `STALL_MS` 没前进（`_lastProgressAt` 由 timeupdate 维护）
+     * 命中后按「先重解析、再跳下一首」两级处理，和 `videoError` 的思路一致。
+     */
+    checkPlaybackStall(): void {
+      const v = this.videoEl();
+      // 已经判定这条流救不回来（单曲歌单 + 反复停滞）：别再周期性告警
+      if (this._stallGivenUp) return;
+      if (!v || v.paused || v.seeking) {
+        // 暂停/拖动时不动是正常的：计时和「已恢复几次」都清掉，
+        // 否则用户暂停过一次，本曲第一次真停滞会直接走「已跳过」而省掉重解析
+        this._stallSince = 0;
+        this._stallRecoveries = 0;
+        return;
+      }
+      /**
+       * 还没给过源就不管：起播前本来就该等。
+       * 判据用 `currentSrc`（MSE 下是 blob: 地址，普通播放是直链），它空着说明连源都没设。
+       */
+      if (!v.currentSrc) {
+        this._stallSince = 0;
+        return;
+      }
+      const d = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+      /**
+       * **`duration` 为 0 正是用户报的那个场景**，不能提前 return。
+       *
+       * 现场是：时长那里显示 `0:00`、缓冲圈停在 99%。原因是 MSE 已经有分片进来了
+       * （所以 `buffered.end()` 有值、百分比能算到 99），但整条的 duration 一直没确定、
+       * `readyState` 也上不去 —— 于是 `syncBufferState` 的隐藏条件永远不满足，圈就挂着。
+       * 原来这里写了「没拿到时长就直接返回」，等于把这个场景排除在保护之外。
+       */
+      const noDuration = d === 0;
+      if (!noDuration && v.currentTime >= d - 2) {
+        // 片尾交给 checkEndOfStream，别两边同时动手
+        this._stallSince = 0;
+        return;
+      }
+      // 2 秒内有前进就算正常（timeupdate 约 250ms 一次，留足余量）
+      if (Date.now() - this._lastProgressAt < 2000) {
+        this._stallSince = 0;
+        this._stallRecoveries = 0;
+        return;
+      }
+      if (!this._stallSince) {
+        this._stallSince = Date.now();
+        return;
+      }
+      if (Date.now() - this._stallSince < STALL_MS) return;
+
+      // 记一次恢复尝试，并把计时重置为「再看一个 STALL_MS」
+      this._stallSince = Date.now();
+      this._stallRecoveries += 1;
+      const video = this.videoList[this.currentVideoIndex];
+      console.warn(
+        `[video] 播放停滞 ${STALL_MS}ms（t=${v.currentTime.toFixed(1)} duration=${d} readyState=${v.readyState} 第 ${this._stallRecoveries} 次恢复）`,
+      );
+
+      if (this._stallRecoveries === 1) {
+        this.$message.warning(
+          noDuration ? '这条视频没能加载出来，正在重新解析…' : '缓冲停住了，正在重新解析这条视频的地址…',
+        );
+        if (video && this.videoListKeyword === this.songName) {
+          void this.changeVideo(video.bvid, this.videoListKeyword, { skipCache: true });
+        } else {
+          void this.videoError();
+        }
+        return;
+      }
+
+      this._stallRecoveries = 0;
+      const label = `《${this.songName || '当前歌曲'}》`;
+      if (this.songs.length > 1) {
+        this.$message.warning(`${label}这条视频拉不动，已跳过`);
+        this.next();
+        return;
+      }
+      /**
+       * 单曲歌单没有「下一首」可跳
+       *
+       * 原来这里只把计数归零、照样弹提示 —— 于是每 12 秒刷一次同样的告警，
+       * 永远不恢复也不停。改成只提示一次并**放弃这条流**，别再空转。
+       */
+      if (!this._stallGivenUp) {
+        this._stallGivenUp = true;
+        this.$message.warning(`${label}这条视频一直拉不动，可以换个视频源试试`);
+      }
     },
     /**
      * 预热「上一首 / 下一首」
@@ -1165,6 +1388,8 @@ export default defineComponent({
           videoUrl: url.videoUrl ?? null,
           dash: url.dash ?? null,
         };
+        // 换了一首歌的预热结果 → 「热过了」的标记要跟着重置，否则它永远不会被真正拉起来
+        this._warmed[dir] = false;
         console.log(`[prefetch] 已备好${dir === 'next' ? '下一首' : '上一首'}：${songName}`);
       } catch (err) {
         // 预热失败完全不影响正常切歌（该联网还是联网），静默记一笔
@@ -1186,7 +1411,7 @@ export default defineComponent({
      */
     warmMedia(dir: 'next' | 'prev'): void {
       const info = this._warm[dir];
-      if (!info || this._warmSession[dir] || this._warmTimer[dir]) return;
+      if (!info || this._warmed[dir] || this._warmSession[dir] || this._warmTimer[dir]) return;
       const nearEnd = this.duration > 0 && this.duration - this.currentTime <= PREFETCH_AHEAD_S;
       // 自己这边都快不够播了就先不抢带宽（近片尾时例外：马上要切了）
       if (this.bufferSeconds < 5 && !nearEnd) return;
@@ -1207,7 +1432,8 @@ export default defineComponent({
         this.stopWarmMedia(dir);
         return;
       }
-      // 只要开头那一小段，别把整条片子下下来
+      // 只要开头那一小段，别把整条片子下下来；拉过就标记「这个方向热了」，不再重复拉
+      this._warmed[dir] = true;
       this._warmTimer[dir] = setTimeout(() => this.stopWarmMedia(dir), 2000);
     },
     /** 取（或创建）预热用的隐藏元素：移出可视区、静音，绝不参与界面 */
@@ -1254,6 +1480,8 @@ export default defineComponent({
     clearWarm(dir: 'next' | 'prev'): void {
       this.stopWarmMedia(dir);
       this._warm[dir] = null;
+      // 结果作废 → 「热过了」的标记也一起清掉，下一首才有机会再预热
+      this._warmed[dir] = false;
     },
     /** 两个方向全部作废（换歌单 / 清空播放） */
     clearAllWarm(): void {
@@ -1389,8 +1617,10 @@ export default defineComponent({
           this.seekAfterLoadFor = '';
         }
         this._videoErrorCount = 0;
-        // 新的源开始了：片尾看门狗的两个状态一起复位
+        // 新的源开始了：片尾看门狗与停滞看门狗的状态一起复位
         this._endStallHandled = false;
+        this._stallSince = 0;
+        this._stallRecoveries = 0;
         this._progressPos = 0;
         this._lastProgressAt = Date.now();
         // 如果这次切进来的正是预热过的那首，对应槽位就作废了
@@ -1474,6 +1704,18 @@ export default defineComponent({
           }
           void v.play().catch(() => {});
         }
+        /**
+         * 看门狗状态必须一起复位
+         *
+         * 单曲循环走的是「拨回 0 再 play」，不会重新触发 `loadeddata`，
+         * 也就是 `onVideoLoaded` 里那次复位不会发生 —— 而 `checkEndOfStream` 第一行就是
+         * `if (this._endStallHandled) return`。不复位的话，第二圈开始片尾看门狗永久失效，
+         * 「播到最后一秒卡住」会原样重现。
+         */
+        this._endStallHandled = false;
+        this._progressPos = 0;
+        this._lastProgressAt = Date.now();
+        this._stallSince = 0;
         this.paused = false;
         this.syncTrayState();
         this.updateMediaSession();
@@ -1611,6 +1853,13 @@ export default defineComponent({
           e.preventDefault();
           this.toggleFullscreen();
           break;
+        case 'KeyS':
+          // 锁定 / 解锁；输入框里打字不受影响（上面挡掉了 INPUT/TEXTAREA），
+          // 弹窗开着时也不响应（模态遮罩下按 S 会在弹窗背后藏界面）
+          if (this.anyDialogOpen()) break;
+          e.preventDefault();
+          this.toggleLock();
+          break;
         case 'Escape':
           e.preventDefault();
           if (this.isFullscreen) this.toggleFullscreen();
@@ -1677,6 +1926,18 @@ export default defineComponent({
       this.audioQualityDesc = '';
       this.qualityOptions = null;
       this.videoQualityPixels = '';
+      /**
+       * 上一首的看门狗状态要在这里就作废
+       *
+       * `changeSong` 之后有一段「搜索 + 解析」的空窗（网络往返可能好几秒），
+       * 期间旧 `<video>` 还挂着旧源、1 秒心跳照样在跑：如果旧视频正好卡在最后 2 秒
+       * （就是「缓冲到底但没触发 ended」那个已知场景），片尾看门狗会在空窗里命中并
+       * `videoEnded() → next()` —— 用户点一次下一首实际跳过两首。
+       */
+      this._endStallHandled = true;
+      this._lastProgressAt = Date.now();
+      this._stallSince = 0;
+      this._stallRecoveries = 0;
       // 进度也属于上一首：不复位的话 playCurrent 会把上一首的秒数写进 resumeTime，
       // 键盘 / SMTC 拖进度还会拿它去定位新歌
       this.currentTime = 0;
@@ -1833,6 +2094,19 @@ export default defineComponent({
       this.stopDashSession();
 
       /**
+       * 换了源就重置停滞看门狗的计时
+       *
+       * 必须在这里做：`currentSrc` 一设上就非空，而 `_lastProgressAt` 若还停在上一首
+       * 最后一次推进的时间（可能很久以前），新源起播超过 12 秒就会被误判成「停滞」，
+       * 弹提示并把**正在加载**的那个请求用 `changeVideo(skipCache)` 顶掉；
+       * 重解析也慢的话再过 12 秒就变成「拉不动，已跳过」。
+       */
+      this._lastProgressAt = Date.now();
+      this._stallSince = 0;
+      // 换了源就重新给这条流机会（上一轮可能已经判定放弃过）
+      this._stallGivenUp = false;
+
+      /**
        * 换源时**不要立刻**亮缓冲提示。
        *
        * 搜索 / 播放地址都有缓存时，切歌常常 200~400ms 就出画了，
@@ -1848,7 +2122,14 @@ export default defineComponent({
       const dash = this.dashSource;
       if (dash && DashSession.isSupported(dash)) {
         const session = new DashSession(el);
-        this._dashSession = session;
+        /**
+         * `markRaw` 不能省：`data()` 里的对象会被 Vue 变成响应式，读 `this._dashSession`
+         * 拿到的是 **reactive 代理**，而闭包里的 `session` 是原始对象 —— 两者 `!==` 恒为真，
+         * 下面那句「期间已经换过源就忽略」会把**每一次**失败都当成「已经换过源」，
+         * `fallbackToDurl()` 成了死代码。表现是 dash 起播失败（sourceopen 超时、配额耗尽，
+         * 这些都不触发 <video> 的 error）时黑屏挂着，最后整首歌被跳过。
+         */
+        this._dashSession = markRaw(session);
         session
           .start(dash)
           .catch((err) => {
@@ -1860,8 +2141,18 @@ export default defineComponent({
         return;
       }
 
+      /**
+       * 环境不支持这条 dash 编码：**必须真的退回 durl**
+       *
+       * 踩过：这里原来只打一行「改用 durl」的日志，什么都没做；而此时旧会话已经 stop、
+       * blob 地址也 revoke 过了，走 dash 时主进程回的 `videoUrl` 本来就是 null ——
+       * 结果新源根本没设上，画面停在上一首，界面却已经是新歌名，下一首还会重复。
+       */
       if (dash && !DashSession.isSupported(dash)) {
-        console.warn('[video] 当前环境不支持该 dash 编码，改用 durl');
+        console.warn('[video] 当前环境不支持该 dash 编码，退回 durl');
+        this._dashDisabled = true;
+        this.fallbackToDurl();
+        return;
       }
       if (this.videoUrl) el.src = this.videoUrl;
     },
@@ -2218,7 +2509,6 @@ export default defineComponent({
       const record = this.playlistsStore.current;
       if (!record) return;
       const patch: Partial<AppSetting> = {
-        'player.playIndex': this.currentIndex,
         'player.resumeTime': Math.floor(this.currentTime || 0),
       };
       void this.settingStore.update(patch);
@@ -2283,7 +2573,6 @@ export default defineComponent({
      */
     onBeforeUnload(): void {
       const patch: Partial<AppSetting> = {
-        'player.playIndex': this.currentIndex,
         'player.resumeTime': Math.floor(this.currentTime || 0),
       };
       this.settingStore.update(patch);
@@ -2456,6 +2745,31 @@ export default defineComponent({
       this.addVideoVisible = false;
     },
     /**
+     * 全屏 -> 自动锁定（设置里开关，默认关）
+     *
+     * 进全屏时锁上、退出全屏时解开，但**只动「因全屏而锁」的那次**：
+     * 用户自己按 S 锁的，退出全屏不该替他解开。
+     */
+    isFullscreen(full: boolean): void {
+      if (full) {
+        /**
+         * 只有**本次真的由全屏触发了锁定**才记来源
+         *
+         * 用户可能自己按 S 锁着再进全屏：这时不能把「解锁的责任」算在全屏头上，
+         * 否则退出全屏会替他解开（与这段的初衷相反）。
+         */
+        if (this.settingStore.setting['player.lockOnFullscreen'] && !this.locked) {
+          this._lockedByFullscreen = true;
+          this.toggleLock(true);
+        }
+        return;
+      }
+      if (this._lockedByFullscreen) {
+        this._lockedByFullscreen = false;
+        if (this.locked) this.toggleLock(false);
+      }
+    },
+    /**
      * 配置可能在别处被改动（多窗口同步、托盘、恢复默认），
      * 所以要把 Pinia 里的音量/静音同步回本地播放状态，并作用到 <video> 上。
      *
@@ -2532,6 +2846,15 @@ export default defineComponent({
         this.handleLogoutConfirm();
       },
     );
+    /**
+     * 左键点托盘图标 = 回到窗口 + 解锁
+     *
+     * 窗口模式 + 锁定状态下，界面只剩左下右下两个角按钮，用户自然会去点托盘；
+     * 这里用 `toggleLock(false)`（幂等）：没锁就什么都不做，也不会多弹一条提示。
+     */
+    this.removeTrayUnlock = electronApi.onTrayUnlock(() => {
+      this.toggleLock(false);
+    });
     this.removeWallpaperState = electronApi.onWallpaperState((enabled) => {
       this.wallpaperEnabled = enabled;
     });
@@ -2608,6 +2931,7 @@ export default defineComponent({
     if (this.removeTrayToggleMute) this.removeTrayToggleMute();
     if (this.removeTrayShowPlaylist) this.removeTrayShowPlaylist();
     if (this.removeTrayShowLogoutConfirm) this.removeTrayShowLogoutConfirm();
+    if (this.removeTrayUnlock) this.removeTrayUnlock();
     if (this.removeWallpaperState) this.removeWallpaperState();
     if (this.removeMaximizedListener) this.removeMaximizedListener();
     if (this.removeFullscreenListener) this.removeFullscreenListener();
@@ -2990,5 +3314,46 @@ html[data-tint='dark'] {
 .fullscreen-btn .iconfont {
   font-size: 20px;
   line-height: 1;
+}
+
+/*
+ * 左下角的锁定按钮
+ *
+ * 和右下角全屏按钮完全同一套外观，只是贴左边；锁定状态下这俩按钮**都要留着**
+ * （界面其它部分都藏起来了，没有它们就没法解锁）。
+ */
+.corner-btn {
+  position: fixed;
+  bottom: 16px;
+  z-index: 100;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--glass-text);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  text-shadow: var(--glass-shadow);
+  transition: all 0.2s;
+  opacity: 0.2;
+}
+.corner-btn:hover {
+  opacity: 1;
+  background: var(--glass-bg-strong);
+}
+.lock-btn {
+  left: 16px;
+}
+/* 锁着的时候让它明显一点，否则界面上什么都看不到、这个按钮又是半透明的 */
+.lock-btn.locked {
+  opacity: 0.75;
+}
+.lock-btn.locked:hover {
+  opacity: 1;
 }
 </style>

@@ -29,7 +29,10 @@
 │   │   ├── types/
 │   │   │   ├── app_setting.ts      #   AppSetting 全量配置 TS 接口（扁平点号键）
 │   │   │   ├── ipc.ts              #   IPC 频道契约 ChannelMap（入参/返回值）
-│   │   │   └── api.ts              #   preload 暴露给 window 的 api 契约
+│   │   │   ├── api.ts              #   preload 暴露给 window 的 api 契约
+│   │   │   ├── playlist.ts         #   歌单 / 曲目 / 收藏视频的类型与搜索键
+│   │   │   ├── musicSdk.ts         #   多平台音源的类型
+│   │   │   └── cache_stats.ts      #   缓存占用统计的返回结构
 │   │   ├── defaultSetting.ts       #   默认配置对象（satisfies 强校验）
 │   │   ├── constants.ts            #   配置版本号、存储名等常量
 │   │   ├── ipcNames.ts             #   广播事件名（invoke 频道名走 types/ipc.ts 的类型）
@@ -41,8 +44,11 @@
 │   │       └── common.ts           #   compareVer / debounce
 │   ├── main/
 │   │   ├── index.ts                # 入口：便携模式 → 初始化配置/歌单 → 注册 IPC → 建窗口
+│   │   ├── ipcHandlers.ts          # 组装各领域 handler（IpcContext 依赖注入）
+│   │   ├── protection.ts           # ★ 打包后渲染层资源的 blmv:// 解密协议
+│   │   ├── bundleKey.ts            # 打包加密用的对称密钥（会被编进主进程字节码）
 │   │   ├── portable.ts             # 便携版数据目录（%APPDATA% 优先，否则 exe 同级 data/）
-│   │   ├── biliApi.ts              # B站 API（搜索/视频解析/WBI 签名）
+│   │   ├── biliApi.ts              # B站 API（搜索/视频解析/WBI 签名/登录态）
 │   │   ├── music/                  # ★ 多平台歌单解析（移植自 LX 的 musicSdk）
 │   │   │   ├── index.ts            #   音源总表 + 按链接自动识别平台
 │   │   │   ├── http.ts             #   请求层（跟随重定向 / 超时 / 解压）
@@ -54,30 +60,42 @@
 │   │   │       └── kw.ts           #   酷我音乐（pl.svc）
 │   │   ├── utils/
 │   │   │   ├── setting.ts          # ★ 配置服务：内存常驻 + 防抖落盘 + 变更通知
-│   │   │   ├── playlist.ts         # ★ 歌单集合服务：迁移 / 增删改 / 同步
+│   │   │   ├── playlist.ts         # ★ 歌单集合服务：迁移 / 增删改 / 同步 / 收藏
 │   │   │   ├── store.ts            # 原子写入的 JSON 存储
 │   │   │   ├── atomicJson.ts       # 公共的「temp + rename」原子写
-│   │   │   └── cache.ts            # 搜索缓存（文件名 = 关键词 md5）
-│   │   └── ipc/                    # 按领域拆分的 IPC handler
+│   │   │   ├── cache.ts            # 搜索缓存（文件名 = 关键词 md5）
+│   │   │   └── quality.ts          # 从 playurl 响应读出「实际在播」的档位（档位表在 @common/constants）
+│   │   └── ipc/                    # 按领域拆分的 handler：app / auth / window / wallpaper /
+│   │                               #   tray / setting / playlist / cache / music / biliApi
 │   ├── preload/
 │   │   ├── index.ts                # contextBridge 暴露类型化 api
 │   │   └── index.d.ts              # window.electronAPI 全局声明
 ├── src/                            # 渲染进程
 │   ├── main.ts                     # 挂载前先拉配置 + 挂广播监听
-│   ├── App.vue
+│   ├── App.vue                     # ★ 播放核心：切歌/续播/缓冲/两个看门狗/预热/快捷键/锁定/托盘同步
 │   ├── stores/
 │   │   ├── setting.ts              # ★ Pinia：配置的响应式副本
-│   │   └── playlists.ts            # ★ Pinia：歌单集合 + 同步编排
+│   │   └── playlists.ts            # ★ Pinia：歌单集合 + 同步编排 + 收藏
 │   ├── api/electron.ts             # 直接透出 window.electronAPI（已带类型）
 │   ├── assets/                     # 图标字体 + 头像（avatar.jpg / avatar-fish.jpg）
+│   ├── trayMenu/main.ts            # ★ 自绘托盘菜单页逻辑（独立窗口 / 独立构建入口）
 │   ├── types/app.ts                # 组件数据类型
+│   ├── utils/
+│   │   ├── dashPlayer.ts           # ★ MSE（dash）分片调度
+│   │   ├── videoQuality.ts         # 按解码分辨率兜底一个清晰度标签
+│   │   ├── image.ts                # 图片地址规整
+│   │   ├── plain.ts                # 去响应式（写盘前）
+│   │   └── uiTheme.ts              # 主题令牌（颜色/模糊/阴影）
 │   └── components/
 │       ├── PlaylistPanel.vue       # ★ 左上歌单入口（点一下直接开管理弹窗）
 │       ├── PlaylistManager.vue     # ★ 歌单管理弹窗（新建 / 编辑 / 同步 / 曲目）
 │       ├── SettingsDialog.vue      # ★ 设置弹窗
 │       ├── AboutDialog.vue         # ★ 关于弹窗（仓库地址 / 作者与 DeepSeek·大肥鱼头像）
+│       ├── AddVideoDialog.vue      # ★ 「添加视频」弹窗（粘贴链接 → 解析 → 收藏）
 │       ├── biliVideoControls.vue   #   播放控制栏
-│       └── showList.vue            #   歌曲/视频列表弹窗（含封面/专辑/歌手）
+│       └── showList.vue            #   歌曲/视频列表弹窗（放大镜搜索 / 刷新 / 爱心收藏）
+├── scripts/protect.mjs             # ★ 打包保护流水线：字节码 + 混淆 + 资源加密
+├── index.html / tray-menu.html     # 两个渲染入口
 └── electron.vite.config.ts
 ```
 
@@ -148,7 +166,8 @@ electron/common/types/ipc.ts  IpcChannelMap（频道 → 入参/返回值）
   这里原来挂了个快捷下拉菜单，已经去掉：两个入口容易状态打架，而且用户点开基本只为了进管理。
   hover 表现和标题栏其它按钮一致：只换背景，不动透明度（值也照抄 `.titlebar-btn`：圆角 8px、内边距 0 12px）。
 - **右上「设置」**：紧挨头像右侧，打开设置弹窗。只放**需要用户决策且没有其它入口**的项：
-  - 播放：最高视频清晰度 / 最高音质（自动播放遵守的上限）、记住播放进度、声音输出设备变化时暂停
+  - 播放：最高视频清晰度 / 最高音质（自动播放遵守的上限）、记住播放进度、声音输出设备变化时暂停、
+    **全屏自动锁定**（默认关：进全屏时自动收起界面）
   - 界面：主题色 / 字体颜色（都是「16 进制输入框 + 取色盘」）、透明度、模糊强度、阴影强度
   - 通用：启动进入壁纸模式、关闭窗口时最小化到托盘、任务栏显示播放进度、搜索缓存清理、恢复默认设置
   - 「记住播放进度」是原来的「自动续播」+「恢复播放进度」合并来的（只用一个 key
@@ -178,10 +197,10 @@ electron/common/types/ipc.ts  IpcChannelMap（频道 → 入参/返回值）
 歌曲 / 视频列表这两个弹窗的头部有「刷新」与「加号」、行尾有收藏爱心，
 详见 [视频列表：刷新 / 收藏 / 添加视频](#视频列表刷新--收藏--添加视频踩坑记录)。
 
-**弹窗的关闭方式**（设置 / 歌单管理 / 歌曲·视频列表 / 添加视频四个都一样）：
+**弹窗的关闭方式**（设置 / 歌单管理 / 歌曲·视频列表 / 添加视频 / 关于**五个**都一样）：
 不要右上角的叉号（`show-close=false`），点弹窗外面的空白处关闭。
 提示「点击空白位置关闭」写在**遮罩**上、弹窗下面 —— 用 `.el-overlay-dialog::after`
-（在 App.vue 的全局样式里），一处生效三个弹窗都有；字大加粗，
+（在 App.vue 的全局样式里），一处生效**五个**弹窗都有；字大加粗，
 `pointer-events: none` 所以点它等于点遮罩、照样能关。
 Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩上，
 所以**拖滑块时把鼠标甩到弹窗外再松手不会误关**。
@@ -192,9 +211,43 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 歌单同步策略挂在歌单上而不是全局，是为了避免「明明给歌单设了自动同步，却被全局开关关掉」这种困惑。
 应用启动时会按各歌单自己的策略同步；定时同步按所有定时歌单里**最小的间隔做心跳**，每次心跳只同步真正到点的歌单，所以各歌单周期可以不同而只需一个定时器。
 
+> **一次性升级（老用户能看到的行为变化）**：同步策略原有一半由全局设置
+> `playlist.syncOnStartup` 控制，改成「完全由每个歌单自己决定」时，那些「有分享链接但还是手动同步」
+> 的歌单会被自动改成「启动同步」（否则它们会突然完全不再自动同步）。
+> 这一步**只在从更老的数据版本升上来时执行一次**（用 `playlists.json` 里的 `version` 做闸门）——
+> 不然你每次启动手动设的「手动同步」都会被无声推翻，还会顺手联网同步覆盖曲目。
+
 底部的播放控制栏（播放、进度、音量、循环模式）由 `biliVideoControls` 负责，鼠标移上去才显现。
 信息区两行：上行是 B 站视频标题，下行是 `歌曲名 - 歌手 · 专辑`，
 **行尾是清晰度和音质两个角标，点开即可切换**。
+
+**两个角按钮 + 界面锁定**：
+
+```
+┌───────────────────────────────┐
+│ 标题栏（锁定/壁纸模式下隐藏）    │
+│                               │
+│            画面                │
+│                               │
+│ [🔒]                    [⛶]   │  ← 左下=锁定（S）  右下=全屏（F）
+└───────────────────────────────┘
+```
+
+- 两个角按钮共用 `.corner-btn` 外观（毛玻璃令牌 + 平时 `opacity: .2`、悬停到 1），
+  只是 `left: 16px` / `right: 16px`。图标字体里没有锁，**用内联 SVG**（开锁/闭锁两种画法）。
+- **锁定 = 复用 `.wm-hidden`**：给标题栏和 `<biliVideoControls>` 加同一个 `display: none !important`
+  的类（壁纸模式也是这套），组件不卸载、内部状态（音量拖动等）不丢。
+- 踩过的坑：
+
+| 坑 | 现象 | 怎么修 |
+| --- | --- | --- |
+| **两个角按钮不能一起藏** | 锁定后界面上什么都没有，唯一的解锁入口也没了 | 隐藏类只加在标题栏和控制栏上；`.lock-btn` / `.fullscreen-btn` 永远不隐藏（锁定态给锁定按钮 `opacity: .75`，否则半透明太淡找不到） |
+| **`S` 会被当成打字** | 在搜索框/设置输入框里打 `s` 就把界面锁了 | `handleKeydown` 里先挡 `INPUT` / `TEXTAREA`；`KeyS` 再额外挡「有弹窗开着」（弹窗是模态遮罩，锁了会在弹窗背后藏界面，而且那时锁定按钮本来也点不到） |
+| **退出全屏把手动锁也解开** | 用户自己按 S 锁的，退出全屏后被自动解开 | 只有「因全屏而自动锁」的那次才跟着解开：`_lockedByFullscreen` 记着来源，手工解锁时清掉这个标记 |
+| **锁定提示没人看见** | 锁完屏幕一片干净，用户不知道发生了什么、也不知道怎么回去 | 锁定/解锁都用 `$message.info` 弹一条，文案照全屏那条的结构：「已锁定,按S键或点左下角按钮可以解锁」 |
+
+`player.lockOnFullscreen`（设置 → 播放 → 「全屏自动锁定」）默认 `false`，
+渲染层监听 `isFullscreen`：进全屏时按设置锁上、退出时（且确实是自动锁的那次）解开。
 
 控制栏那几个图标按钮的尺寸约定：**高度固定 `10vh`，字形 `7vh`** ——
 想调大小只改 `font-size`，别动 `height`。这里必须同时写 `display: inline-flex`：
@@ -218,7 +271,8 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 | 全屏按钮 | `icon-full-screen` / `icon-suoxiao` |
 
 换图标**只改类名**：字体里没有的旧类名（`icon-yinleliebiao`、`icon-play-previous`、
-`icon-play-next`、`icon-ziyuanldpi`）留在模板里就是一个空白按钮，验证脚本里专门有一条检查。
+`icon-play-next`、`icon-ziyuanldpi`）留在模板里就是一个空白按钮。
+（仓库里**没有**自动化检查脚本，这类问题靠人工看界面；真要做就自己写一个临时脚本去 grep 类名。）
 
 ### 界面颜色与毛玻璃（CSS 令牌）
 
@@ -384,7 +438,8 @@ dash 的视频轨和音频轨是两个 URL，而 `<video>` 一次只能播一个
 所以用 MSE 把两轨塞进同一个 MediaSource 的两个 SourceBuffer 里 ——
 对外仍然只有一个媒体元素，进度 / 音量 / 续播 / SMTC 这些现有逻辑一行都不用改。
 
-**默认清晰度**由 `electron/main/biliApi.ts` 的 `PREFERRED_QN` 决定（116 = 1080P 60帧）。
+**默认清晰度**取设置里的 `player.videoQuality`（默认 116 = 1080P 60帧，常量是
+`@common/constants` 的 `DEFAULT_VIDEO_QN`；渲染层没传时用它兜底，见 `biliApi.resolveVideoUrl`）。
 它只是「尽量达到」的目标：dash 响应一次会回来**所有**档位（实测最高 4K），
 由 `pickDashVideo` 挑「不超过它里最高的一条」，并且优先 H.264（`avc1`）——
 AV1 / HEVC 在部分机器上 `MediaSource.isTypeSupported` 会返回 false。
@@ -473,7 +528,8 @@ need = 311 - 1 + 3 = 313      lastBufferedEnd = 311      311 / 313 = 98%
 
 - 已进入最后 2 秒，且缓冲末尾真的到了片尾；
 - 没有暂停、没有在 seek；
-- 播放位置连续 3 秒没有前进。
+- 播放位置连续一段时间没有前进：`readyState >= 3` 时等 3 秒（还有后手数据，说明只是慢），
+  `readyState <= 2`（等着数据但没来）多给一点，等 5 秒。
 
 命中就按「播完了」处理（单曲循环重播，其余模式下一首）。
 
@@ -543,8 +599,40 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 每首歌**本次运行内第一次**用到时重解析一次。这是平台签名机制，不是故障；
 不重解析反而会拿死链去播、报「视频加载失败，已跳过」。
 
-> 因此这条日志只在**每次运行的第一条**上说明原因（`expiredHintLogged`），
-> 后面就是一行短句 —— 否则一次听五首歌刷五行带解释的长句，看着像出事了。
+> 这条日志**每次过期都会打印**（一行短句，原因写在代码注释里）—— 属于预期内现象，
+> 不做闸门、也不逐条解释：那样反而要在日志里维护一套「说没说过」的状态。
+
+### 播放停滞看门狗（「打开就卡在 99%」的真正原因）
+
+用户反馈：**偶尔一打开就显示 99% 的缓冲圈卡住，点一下下一首就好了**，
+而且**时长那里是 `0:00`** —— 最后这条信息才是关键。
+
+现场还原：MSE 已经有分片进来了（所以 `buffered.end()` 有值，进度能算到 99%），
+但整条的 `duration` 一直没确定、`readyState` 也上不去。于是：
+
+- `syncBufferState` 的隐藏条件是 `readyState >= 3` 且余量够 1 秒 —— 永远不满足，圈一直挂着；
+- 百分比的分母是「播放点 + 余量」，没下完就不会到 100，所以显示停在 **99%**；
+- 时长那一栏因为 `duration` 为 0/NaN，显示 **0:00**。
+
+原来没有任何兜底：`checkEndOfStream` 只管「播到片尾不动」，而这里连时长都没有，
+所以只能靠用户手动点下一首重建整条管线。
+
+现在 `checkPlaybackStall()`（挂在同一个 1 秒心跳上，`STALL_MS = 12s`）：
+
+| 判据 | 说明 |
+| --- | --- |
+| 有源（`currentSrc` 非空） | 起播前本来就该等，不算停滞 |
+| 没暂停、没在 seek | 这些情况下不动是正常的 |
+| **允许 `duration === 0`** | 这正是要救的场景（原来写的是「没时长就直接返回」，等于把它排除在外） |
+| 不在最后 2 秒 | 片尾交给 `checkEndOfStream`，别两边同时动手 |
+| 位置连续 12 秒没前进 | `_lastProgressAt` 由 `timeupdate` 维护，留 2 秒宽限 |
+
+命中后两级处理：先 `changeVideo(bvid, keyword, { skipCache: true })` 重新解析（提示
+「这条视频没能加载出来，正在重新解析…」），下一轮还不动就跳到下一首。
+
+实测（断网黑洞地址模拟「有源但永远不来数据」）：正常播放 20 秒无误报；
+`duration=0 readyState=0` 的卡死现场 12 秒命中，提示后**真的重新播起来**
+（`duration=223 readyState=4 t=19.4`，源是 MSE 的 `blob:` 地址）。
 
 最后一条是 `/api/resolveVideo` 里新加的：登录能解锁更高档位（实测同一视频
 匿名 `accept_quality=[64,16]`，登录后 `[116,80,64,16]`），不重取的话
@@ -593,13 +681,14 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 现在的做法（`electron/main/index.ts`）：
 
 - `applyFullScreenGeometry()`：`setAspectRatio(0)`（免得宽高比约束改写 `setBounds`）+ 
-  `setBounds(主屏 bounds)` + `setAlwaysOnTop(true)`（不置顶的话任务栏会压在窗口上面）。
+  `setBounds(窗口所在屏的 bounds)`（用 `screen.getDisplayMatching()` 取，写死主屏会把副屏上的窗口拽回主屏）
+  + `setAlwaysOnTop(true)`（不置顶的话任务栏会压在窗口上面）。
 - 全屏状态由主进程的 `isFullScreen` 变量持有，`win:isFullscreen` 直接返回它，
   **不再**是 `mainWindow.isFullScreen()`；`resize` 事件也不再回写这个变量。
 - 两层还原点，互不污染：
   - `fullScreenRestore`：进入全屏前的普通窗口尺寸 / 最大化状态，退出全屏时用；
   - `wallpaperRestore`：进入壁纸**之前**的状态（含「当时是不是全屏」），退出壁纸时用。
-    所以「全屏 → 壁纸 → 应用程序」会回到全屏，且此时依然能正常退出全屏。
+    所以「全屏 → 壁纸 → 窗口模式」会回到全屏，且此时依然能正常退出全屏。
 - 先铺满窗口、等 120ms 让系统应用尺寸，**再** `asWallpaper.attach()`，否则挂载拿到的是旧几何。
 - 壁纸模式下 `win:toggleFullscreen` 直接返回（几何由壁纸层接管）。
 - **壁纸模式 = 纯背景**：标题栏和控制栏都挂 `.wm-hidden`（`display: none`），窗口里没有可点的东西，
@@ -667,7 +756,8 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 | **动作必须跟着状态走** | 踩过：登录那一项的文案会随登录态变成「退出登录」，但动作写死成 `'login'` —— 点「退出登录」发的还是 login，用户看到的就是「点了又登录上了」。凡是文案会变的项，`action` 也要是函数 |
 | **每次弹出都要装兜底显示** | 踩过：页面「高度没变就不回报」，而显示这件事绑在 `trayMenu:ready` 上 —— 第一次右键能弹（高度 0→N），第二次开始不再回报，菜单就再也不出现（「进了壁纸模式后右键弹不出来」）。现在 `showTrayMenu` 每次都装一个 120ms 的兜底显示，高度真变了再重新定位 |
 | **合成点击防护** | 已注释。它本来是挡「鼠标转发把点菜单这一下同时合成到壁纸窗口」，现在壁纸模式 `forwardMouseInput: false`（界面也全隐藏），不会再有合成点击。`trayMenuOpen` 标志留着 —— 菜单开着时要把进度推给菜单里的进度条 |
-| 左键语义 | 直接显示窗口（`restoreWindow`）：壁纸模式下先切回窗口模式，窗口在托盘里就恢复并前置 |
+| 左键语义 | 直接显示窗口（`restoreWindow`）：壁纸模式下先切回窗口模式，窗口在托盘里就恢复并前置；**同时广播 `tray:unlock` 让界面解锁** |
+| **左键要顺带解锁** | 踩过：窗口模式 + 锁定状态下界面只剩左下右下两个角按钮，用户会很自然地去点托盘图标 —— 以前那一下什么都不发生（窗口本来就可见），看着像卡死。现在左键在 `restoreWindow()` 之后广播 `tray:unlock`，渲染层用幂等的 `toggleLock(false)` 处理（没锁就什么都不做、也不多弹提示）。锁定态只在渲染层，主进程不猜也不存 |
 | **提示文案必须跟着行为走** | 踩过：左键从「播放 / 暂停」改成「回到窗口」之后，壁纸模式的 tooltip 还写着旧文案，用户照提示点了一下，结果窗口直接跳出来 —— 提示与行为不一致比没有提示更糟。tooltip 两种模式各写各的（应用模式「单击：显示窗口」/ 壁纸模式「单击：回到窗口」），菜单里每个按钮的 `title` 也随状态更新（播放/暂停、当前模式、静音/取消静音） |
 | 退出 | 主窗口 `closed` 时一并 `destroy` 菜单窗口，否则那个隐藏窗口会让 `window-all-closed` 永不触发、点 X 退不掉 |
 
@@ -833,6 +923,9 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
     lastIndex,             // 该歌单上次播放到第几首
     videoCache: {          // key = "歌名-歌手"，续播时精确还原同一个视频
       '歌名-歌手': { bvid, title, cover, pickedAt }
+    },
+    favorites: {           // key 同上；这首歌收藏的视频（列表里固定排最前面）
+      '歌名-歌手': [{ bvid, title, cover, author, duration, savedAt }]
     }
   }]
 }
@@ -849,7 +942,8 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 旧版单歌单 `playlist.json` 会在首次启动时**自动迁移**成集合里的第一条记录（迁移后旧文件改名为 `.migrated`，不会丢失）。
 
 续播相关的信息存在 `setting.json` 里：`player.resumeOnStart`（记住播放进度）、`player.resumeTime`
-（上次播放到第几秒）、`player.playIndex`，以及每个歌单自己的 `lastIndex`。
+（上次播放到第几秒）；**播到第几首由每个歌单自己的 `lastIndex` 决定**（`player.playIndex` 是历史遗留、
+只写不读，已经删掉）。
 界面相关的：`common.themeColor` / `common.fontColor`（hex）、`common.glassTransparency`（0-100）、`common.glassBlur`（0-20）、`common.glassShadow`（0-20）。
 记录时机：切歌、切视频、视频加载完成、播放进度变化（节流 5 秒）、关闭窗口前。
 
@@ -886,8 +980,9 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
    而且 Node 默认不跟随重定向，能直接读到 `location` 头，正好解决短链解析。
 3. **自动识别音源**：LX 让用户在弹窗里手选音源，本项目按链接 host 自动判断，
    体验更省事；纯数字 ID 因无法判断平台会给出明确提示。
-4. **返回结构精简**：LX 的歌曲对象还带 `qualitys`/`typeUrl` 等取播放地址用的字段，
-   本项目只要 歌名/歌手/时长，全部砍掉。
+4. **返回结构精简**：LX 的歌曲对象还带 `qualitys`/`typeUrl` 等取播放地址用的字段，全部砍掉；
+   本项目保留的是 `name / singer / interval / albumName / cover`（结构化曲目要展示专辑与封面，
+   见 `ParsedSong`），同步与手动新建都会把专辑 / 封面一起写进歌单。
 
 ---
 
@@ -959,6 +1054,54 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 
 ---
 
+---
+
+## 打包与代码保护（V8 字节码 / 混淆 / asar 加密）
+
+`npm run pack`（免安装目录）与 `npm run dist`（安装包）会走保护流水线，**开发完全不受影响**：
+
+```
+build:only（electron-vite 三个目标）
+   ↓
+protect（scripts/protect.mjs）
+   1. 主进程 / 预加载 → V8 字节码（bytenode）      out/main/index.js 变成几百字节加载器 + index.jsc
+   2. 渲染层 js → 混淆（javascript-obfuscator）     字符串数组 + 十六进制标识符
+   3. 渲染层 html/js/css → AES-256-GCM 就地加密     文件头 BLMV1
+   ↓
+electron-builder（asar）
+```
+
+运行时：主进程注册 `blmv://` 协议（`electron/main/protection.ts`），页面请求哪个资源就解密哪个，
+只解密到内存；页面地址从 `file://` 变成 `blmv://app/index.html`。
+密钥在 `electron/main/bundleKey.ts`（会被编进主进程字节码，不是明文躺在 asar 里），
+打包时可用 `BLMV_BUNDLE_KEY` 覆盖。
+
+> **老实说**：客户端加密只是提高门槛，不是不可破解 —— 密钥必须在客户端才能解密。
+> 想真正拦住人得靠服务端，而本项目是纯本地播放器。这一步的实际效果是
+> 「不能直接打开 asar 读源码 / 改一行就跑」，而不是「绝对安全」。
+
+踩过的坑（每一个都真踩了）：
+
+| 坑 | 现象 | 怎么修 |
+| --- | --- | --- |
+| **模块模式字节码不能用 `runBytecodeFile`** | 加载器执行了、`require` 也返回成功，但**窗口永远不出现**，而且不报任何错（`compileAsModule: true` 编出来的只是模块包装函数，没被调用） | 加载器写成 bytenode 官方那种 CommonJS 形式：`require('bytenode')` + `module.exports = require('./index.jsc')` —— `.jsc` 的模块扩展由 bytenode 挂上，这样才会真正执行 |
+| **环境里的 `ELECTRON_RUN_AS_NODE=1`** | bytenode 要拉起 Electron 自己来编译（必须同一套 V8），命令形如 `ELECTRON_RUN_AS_NODE=1 electron.exe --no-sandbox …`；环境里本来就带着这个变量时 Electron 退化成纯 Node，报 **`bad option: --no-sandbox`**（完全看不出真因） | 脚本开头 `delete process.env.ELECTRON_RUN_AS_NODE` |
+| **保护脚本崩了却没人发现** | 改加载器时在**模板字符串里用了反引号**，脚本直接语法报错；而 `build:only` 已经把明文写进 `out/`，于是「保护后的 asar」里全是明文。更糟的是**验证是瞎的**：解密函数对明文原样返回，`blmv://` 那条路照跑不误、测试全绿 | ①别用管道把 stderr 和退出码一起吞掉；②验收改成**字节级**：`out/renderer/index.html` 头必须是 `BLMV1`、`out/main/index.js` 只有几百字节且存在 `index.jsc` |
+| **`registerSchemesAsPrivileged` 的时机** | 必须在 `app.whenReady()` **之前**调用，否则 `blmv://` 不是标准/安全上下文，fetch、MSE、CORS 全按普通自定义协议处理 | 放在模块顶层（`setupUserDataPath()` 之后、`whenReady` 之前） |
+| **换协议把跨域取流搞挂** | 页面 origin 从 `file://` 变成 `blmv://app` 后 dash 音视频流的 `fetch` 开始报 CORS；实测 B 站 CDN 会把**第一个请求者的 Origin** 写进 `Access-Control-Allow-Origin` 并按 URL 缓存（报错原话：`has a value 'http://localhost:5173' that is not equal to the supplied origin`） | 在 `onHeadersReceived` 里对媒体域**统一改**成 `*`（并删掉 `Access-Control-Allow-Credentials`）。**必须大小写不敏感地先删再加**：CDN 回的是小写键，直接赋值等于又加一条，浏览器看到 `ACAO: blmv://app, *` 两个值会判非法（第一版就这么写的，报错从 1 条变 20 条） |
+| **asar 本身没有加密** | `asar` 只打包不加密；`asarUnpack` 更是把文件原样摊在磁盘上 | 自己加密 + 自定义协议解密。`bytenode` 必须进 `dependencies`（加载器运行时要用），`electron-as-wallpaper` 仍走 `asarUnpack` |
+
+**验收方式**（以后改这块照这个来）：
+
+1. `npm run build:protected` 后做字节级检查（密文头 + `.jsc` 存在 + 加载器只有几百字节）；
+2. 用 `BLMV_FORCE_PROTECT=1` 跑开发态验证：页面 URL 是 `blmv://app/`、DOM 完整、`electronAPI` 可用、
+   能搜到歌、能起播 —— **并且要断言音频真解码**（只看 `duration` 会漏掉 CORS 问题）；
+3. `npx electron-builder --dir` 后用 `@electron/asar` 抽文件看头是不是 `BLMV1`；
+4. 直接启动 `release/win-unpacked/BLMV.exe`，看窗口标题出不出来
+   （标题来自渲染层，等于「解密 + 混淆后仍能跑」的端到端证明）。
+
+---
+
 ## 一次代码审查修掉的东西
 
 给自己留个记录：下面这些不是「设计」，是**真的漏掉 / 写错**的地方，改动都带了注释说明原因。
@@ -1002,6 +1145,13 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 IPC（`playlist:get` / `playlist:save` / `auth:reLogin` / `cache:clearSingle`）、`store` 的 `has`/`set`/`all`、
 `BROADCAST_EVENT_NAME` 里没用到的成员、一批只为导出而导出的函数，以及 store 里那层
 「给每个设置项包一个 computed」的包装（组件统一直接读 `setting['xxx.yyy']`）。
+
+**后来又清掉的一批**（一次代码审查的结论）：`player.playIndex`（只写不读，续播用的是歌单的 `lastIndex`）、
+`DuplicatePolicy` 的 `'keep'` 与那个从没人传的 `duplicatePolicy` 参数（现在同步固定去重）、
+`cache.clearSingle()`（IPC 与函数一起删了）、`ipc.ts` 里的 `PlaylistSong = string` / `Playlist`
+（与 `types/playlist.ts` 的结构化同名类型冲突，全项目已无引用）、`BROADCAST_EVENT_NAME` 里 11 个没人
+按名字引用的常量（广播事件全集看 `types/ipc.ts` 的 `IpcEventMap`）、`main/utils/quality.ts` 里重抄的
+档位标签表（改为从 `VIDEO_QUALITY_OPTIONS` 推导）。
 
 ---
 

@@ -536,13 +536,28 @@ export default defineComponent({
       }
     },
     async setCurrent(item: PlaylistRecord) {
-      await this.store.setCurrent(item.id);
+      /**
+       * 写盘可能失败（磁盘满 / 被杀软占用），而 `store.setCurrent` 内部会 `await persist()`：
+       * 不接住就是一个未处理的 rejection —— 用户还会先看到「已切换为《X》」的假成功。
+       * 所以先 await 成功、再弹提示。
+       */
+      try {
+        await this.store.setCurrent(item.id);
+      } catch (err) {
+        ElMessage.error('切换歌单失败：' + (err instanceof Error ? err.message : String(err)));
+        return;
+      }
       ElMessage.success(`已切换为《${item.name}》`);
       this.$emit('switch', item.id);
     },
     async remove(item: PlaylistRecord) {
       const wasCurrent = item.id === this.store.currentId;
-      await this.store.removePlaylist(item.id);
+      try {
+        await this.store.removePlaylist(item.id);
+      } catch (err) {
+        ElMessage.error('删除歌单失败：' + (err instanceof Error ? err.message : String(err)));
+        return;
+      }
       ElMessage.success(`已删除《${item.name}》`);
       if (this.selectedId === item.id) {
         this.selectedId = this.store.currentId || this.store.playlists[0]?.id || '';

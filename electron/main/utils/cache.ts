@@ -307,16 +307,6 @@ export async function clearAll(): Promise<boolean> {
   }
 }
 
-export async function clearSingle(keyword: string): Promise<boolean> {
-  try {
-    ensureIndex()
-    removeFile(fileNameOf(keyword))
-    return true
-  } catch (err) {
-    console.error('Cache clear error:', err)
-    return false
-  }
-}
 
 export const getStats = (): CacheStats => {
   ensureIndex()

@@ -74,6 +74,11 @@ let navFetchedAt = 0
 /** nav 数据的保鲜期；超过就在需要判断登录态时重新拉一次 */
 const NAV_TTL_MS = 60 * 1000
 
+/** 上次 nav 请求失败的时间（失败退避用，避免风控期间每秒重试） */
+let navFailedAt = 0
+/** 失败后的退避窗口 */
+const NAV_FAIL_BACKOFF_MS = 15 * 1000
+
 async function getCookieString(): Promise<string> {
   try {
     const cookies = await session.defaultSession.cookies.get({})
@@ -117,6 +122,26 @@ async function refreshNavData(): Promise<string | null> {
       cachedMixinKey = getMixinKey(imgKey, subKey)
       mixinKeyExpireAt = Date.now() + 6 * 3600 * 1000
     }
+    /**
+     * 先看响应码，再认 `isLogin` —— 这一步是必须的
+     *
+     * 踩过：只看 `json.data?.isLogin`，任何「HTTP 200 但被风控/拦截」的响应
+     * （`code` 为 -352 / -412 这类，`data` 直接是 null）都会被判成「明确未登录」，
+     * 于是界面与托盘整体切成未登录，`resolveVideo` 还会把 `loginState: false`
+     * 写进缓存条目 —— 之后每次解析都判「未登录时取的，现已登录」而成片重解析。
+     * 真正该表达的是「这次没问到」（`null`），而不是「没登录」。
+     *
+     * -101 是「账号未登录」，那是**有效的**否定结论，按 isLogin 落定即可。
+     */
+    if (json.code !== 0 && json.code !== -101) {
+      console.warn('[auth] nav 返回异常码，登录态保持不变:', json.code, json.message ?? '')
+      // 只更新 wbi mixin key（上面已经算好），登录态留空表示「未知」
+      loginState = null
+      cachedUserInfo = null
+      navFetchedAt = Date.now()
+      return cachedMixinKey
+    }
+
     if (json.data?.isLogin) {
       cachedUserInfo = {
         face: json.data.face ?? '',
@@ -163,8 +188,27 @@ export const ensureLoginState = async (): Promise<boolean | null> => {
   if (loginState !== null && Date.now() - navFetchedAt < NAV_TTL_MS) {
     return loginState
   }
+  /**
+   * 失败退避
+   *
+   * 登录窗口在轮询、每次解析也要问一次登录态；nav 一旦因为风控/断网失败，
+   * 没有退避就是每秒一次的请求风暴（越打越像异常流量）。
+   */
+  if (navFailedAt && Date.now() - navFailedAt < NAV_FAIL_BACKOFF_MS) {
+    return loginState
+  }
+  const before = navFetchedAt
   await refreshNavData()
-  // refreshNavData 失败时不会改 loginState，这里原样返回（可能是 null = 未知）
+  /**
+   * 没更新 `navFetchedAt` 就说明**这次没问到**（refreshNavData 失败时不动状态）。
+   * 这时候要返回 `null`（未知），而不是把上一次的结论当权威 ——
+   * 「陈旧 true」会被写进缓存条目的登录态快照，「陈旧 false」会让界面无端变未登录。
+   */
+  if (navFetchedAt === before) {
+    navFailedAt = Date.now()
+    return null
+  }
+  navFailedAt = 0
   return loginState
 }
 
@@ -190,10 +234,17 @@ const getMixinKeyCached = async (): Promise<string | null> => {
  * 明明登录着却像掉线一样。
  */
 export const getUserInfo = async (): Promise<UserInfo> => {
+  /**
+   * `cachedUserInfo` 也要看 TTL
+   *
+   * 踩过：这里只判「有没有缓存」，于是 nav 数据可能是几天前的 —— 用户早就掉登录了，
+   * 界面还拿着旧头像旧名字；反过来 nav 拿不到时又会被下面当成「未登录」。
+   */
+  if (cachedUserInfo && Date.now() - navFetchedAt < NAV_TTL_MS) return cachedUserInfo
+  const state = await ensureLoginState()
+  // 刷新失败但手里还有旧信息：继续用旧的，别误报未登录
   if (cachedUserInfo) return cachedUserInfo
-  await refreshNavData()
-  if (cachedUserInfo) return cachedUserInfo
-  if (loginState === false) throw new Error('未登录')
+  if (state === false) throw new Error('未登录')
   throw new Error('NAV_FAILED')
 }
 
