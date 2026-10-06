@@ -513,11 +513,50 @@ export interface ResolveVideoResult {
   playData: BiliResponse
 }
 
+/**
+ * 常规 CDN 域
+ *
+ * B 站的 playurl 会给每条流一个 `baseUrl` + 若干 `backupUrl`。其中 `baseUrl`
+ * 有时是 **P2P / 边缘节点**（实测见过 `*.mountaintoys.cn`、`*.szbdyd.com`），
+ * 那种地址只对官方客户端有效，普通 HTTP 请求会被 **403** 拒掉 ——
+ * 用户看到的现象就是「别的视频都能放，只有这一个怎么也放不出来」，而且不报任何错。
+ */
+const NORMAL_CDN_SUFFIXES = [
+  '.bilivideo.com',
+  '.bilivideo.cn',
+  '.bilibili.com',
+  '.hdslb.com',
+  '.akamaized.net',
+]
+
+export const isNormalCdn = (url: string): boolean => {
+  try {
+    const host = new URL(url).hostname.toLowerCase()
+    return NORMAL_CDN_SUFFIXES.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 从「主地址 + 备用地址」里挑一个可用的
+ *
+ * 优先常规 CDN 域；都不常规（或解析不出主机）就退回第一个 —— 有总比没有强。
+ */
+export const pickNormalCdnUrl = (
+  primary: string | null | undefined,
+  backups?: Array<string | null | undefined> | null,
+): string | null => {
+  const all = [primary, ...(backups ?? [])].filter(
+    (u): u is string => typeof u === 'string' && u.length > 0,
+  )
+  if (all.length === 0) return null
+  return all.find((u) => isNormalCdn(u)) ?? all[0]
+}
+
 const dashUrlOf = (item: DashItem | undefined): string | null => {
   if (!item) return null
-  const primary = item.baseUrl || item.base_url
-  if (primary) return primary
-  return item.backupUrl?.[0] ?? item.backup_url?.[0] ?? null
+  return pickNormalCdnUrl(item.baseUrl || item.base_url, item.backupUrl ?? item.backup_url)
 }
 
 const dashMimeOf = (item: DashItem): string | null => {
@@ -687,11 +726,20 @@ const requestPlayUrl = async (
   return res2
 }
 
-/** 从响应里取第一条 durl 地址 */
+/**
+ * 从响应里取第一条 durl 地址
+ *
+ * 同样优先常规 CDN 域：`url` 可能是 P2P 节点（403），而 `backup_url` 是正常 CDN。
+ */
 const firstDurl = (res: BiliResponse | null): string | null => {
-  const durl = (res?.data as { durl?: Array<{ url?: string }> } | undefined)?.durl
-  const url = durl?.[0]?.url
-  return typeof url === 'string' && url ? url : null
+  const durl = (
+    res?.data as
+      | { durl?: Array<{ url?: string; backup_url?: string[]; backupUrl?: string[] }> }
+      | undefined
+  )?.durl
+  const first = durl?.[0]
+  if (!first) return null
+  return pickNormalCdnUrl(first.url, first.backup_url ?? first.backupUrl)
 }
 
 /**

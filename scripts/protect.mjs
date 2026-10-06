@@ -199,21 +199,34 @@ const isLoader = (file) => {
 }
 
 /**
- * 重复执行的保护
+ * 前置检查：`out/` 必须是**干净的明文**
  *
- * 这个脚本**不是幂等的**，硬跑第二遍会把产物搞坏：
- *  - 字节码那步会把只剩下几百字节的加载器当源码再编一遍；
- *  - 加密那步会把已经是密文的文件再加密一次（解出来是乱码，页面直接白屏）。
- * 所以先检测：已经是保护状态就直接跳过并提示（要重新保护先 `npm run build:only`）。
- * 踩过：连着跑两次 `npm run pack` 就会得到打不开的包，而且报错信息完全指不到这里。
+ * 这个脚本会把 `out/` 原地改写成「主进程/预加载=字节码加载器 + 渲染层=密文」，
+ * 所以它**不能**在已经处理过的产物上再跑一遍（会把加载器当源码再编、把密文再加密一层），
+ * 更不能在**混合态**上跑 —— 混合态是这么来的：`out/renderer` 还是上一轮的密文，
+ * 而 main 被重新构建成明文（一次部分重建就会这样）。
+ * 那种状态下启动应用，明文主进程没有解密协议，直接把密文当 HTML 加载 → **满屏乱码**（真发生过）。
+ *
+ * 所以这里一律先验证再动手：只要发现字节码 / 密文的痕迹，就直接报错让人先 `npm run build:only`。
+ * 宁可报错也不要闷头做出一份坏产物，或者（更早的写法）静默「跳过」把混合态留在那儿。
  */
-const alreadyProtected = () => {
+const assertOutIsPlain = () => {
   const mainJs = path.join(root, 'out/main/index.js')
+  const mainJsc = path.join(root, 'out/main/index.jsc')
+  const preloadJsc = path.join(root, 'out/preload/index.jsc')
   const html = path.join(root, 'out/renderer/index.html')
-  return (
-    (fs.existsSync(path.join(root, 'out/main/index.jsc')) && isLoader(mainJs)) ||
-    (fs.existsSync(html) && isEncrypted(html))
-  )
+  const dirty = []
+  if (fs.existsSync(mainJsc)) dirty.push('out/main/index.jsc（字节码）')
+  if (fs.existsSync(preloadJsc)) dirty.push('out/preload/index.jsc（字节码）')
+  if (fs.existsSync(mainJs) && isLoader(mainJs)) dirty.push('out/main/index.js（字节码加载器）')
+  if (fs.existsSync(html) && isEncrypted(html)) dirty.push('out/renderer/index.html（密文）')
+  if (dirty.length > 0) {
+    throw new Error(
+      'out/ 不是干净的明文产物，不能在这上面做保护：\n  - ' +
+        dirty.join('\n  - ') +
+        '\n先跑 npm run build:only 还原成明文，再重新 npm run pack。',
+    )
+  }
 }
 
 const main = async () => {
@@ -221,11 +234,7 @@ const main = async () => {
   if (!fs.existsSync(path.join(outDir, 'main/index.js'))) {
     throw new Error('out/main/index.js 不存在，先跑 electron-vite build')
   }
-
-  if (alreadyProtected()) {
-    log('产物已经是保护后的状态，跳过（要重新保护，先 npm run build:only 还原成明文）')
-    return
-  }
+  assertOutIsPlain()
 
   // 1) 字节码（只对主进程 / 预加载）
   await compileToBytecode(path.join(outDir, 'main/index.js'), 'main')
@@ -236,7 +245,7 @@ const main = async () => {
   await obfuscateRenderer(rendererDir)
   encryptRenderer(rendererDir)
 
-  log('保护流水线完成：主进程/预加载=字节码，渲染层=混淆 + 加密')
+  log('保护流水线完成：主进程/预加载=字节码，渲染层=混淆 + 加密（就地改写 out/）')
 }
 
 main().catch((err) => {

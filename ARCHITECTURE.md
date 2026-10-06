@@ -429,6 +429,17 @@ dash 链路取「地址和实际播放地址一致」的那条流的 `id`，durl
 所以现在 `resolveVideoUrl` 是 **dash 优先、durl 兜底**：
 拿到 dash 双轨就交给渲染层用 MSE 合成；dash 不可用（或渲染层播放失败）才退回 durl 720P。
 
+> **地址要在 `baseUrl` 和 `backupUrl` 里挑「常规 CDN 域」（真踩过）**：
+> playurl 给每条流一个 `baseUrl` + 若干 `backupUrl`，而 `baseUrl` 有时指向
+> **P2P / 边缘节点**（实测见过 `*.mountaintoys.cn:4483`、`*.szbdyd.com`）——
+> 那种地址只对官方客户端有效，普通 HTTP 请求直接 **403**。
+> 现象极具迷惑性：**别的视频都能放，只有某一个怎么也放不出来，也不报错**（画面永远 readyState=0、
+> 进度停在 99% 的缓冲圈上）。现在 `pickNormalCdnUrl()`（`biliApi.ts`）在
+> `baseUrl` + `backupUrl`（durl 则是 `url` + `backup_url`）里**优先挑
+> `*.bilivideo.com` / `*.bilivideo.cn` / `*.bilibili.com` / `*.hdslb.com` / `*.akamaized.net`**，
+> 都不常规时才退回第一个。缓存里的老地址也走同一套规则（`extractDurl` 复用它），
+> 所以不用清缓存，重开就换到正常节点。
+
 平台偶尔会出现「报 720P、帧却是 1920×1080」这类元数据与实际流不一致的情况，
 角标按平台档位显示，真实分辨率放在悬浮提示里，不藏着。
 
@@ -1061,20 +1072,32 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 `npm run pack`（免安装目录）与 `npm run dist`（安装包）会走保护流水线，**开发完全不受影响**：
 
 ```
-build:only（electron-vite 三个目标）
+build:only（electron-vite 三个目标）→ out/            ← 保护前必须是干净明文（脚本会检查）
    ↓
-protect（scripts/protect.mjs）
-   1. 主进程 / 预加载 → V8 字节码（bytenode）      out/main/index.js 变成几百字节加载器 + index.jsc
+protect（scripts/protect.mjs）**就地改写 out/**
+   1. 主进程 / 预加载 → V8 字节码（bytenode）      index.js 变成几百字节加载器 + index.jsc
    2. 渲染层 js → 混淆（javascript-obfuscator）     字符串数组 + 十六进制标识符
-   3. 渲染层 html/js/css → AES-256-GCM 就地加密     文件头 BLMV1
+   3. 渲染层 html/js/css → AES-256-GCM 加密         文件头 BLMV1
    ↓
-electron-builder（asar）
+electron-builder（asar）→ 打包 out/
 ```
 
 运行时：主进程注册 `blmv://` 协议（`electron/main/protection.ts`），页面请求哪个资源就解密哪个，
 只解密到内存；页面地址从 `file://` 变成 `blmv://app/index.html`。
 密钥在 `electron/main/bundleKey.ts`（会被编进主进程字节码，不是明文躺在 asar 里），
 打包时可用 `BLMV_BUNDLE_KEY` 覆盖。
+
+> **为什么 `protect` 必须先检查 `out/` 是不是干净明文（这是踩出来的）**：保护是**就地改写**，
+> 所以它既不能在已经保护过的产物上再跑一遍（会把加载器当源码再编、把密文再加密一层），
+> 也不能在**混合态**上跑。混合态是这么来的：`out/renderer` 还留着上一轮的密文，
+> 而 main 被重新构建成明文（一次部分重建就会这样）—— 这时候启动应用，
+> 明文主进程没有解密协议，直接把密文当 HTML 加载，**用户看到满屏乱码**（真发生过）。
+> 现在脚本一进来就查 `index.jsc` / 加载器 / 密文 HTML 的痕迹，发现任何一样就**直接报错**
+> 让人先 `npm run build:only`；宁可报错，也不要闷头做出一份坏产物，
+> 更不要（早期写法）静默「跳过」，把混合态留在磁盘上。
+>
+> 另外：`out/` 被保护之后**不要直接跑 `npm run dev` / `electron .`**（会加载密文页）；
+> 先 `npm run build:only` 还原明文。
 
 > **老实说**：客户端加密只是提高门槛，不是不可破解 —— 密钥必须在客户端才能解密。
 > 想真正拦住人得靠服务端，而本项目是纯本地播放器。这一步的实际效果是

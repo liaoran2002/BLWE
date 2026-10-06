@@ -63,9 +63,16 @@ interface SearchPayload {
  *
  * dash 的双轨不在这里处理 —— 它需要两条流一起给，见 `extractDashStreams`。
  */
-const extractDurl = (playData: BiliApiResponse | undefined): string | null => {  const durl = (playData?.data as { durl?: Array<{ url?: string }> } | undefined)?.durl
-  const url = durl?.[0]?.url
-  return typeof url === 'string' && url ? url : null
+const extractDurl = (playData: BiliApiResponse | undefined): string | null => {
+  const durl = (
+    playData?.data as
+      | { durl?: Array<{ url?: string; backup_url?: string[]; backupUrl?: string[] }> }
+      | undefined
+  )?.durl
+  const first = durl?.[0]
+  if (!first) return null
+  // 和 biliApi 那边同一套规则：`url` 可能是 P2P 节点（普通请求 403），优先用常规 CDN 的备用地址
+  return biliApi.pickNormalCdnUrl(first.url, first.backup_url ?? first.backupUrl)
 }
 
 /**

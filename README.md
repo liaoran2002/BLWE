@@ -178,8 +178,13 @@ npm run dist
 ```
 
 > 开发（`npm run dev`）**不会**触发保护，渲染层走 Vite dev server，改完刷新即可；
-> 保护只在 `pack` / `dist` 里跑。`npm run pack` 之后 `out/` 里是密文与字节码，
-> 想回去调试先 `npm run build`（或 `build:only`）覆盖回明文。
+> 保护只在 `pack` / `dist` 里跑，而且是**就地改写 `out/`** ——
+> 跑完 `pack` / `dist` 之后 `out/` 里是密文与字节码，**想继续调试先 `npm run build:only` 还原成明文**。
+>
+> `protect` 会先检查 `out/` 是不是干净的明文：只要发现字节码 / 密文的痕迹就**直接报错**
+> 让你先 `npm run build:only`，不会在混合态上闷头再处理一遍。
+> （历史坑：原地改写时若发生一次部分重建，就会留下「主进程明文 + 渲染层密文」的混合态，
+> 页面把密文当 HTML 渲染 → **满屏乱码**。现在由这个前置检查挡住。）
 >
 > 另外 `ELECTRON_RUN_AS_NODE` 被设成 `1` 的环境（某些 CI / 终端）会让 `electron` 退化成纯 Node，
 > 表现为 `app.setName` 未定义、或打包时报 `bad option: --no-sandbox` —— 跑脚本前清掉这个变量。
