@@ -1237,7 +1237,17 @@ export default defineComponent({
       const v = this.videoEl();
       // 已经判定这条流救不回来（单曲歌单 + 反复停滞）：别再周期性告警
       if (this._stallGivenUp) return;
-      if (!v || v.paused || v.seeking) {
+      /**
+       * `paused` 不能一概当成「用户暂停了」
+       *
+       * 踩过：起播的 `play()` 原来只在 `onVideoLoaded`（`@loadeddata`）里调用，
+       * 而 dash（MSE）会话卡住时 `loadeddata` **永远不来** —— 元素一直 `paused === true`，
+       * 这里第一道判断就把自己排除掉了，于是「时长有了、画面一个字节都没有」会**永久卡住**，
+       * 连重解析兜底都进不去（用户报的就是这个）。
+       * 判据：`readyState === 0` 且位置还是 0 = 一个字节都没到，算停滞，照样走兜底。
+       */
+      const neverStarted = v ? v.readyState === 0 && v.currentTime === 0 : false;
+      if (!v || v.seeking || (v.paused && !neverStarted)) {
         // 暂停/拖动时不动是正常的：计时和「已恢复几次」都清掉，
         // 否则用户暂停过一次，本曲第一次真停滞会直接走「已跳过」而省掉重解析
         this._stallSince = 0;
@@ -1291,6 +1301,23 @@ export default defineComponent({
         this.$message.warning(
           noDuration ? '这条视频没能加载出来，正在重新解析…' : '缓冲停住了，正在重新解析这条视频的地址…',
         );
+        /**
+         * 重新解析的是**同一个视频**，所以要把当前位置记下来接着播
+         *
+         * 换 `src` 会把播放位置清零，不记的话就是「重新解析成功后从头开始」——
+         * 用户正听到一半，突然回到 0:00。
+         */
+        this.rememberSeekPoint();
+        /**
+         * dash（MSE）卡住时**优先退回 durl**
+         *
+         * 重新解析同一个 dash 地址往往还是卡在同一个环节（分片拉不动 / MSE 没数据），
+         * 白等 12 秒再跳歌。durl 是单文件直链，能立刻绕开这一层 —— 用户要的是"能看"。
+         */
+        if (this.dashSource) {
+          this.fallbackToDurl();
+          return;
+        }
         if (video && this.videoListKeyword === this.songName) {
           void this.changeVideo(video.bvid, this.videoListKeyword, { skipCache: true });
         } else {
@@ -1503,12 +1530,33 @@ export default defineComponent({
      * 但只下到 5 秒），这时进度应该按「下载到播放点」算：
      * 所以分子取「最后一段缓冲的末尾」，分母取「播放点 + 余量」。
      */
+    /**
+     * 播放点往后**连续可用**多少秒
+     *
+     * 播放点不在任何缓冲段里就返回 0 —— 这正是「时长有了、一个字节都没解码」那种卡住的判据。
+     * 不能用 `lastBufferedEnd()` 代替：它取的是「包含播放点那段的末尾，否则最后一段的末尾」，
+     * 当播放点在第一个缓冲段**之前**（MSE 刚 append、还没起播）时会给出一个很大的数，
+     * 于是缓冲提示被误判成「早就够播了」而**不显示**（用户报的「加载条也不显示就卡在那里」）。
+     */
+    bufferedAhead(): number {
+      const el = this.videoEl();
+      if (!el || !el.buffered.length) return 0;
+      const t = el.currentTime;
+      for (let i = 0; i < el.buffered.length; i += 1) {
+        if (t >= el.buffered.start(i) && t <= el.buffered.end(i)) {
+          return Math.max(0, el.buffered.end(i) - t);
+        }
+      }
+      return 0;
+    },
     syncBufferState(): void {
       const el = this.videoEl();
       if (!el) return;
-      const end = this.lastBufferedEnd();
-      this.bufferSeconds = Math.max(0, end - el.currentTime);
+      const ahead = this.bufferedAhead();
+      this.bufferSeconds = ahead;
       const duration = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+      /** 从播放点往后连续可用到哪一秒（有空洞时就是播放点本身） */
+      const end = el.currentTime + ahead;
       /**
        * 分母不能超过片子总长。
        *
@@ -1579,7 +1627,13 @@ export default defineComponent({
       this._videoErrorCount += 1;
       const video = this.videoList[this.currentVideoIndex];
       if (this._videoErrorCount === 1 && video) {
-        // 第一次失败：跳过缓存重新解析该视频
+        /**
+         * 第一次失败：跳过缓存重新解析该视频
+         *
+         * 必须先把当前位置记下来：这是**同一个视频**重新解析地址（缓存过期 / 直链失效），
+         * 换 `src` 会把播放位置清零 —— 不记的话用户听到的就是「重新解析后从头开始」。
+         */
+        this.rememberSeekPoint();
         await this.changeVideo(video.bvid, this.videoListKeyword, { skipCache: true });
         return;
       }
@@ -1606,10 +1660,19 @@ export default defineComponent({
           const target = this.seekAfterLoad;
           this.seekAfterLoad = 0;
           this.seekAfterLoadFor = '';
-          try {
-            v.currentTime = target;
-          } catch {
-            /* 某些格式不支持 seek，忽略 */
+          /**
+           * 目标点已经越过片尾就**别定位**：`currentTime` 在 duration 未知（MSE 早期是
+           * 0 / Infinity）或上一次是坏源时可能很大，硬定位会「一进去就播完」甚至画面不动。
+           */
+          const dur = v.duration;
+          if (Number.isFinite(dur) && dur > 0 && target >= dur - 1) {
+            console.warn('[video] 记录的进度已超过片长，忽略定位:', target, dur);
+          } else {
+            try {
+              v.currentTime = target;
+            } catch {
+              /* 某些格式不支持 seek，忽略 */
+            }
           }
         } else {
           // 不是给这首歌设的，直接丢掉，别让它污染下一首
@@ -2138,6 +2201,15 @@ export default defineComponent({
             console.warn('[video] dash 播放失败，退回 durl:', err);
             this.fallbackToDurl();
           });
+        /**
+         * 立刻把 `play()` 叫起来（别等 `loadeddata`）
+         *
+         * 踩过：起播的 `play()` 原来只在 `onVideoLoaded` 里调用，而 dash 会话卡住时
+         * `loadeddata` 永远不来 —— 元素一直 `paused === true`，停滞看门狗的第一道判断
+         * 就会把它当成「用户暂停了」，于是「时长有了、画面一个字节都没有」永久卡住。
+         * 这里叫起来之后就算数据不来，`paused` 也是 false，12 秒后兜底照常生效。
+         */
+        if (!this.paused) void el.play().catch(() => {});
         return;
       }
 
@@ -2154,7 +2226,12 @@ export default defineComponent({
         this.fallbackToDurl();
         return;
       }
-      if (this.videoUrl) el.src = this.videoUrl;
+      if (this.videoUrl) {
+        el.src = this.videoUrl;
+        // 同上：不等 loadeddata，先把播放意图落到元素上（否则「没数据的源」会让
+        // 元素一直 paused，停滞兜底进不去）
+        if (!this.paused) void el.play().catch(() => {});
+      }
     },
     /**
      * 延迟显示换源缓冲提示
@@ -2174,7 +2251,7 @@ export default defineComponent({
          * 实测：预热过的切歌里有 200ms 左右「数据其实早就够了、只是解码器还没出画」的空窗，
          * 这时亮一个 99% 的圈纯粹是干扰 —— 够播了就该直接出画。
          */
-        if (this.lastBufferedEnd() - el.currentTime >= 1) return;
+        if (this.bufferedAhead() >= 1) return;
         this.buffering = true;
         this.syncBufferState();
         this.startBufferTicker();
@@ -2200,6 +2277,16 @@ export default defineComponent({
      * 连续失败两次就认为这台机器上 dash 不可用，本会话不再尝试，
      * 免得每切一首歌都白跑一次 dash。
      */
+    rememberSeekPoint(): void {
+      // 位置优先取元素上的（切源瞬间 this.currentTime 可能还是上一帧的旧值）
+      const v = this.videoEl();
+      const at = v && Number.isFinite(v.currentTime) ? v.currentTime : this.currentTime;
+      if (at > 1) {
+        this.seekAfterLoad = at;
+        // 标明是给这首歌设的：中途切歌时 onVideoLoaded 会把不匹配的定位丢掉
+        this.seekAfterLoadFor = this.songName;
+      }
+    },
     fallbackToDurl(): void {
       this.stopDashSession();
       this.dashSource = null;
@@ -2211,12 +2298,7 @@ export default defineComponent({
       const bvid = this.currentBvid;
       if (!bvid) return;
       // 换 durl 会重新加载视频，把当前进度记下来接着播
-      // （并标明是给这首歌设的，免得中途切歌后误用到别的歌上）
-      const resumeAt = this.currentTime;
-      if (resumeAt > 1) {
-        this.seekAfterLoad = resumeAt;
-        this.seekAfterLoadFor = this.songName;
-      }
+      this.rememberSeekPoint();
       void this.changeVideo(bvid, this.videoListKeyword || this.songName, {
         skipCache: true,
         noDash: true,

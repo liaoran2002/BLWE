@@ -35,7 +35,7 @@
         https://github.com/liaoran2002/BiLiMusicVideo
       </div>
 
-      <div class="ab-thanks">大肥鱼，没有你我写不出来啊！<br>虽然花了我38.53块钱加6元鲸圆券！但是你不是吃白饭的大肥鱼！</div>
+      <div class="ab-thanks">大肥鱼，没有你我写不出来啊！<br>虽然花了我40块钱加6元鲸圆券！但是你不是吃白饭的大肥鱼！</div>
     </div>
   </el-dialog>
 </template>
