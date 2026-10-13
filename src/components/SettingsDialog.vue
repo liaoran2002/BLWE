@@ -149,6 +149,33 @@
             <span class="st-value">{{ shadowPercent }}%</span>
           </div>
         </div>
+        <!--
+          窗口宽高比
+
+          `allow-create` 让用户能直接输入一个比例（如 21:9、9:16），输入的值会被
+          加进列表并持久化（`common.customAspectRatios`），下次打开还在。
+          `filterable` 让选项多了以后能搜。
+        -->
+        <div class="st-row">
+          <div class="st-name">窗口宽高比</div>
+          <el-select
+            :model-value="setting['common.windowAspectRatio']"
+            size="small"
+            style="width: 170px"
+            filterable
+            allow-create
+            default-first-option
+            :reserve-keyword="false"
+            @update:model-value="(v: string) => setAspectRatio(v)"
+          >
+            <el-option
+              v-for="opt in aspectRatioOptions"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
+          </el-select>
+        </div>
       </div>
 
       <!-- 通用 -->
@@ -209,7 +236,12 @@
 import { defineComponent } from 'vue';
 import { ElMessage } from 'element-plus';
 import {
+  ASPECT_RATIO_FREE,
+  ASPECT_RATIO_MAX_LENGTH,
+  ASPECT_RATIO_OPTIONS,
+  ASPECT_RATIO_PATTERN,
   AUDIO_QUALITY_OPTIONS,
+  CUSTOM_ASPECT_RATIO_MAX_COUNT,
   GLASS_BLUR_PERCENT_PER_PX,
   GLASS_BLUR_PERCENT_STEP,
   GLASS_SHADOW_PERCENT_PER_PX,
@@ -286,6 +318,19 @@ export default defineComponent({
       const { count, bytes } = this.cacheStats;
       return `${count} 个文件 / ${formatBytes(bytes)}`;
     },
+    /**
+     * 下拉框的选项 = 固定预设 + 用户自己输入过的比例
+     *
+     * 预设里已经有 `16:9` / `4:3` / `free`，自定义列表要去掉重复的
+     * （用户可能把 16:9 又输了一遍），否则下拉框里会出现两个「16:9」。
+     */
+    aspectRatioOptions(): { label: string; value: string }[] {
+      const presetValues = new Set<string>(ASPECT_RATIO_OPTIONS.map((o) => o.value));
+      const custom = this.setting['common.customAspectRatios']
+        .filter((v) => v && !presetValues.has(v))
+        .map((v) => ({ label: v, value: v }));
+      return [...ASPECT_RATIO_OPTIONS.map((o) => ({ label: o.label, value: o.value })), ...custom];
+    },
   },
   watch: {
     // 每次打开时刷新一次占用
@@ -358,6 +403,50 @@ export default defineComponent({
     setShadowPercent(v: number | number[]): void {
       const pct = snapSlider(v, 0, 100, GLASS_SHADOW_PERCENT_STEP);
       this.set('common.glassShadow', Math.round(pct / GLASS_SHADOW_PERCENT_PER_PX));
+    },
+    /**
+     * 设置窗口宽高比
+     *
+     * 三种输入都要处理：
+     *  1. 固定预设（`16:9` / `4:3` / `free`）→ 直接用；
+     *  2. 已有自定义比例 → 直接用；
+     *  3. **新输入的比例**（`allow-create` 放进来的任意字符串）→ 先校验格式，
+     *     合法才落盘，并把它加进 `common.customAspectRatios` 让它留在下拉列表里。
+     *
+     * 校验必须做：输入框里可以敲任何东西（`abc`、`16/9`、空串），
+     * 非法值落盘后主进程会当成 `0`（不限制），界面却显示着 `abc` —— 两边不一致。
+     */
+    setAspectRatio(v: string): void {
+      const value = String(v ?? '').trim();
+
+      // 「不限制」和空值：回到不限制
+      if (!value || value === ASPECT_RATIO_FREE) {
+        this.set('common.windowAspectRatio', ASPECT_RATIO_FREE);
+        return;
+      }
+
+      if (!ASPECT_RATIO_PATTERN.test(value) || value.length > ASPECT_RATIO_MAX_LENGTH) {
+        ElMessage.warning('宽高比格式应为「宽:高」，例如 16:9 或 21:9');
+        return;
+      }
+
+      // 解析一次，挡掉 `0:9` / `16:0` 这种数学上无意义的值
+      const [w, h] = value.split(':').map(Number);
+      if (!(w > 0) || !(h > 0)) {
+        ElMessage.warning('宽高比两边的数字都必须大于 0');
+        return;
+      }
+
+      this.set('common.windowAspectRatio', value);
+
+      // 新比例就记进下拉列表（已有则不重复加）
+      const presetValues = ASPECT_RATIO_OPTIONS.map((o) => o.value) as string[];
+      const list = this.setting['common.customAspectRatios'];
+      if (!presetValues.includes(value) && !list.includes(value)) {
+        // 只留最近若干个，避免长期使用后列表无限膨胀
+        const next = [...list, value].slice(-CUSTOM_ASPECT_RATIO_MAX_COUNT);
+        this.set('common.customAspectRatios', next);
+      }
     },
     async clearCache() {
       this.cacheBusy = true;

@@ -237,6 +237,13 @@ export interface IpcEventMap {
   /** 托盘菜单点音量图标：静音开关 */
   'tray:toggleMute': void
   'wallpaper:state': boolean
+  /**
+   * 壁纸模式不可用（原生层加载失败 / 找不到 WorkerW 等）
+   *
+   * 以前这种情况是完全静默的：点了按钮没反应、也没有任何日志，
+   * 用户根本不知道是「环境不支持」还是「程序坏了」。现在把原因报给渲染层弹提示。
+   */
+  'wallpaper:unavailable': string
   'window:maximized': boolean
   'window:fullscreen': boolean
   /**

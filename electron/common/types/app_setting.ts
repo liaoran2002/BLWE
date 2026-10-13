@@ -48,6 +48,24 @@ export interface AppSetting {
    * 只管文字阴影（压在视频上的白字/黑字靠它看清），不是弹窗的投影。
    */
   'common.glassShadow': number
+  /**
+   * 窗口宽高比
+   *
+   * 值是一个「比例字符串」：
+   *  - `'16:9'` / `'4:3'` / `'21:9'` … 预设或用户自己输入的比例，窗口锁定该比例；
+   *  - `'free'` 表示**不限制**（用户可以任意拉伸，对应 `setAspectRatio(0)`）。
+   *
+   * 注意：**壁纸模式下这个设置不起作用** —— 壁纸要铺满整屏，
+   * 进入时会强制 `setAspectRatio(0)`，退出时再按这个设置恢复。
+   */
+  'common.windowAspectRatio': string
+  /**
+   * 用户自己输入过的宽高比（`['21:9', '9:16']` 这种）
+   *
+   * 单独存一份是为了实现「输入的比例加到下拉列表里」：下拉框的内容 = 固定预设 + 这一份。
+   * 这里只管存，解析统一走 `parseAspectRatio`（主进程、渲染层共用同一个函数）。
+   */
+  'common.customAspectRatios': string[]
   // #endregion
 
   // #region player

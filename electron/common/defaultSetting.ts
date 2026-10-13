@@ -9,6 +9,7 @@
  * 参考 LX Music 的 src/common/defaultSetting.ts
  */
 import {
+  DEFAULT_ASPECT_RATIO,
   DEFAULT_AUDIO_ID,
   DEFAULT_FONT_COLOR,
   DEFAULT_THEME_COLOR,
@@ -45,6 +46,19 @@ const defaultSetting = {
    * 8 就是原来的「0 1px 4px + 0 0 8px」
    */
   'common.glassShadow': 8,
+  /**
+   * 窗口宽高比：'16:9' / '4:3' / 自定义比例 / 'free'（不限制）
+   *
+   * 默认 16:9 就是改造前写死的那个值，所以老用户升级后行为不变。
+   * 注意**壁纸模式下它不起作用**（壁纸要铺满整屏）。
+   */
+  'common.windowAspectRatio': DEFAULT_ASPECT_RATIO,
+  /**
+   * 用户自己输入过的宽高比（下拉框 = 固定预设 + 这一份）
+   *
+   * 默认空数组：老用户升级后下拉框里只有那三个固定项，跟改造前无差别。
+   */
+  'common.customAspectRatios': [],
   // #endregion
 
   // #region player

@@ -158,5 +158,7 @@ export interface RendererAPI {
   wallpaperToggle: () => Promise<boolean>
   wallpaperIsEnabled: () => Promise<boolean>
   onWallpaperState: (cb: (enabled: boolean) => void) => RemoveListener
+  /** 壁纸模式不可用时收到原因（原生层加载失败 / 找不到桌面壁纸层等），用于给用户提示 */
+  onWallpaperUnavailable: (cb: (reason: string) => void) => RemoveListener
   // #endregion
 }

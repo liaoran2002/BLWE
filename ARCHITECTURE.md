@@ -47,7 +47,8 @@
 │   │   ├── ipcHandlers.ts          # 组装各领域 handler（IpcContext 依赖注入）
 │   │   ├── protection.ts           # ★ 打包后渲染层资源的 blmv:// 解密协议
 │   │   ├── bundleKey.ts            # 打包加密用的对称密钥（会被编进主进程字节码）
-│   │   ├── portable.ts             # 便携版数据目录（%APPDATA% 优先，否则 exe 同级 data/）
+│   │   ├── winWallpaper.ts         # ★ 桌面壁纸层（koffi 直调 Win32：WorkerW / SetParent）
+│   │   ├── portable.ts             # 便携版数据目录（%APPDATA% 优先，否则 exe 同级 blmvdata/）
 │   │   ├── biliApi.ts              # B站 API（搜索/视频解析/WBI 签名/登录态）
 │   │   ├── music/                  # ★ 多平台歌单解析（移植自 LX 的 musicSdk）
 │   │   │   ├── index.ts            #   音源总表 + 按链接自动识别平台
@@ -360,6 +361,67 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 > 所以 `SettingsDialog` 里用 `.st-slider-box` 把滑块和一个等宽数字（`.st-value`）并排，
 > 拖动时数字跟着变。
 
+### 窗口宽高比（设置项，踩坑记录）
+
+**结论：比例存成一个字符串**（`'16:9'` / `'4:3'` / `'21:9'` / `'free'`），
+由 `parseAspectRatio()` 解析成数值喂给 `setAspectRatio()`。
+
+设置里有三项固定预设，加上**用户自己输入过的比例**：
+
+| 下拉项 | 含义 |
+| --- | --- |
+| `16:9（默认）` | 锁 16:9（= 改造前的写死行为） |
+| `4:3` | 锁 4:3 |
+| `不限制` | 不锁比例（`parseAspectRatio` 返回 `0` → `setAspectRatio(0)`） |
+| 用户输入（如 `21:9`） | `allow-create` 放进来的，**加进列表并持久化**到 `common.customAspectRatios` |
+
+**解析函数必须主进程和渲染层共用**（放在 `@common/constants`）：
+两边各写一份迟早会不一致（界面显示「已锁定」而主进程其实没锁）。
+非法值一律返回 `0`（当作不限制），并有 15 条用例的实测覆盖：
+`abc` / `16/9` / `16:` / `:9` / `0:9` / `16:0` / `-16:9` / 空串 / `null` 全部安全回落。
+
+**踩坑一：`setAspectRatio` 绝不能写死。**
+原来是一个模块级常量 `FULLSCREEN_ASPECT = 16/9`，散在**四处**：
+建窗口、退出全屏、退出壁纸、从全屏拖出窗口。只改建窗口那处的话，
+用户选了 4:3，一退出全屏就被**悄悄改回 16:9**。现在四处统一走 `applyAspectRatio()`（读设置）。
+
+**踩坑二：只给 `width` 不给 `height`，宽度会被覆盖（实测）。**
+`setAspectRatio` 会**按高度反推宽度**。不给高度时 Electron 用默认 600，
+于是你指定的 1138 变成了 1069 —— 「按屏幕宽 0.8」直接失效。**所以高必须自己算。**
+
+**踩坑三：只按宽度算高，会让窗口高过屏幕（实测）。**
+在 1423×771 的可用区域上量出来：
+
+| 比例 | 只按宽算 | 问题 |
+| --- | --- | --- |
+| 16:9 | 1138×640 | ok |
+| **4:3** | 1138×**854** | ⚠️ 已经超出 771 |
+| **9:16** | 1138×**2023** | ⚠️ 屏幕高的 2.6 倍 |
+| 21:9 | 1138×488 | ok |
+
+**4:3 是内置预设就会超标**，不是极端情况。所以两条边都按可用区域的 0.8 封顶，
+超了**等比缩回来**（比例不能动，否则和 `setAspectRatio` 打架）。修完实测：
+
+```
+16:9  1097x617  ✅不超屏 ✅比例对
+4:3    823x617  ✅不超屏 ✅比例对
+9:16   347x617  ✅不超屏 ✅比例对
+21:9  1138x488  ✅不超屏 ✅比例对
+free  1097x617  ✅不超屏 ✅比例对
+```
+
+**踩坑四：数组型设置项在 `resetSetting` 里必须深拷贝。**
+`{...defaultSetting}` 只做浅拷贝，数组/对象成员和模块级的 `defaultSetting`
+是**同一个引用**（`player.tagBonus` 早就因此显式深拷贝过）。
+新加的 `common.customAspectRatios` 也是数组 —— 漏了的话，用户往下拉列表加比例
+会把默认值一起改脏，表现是**「恢复默认设置」之后自定义比例还在**。
+
+**和壁纸 / 全屏的关系**：这两种状态要铺满屏幕，都由 `applyFullScreenGeometry()`
+里的 `setAspectRatio(0)` 临时解除约束；退出时再 `applyAspectRatio()` 按设置恢复。
+所以「全屏 → 壁纸 → 窗口模式」回来时，比例还是用户选的那个。
+运行中改设置也会**立刻生效**（`onSettingChange` 里判断 key），
+但在全屏 / 壁纸状态下**故意不动** —— 那会跟 `setBounds` 铺满的逻辑打架。
+
 ### 清晰度 / 音质切换
 
 这两处**不是一回事**，别把它们做成同一份数据：
@@ -666,9 +728,9 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 
 ### 全屏与桌面壁纸（踩坑记录）
 
-**结论：主窗口是 `transparent: true`，Windows 上透明窗口的原生全屏是失效的，
-所以「全屏」改成应用层模拟，不要调用 `setFullScreen()`，也不要读 `isFullScreen()`。**
+**结论：「全屏」用应用层模拟，不要调用 `setFullScreen()`，也不要读 `isFullScreen()`。**
 
+这一套最初是因为**主窗口当时是 `transparent: true`**，而 Windows 上透明窗口的原生全屏是失效的。
 实测（Electron 42 / Windows，`setFullScreen(true)` 后 600ms 读回）：
 
 | 窗口配置 | `isFullScreen()` |
@@ -676,7 +738,7 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 | 普通窗口 | `true` |
 | `frame: false` | `true` |
 | `transparent: true` | **`false`** |
-| `transparent: true` + `frame: false`（本项目） | **`false`** |
+| `transparent: true` + `frame: false`（当时的本项目） | **`false`** |
 | 同上 + `thickFrame:false` / `roundedCorners:false` / `hasShadow:false` / `resizable:true` | **`false`** |
 | 同上，但先 `setBounds` 到整屏再 `setFullScreen` | **`false`** |
 
@@ -689,6 +751,11 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 - 从全屏切到壁纸时，还原点记到的是「非全屏」，退出壁纸就掉回普通窗口，
   而**挂壁纸层时窗口还是普通尺寸** → 「进了壁纸模式但没在壁纸层全屏」。
 
+> **⚠️ 前提已经变了**：主窗口现在**不透明**（原因见下面「壁纸层」那节里 `WS_EX_LAYERED` 的坑），
+> 所以「透明导致原生全屏失效」这个前提**不再成立**。
+> 但**应用层模拟继续保留**，不换回原生 API：它已经过大量验证，
+> 而且 `fullScreenRestore` 那套还原逻辑完全建立在它之上，换回去是纯风险、没有收益。
+
 现在的做法（`electron/main/index.ts`）：
 
 - `applyFullScreenGeometry()`：`setAspectRatio(0)`（免得宽高比约束改写 `setBounds`）+ 
@@ -700,16 +767,152 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
   - `fullScreenRestore`：进入全屏前的普通窗口尺寸 / 最大化状态，退出全屏时用；
   - `wallpaperRestore`：进入壁纸**之前**的状态（含「当时是不是全屏」），退出壁纸时用。
     所以「全屏 → 壁纸 → 窗口模式」会回到全屏，且此时依然能正常退出全屏。
-- 先铺满窗口、等 120ms 让系统应用尺寸，**再** `asWallpaper.attach()`，否则挂载拿到的是旧几何。
+- 先铺满窗口、等 120ms 让系统应用尺寸，**再** `attachWallpaper()`，否则挂载拿到的是旧几何。
 - 壁纸模式下 `win:toggleFullscreen` 直接返回（几何由壁纸层接管）。
 - **壁纸模式 = 纯背景**：标题栏和控制栏都挂 `.wm-hidden`（`display: none`），窗口里没有可点的东西，
-  所以 `attach()` 里 `forwardMouseInput: false`（不装全局鼠标转发）。操作全部走托盘菜单；
-  「设置歌单」「退出登录」这类需要窗口的项会先 `restoreWindow()` 再执行。
+  所以原生层**不做鼠标 / 键盘转发**（那本来是为了把系统事件合成进壁纸窗口，现在没有可点的东西）。
+  操作全部走托盘菜单；「设置歌单」「退出登录」这类需要窗口的项会先 `restoreWindow()` 再执行。
   另外进入时 `setSkipTaskbar(true)`、退出时恢复 `false`：壁纸是「桌面的一部分」，
   任务栏上不该多一个按钮（和最小化到托盘一样干净），要回窗口就左键点托盘图标。
 - **进壁纸模式先收掉所有弹窗**：壁纸模式下标题栏/控制栏都隐藏了，弹窗留在那儿既点不动也关不掉
   （用户只能先回窗口模式关掉它、再重新进壁纸）。所以渲染层监听 `wallpaperEnabled` 变 `true`，
   把列表 / 歌单管理 / 设置 / 关于 / 添加视频一起关掉。
+
+#### 壁纸层用 koffi 自己调 Win32（不再依赖 `electron-as-wallpaper`）
+
+**结论：那个库不能用，换成 `electron/main/winWallpaper.ts`（koffi 直接调 Win32，约 330 行）。**
+
+为什么弃用它 —— 两个原因，一个是**工具链**，一个是**致命 bug**：
+
+| 问题 | 说明 |
+| --- | --- |
+| **要 Rust 工具链** | 它的原生模块靠 `cargo build` **现场编译**（`scripts.install` = `npm run neon:release` → `cargo build`）。没装 cargo 的机器 `npm i` 直接失败；而主进程里那个 `require` 被空 `try/catch` 吞掉 → **点了壁纸按钮毫无反应、也没有任何日志**，用户完全不知道是环境问题还是程序坏了 |
+| **`attach` 不是原子操作（致命）** | 顺序是「先 `SetParent(hwnd, WorkerW)`（不可逆，窗口已离开正常窗口层）→ 再 `toggle_window_transparent`」，而后者内部是「先 `SetWindowLongA` 打上 `WS_EX_LAYERED` → 再 `SetLayeredWindowAttributes(...).unwrap()`」。**这两句之间就是一个「窗口已被摘出正常层、又被打成 layered 但属性还没生效」的中间态 —— 按 Win32 规则这个窗口不显示。** 一旦第二步 panic，JS 层 `window.wallpaperState = { isAttached: true }` 执行不到，调用方以为「没挂上」 |
+| **回滚漏了 detach（把上面的失败变成永久故障）** | 老代码的回滚只还原了几何 / 任务栏 / 置顶，**没有 `SetParent` 回来**。于是窗口留在桌面层且不可见，任务栏按钮也没有；而 `wallpaperEnabled` 已被翻回 `false`，`restoreWindow()` 又只看这个标志 → **永远不会去 detach，点「恢复窗口」也救不回来**，只能杀进程 + 重启 Explorer |
+| **`isTransparent` 报的是错的对象** | 它写的是模块级默认值 `attachOptions.transparent`（`false`），而不是调用方传的 `true`。于是 `detach()` 里读到的永远是 `false`，**`WS_EX_LAYERED` 样式再也不会被清掉** |
+| **`isAttached` 不是成功信号** | 它在 `neon.attach()` 正常返回后**无条件**置 `true`，只能反映「有没有抛异常」，检测不到静默失败 |
+
+现在的做法（`winWallpaper.ts`）：
+
+1. **完全不碰 `WS_EX_LAYERED`** —— 只做 `SetParent`。库那个标志设的 alpha 是 `255`
+   （完全不透明，视觉上等于没做事），唯一效果就是加个 `WS_EX_LAYERED`，
+   却是整条崩溃路径的唯一来源。去掉它，那个中间态**根本不存在**。
+2. **`SetParent` 之后回读真实父窗口来验证**（不是靠「有没有抛异常」猜）。
+3. **失败不抛异常**，返回结构化 `{ok, reason}`，由调用方决定怎么回滚 —— 调用方必须能在
+   「原生层可能已经挂上」的前提下无条件 `detach`。
+4. **koffi 是预编译的 N-API 包**（`@koromix/koffi-win32-x64` 带现成 `.node`），**不需要 Rust 工具链**。
+
+#### ⚠️ 透明窗口 + 没有 GPU 加速 = 壁纸模式「有声音没画面」（踩坑记录）
+
+**这是比上面那条更隐蔽的坑，因为它跟我们的代码无关 —— 是 Chromium 自己去设的 `WS_EX_LAYERED`。**
+
+现象：**在虚拟机里进壁纸模式，声音还在、画面没了**；物理机上完全正常。
+
+排查过程（每一步都实测过，值得记下来）：
+
+| 步骤 | 做法 | 结果 |
+| --- | --- | --- |
+| 1 | 加诊断日志，打印挂载前后的窗口状态 | 挂载**成功**（`parent` 正确）、`visible=1`、`rect=0,0 1920x1080`、`dwmComposition=1` —— 系统眼里一切正常 |
+| 2 | 对比物理机与虚拟机的 `exstyle` | 物理机 `0x0`，虚拟机 **`0x80008`（`layered=1`）** ← 差异在这里 |
+| 3 | 本机复现：同一份代码加 `--disable-gpu` | **复现！`layered` 从 0 变成 1** |
+
+也就是说：**虚拟机只是「没有 GPU 加速」最常见的一种场景**。这条链条是：
+
+```
+transparent: true
+   ↓
+Chromium 要合成一个透明窗口
+   ↓
+有 GPU  → 走 DWM 硬件合成        → 正常 ✅
+没 GPU  → 退回 GDI「分层窗口」    → 给自己设上 WS_EX_LAYERED
+              ↓
+         SetParent 到 WorkerW（桌面层）
+              ↓
+         桌面层的合成路径画不出分层子窗口 → 画面出不来
+              ↓
+         音频走独立线程，不受影响 → 声音还在
+```
+
+**会中招的远不止虚拟机**：远程桌面（RDP）、显卡驱动损坏或用的微软基本显示适配器、
+老显卡、以及任何 `--disable-gpu` 启动的场合。所以「只有虚拟机有问题」是错觉。
+
+**修法：主窗口不要透明。** `transparent: false` + `backgroundColor: '#000000'` 之后，
+Chromium 不需要分层，`exstyle` 干净（实测 `0x100`，**无 `WS_EX_LAYERED`**），从根上绕开。
+
+> **为什么这个修法不会伤到界面毛玻璃**：`--glass-bg` + `backdrop-filter` 模糊的是
+> **页面内部**渲染的视频画面，跟「窗口能不能透出桌面」完全是两件事。
+> 窗口透明影响的是最外层那一圈底色（原来是透出桌面，现在是不透明黑），
+> 而标题栏 / 控制栏 / 弹窗的毛玻璃照旧。
+>
+> 顺带：这个改动**对壁纸模式是纯收益** —— 壁纸模式铺满整屏、界面全隐藏，
+> 那点「透出桌面壁纸」的角反而是噪音；不透明之后画面从边到边，更干净。
+
+**诊断日志保留在代码里**（`winWallpaper.ts` 的 `describeWindow`），挂载前后各打一行：
+
+```
+[wallpaper] 挂载前: parent=65552  visible=1  iconic=0  style=0x14030000(child=0,visibleBit=1)  exstyle=0x0(layered=0,transparent=0)  rect=0,0 1920x1080  dwmComposition=1
+[wallpaper] 挂载后: parent=1049636(期望 1049636)  visible=1  ...  exstyle=0x80008(layered=1,...)  ...
+```
+
+以后再有「画面看不见」的反馈，先看这两行的 `layered` 和 `dwmComposition`，
+一眼就能定位是「透明降级」还是「DWM 合成没开」——不用再像这次一样来回猜。
+
+**⚠️ 校验父窗口不能用 `GetParent`（实测踩过，卡了一整轮）：**
+
+`GetParent` 的语义是「**子窗口**返回 parent，**带 `WS_POPUP` 的顶层窗口**返回 owner」——
+而 `SetParent` **不会**把窗口样式改成 `WS_CHILD`。所以窗口挂到 WorkerW 之后，
+它在 `GetParent` 眼里仍然是顶层窗口，返回的是 **owner（NULL）**，永远拿不到 WorkerW。
+
+实测（挂载成功后同时读三个 API，窗口确实已经在壁纸层）：
+
+```
+SetParent(hwnd, worker) -> 返回 65552（旧父窗口，不是错误码）
+GetParent(hwnd)               = 0        ← 会误判成「没挂上」
+GetWindowLongPtr(hwnd, -8)    = 788750   ← 真实父窗口
+GetAncestor(hwnd, GA_PARENT)  = 788750   ← 真实父窗口
+```
+
+用错这个 API 的后果：**校验永远失败 → 每次进壁纸都被回滚 detach → 壁纸模式完全进不去**，
+而日志上只看到一句 `SetParent 没有生效（期望父窗口 788750，实际 0）`，从字面完全看不出是校验写错了。
+现在用 `GetAncestor(GA_PARENT)`（`GWLP_HWNDPARENT` 兜底）。
+
+顺带：`SetParent` 的**返回值是旧父窗口**、`GetLastError` 也可能是上一次调用的残留（实测拿到 87），
+两者都**不能**当成功/失败依据，只有回读父窗口算数。
+
+**两个标志必须分开：`wallpaperEnabled` vs `wallpaperAttached`**
+
+这是「窗口回不来」那个 bug 的根因，也是这次改造的核心：
+
+| 变量 | 含义 | 谁读它 |
+| --- | --- | --- |
+| `wallpaperEnabled` | **应用意图**：用户当前是不是「壁纸模式」 | 界面按钮文案、托盘菜单、渲染层 `.wm-hidden` |
+| `wallpaperAttached` | **物理事实**：窗口是不是**真的**挂到了桌面层 | `restoreWindow()` / `before-quit` |
+
+`attach` 里的 `SetParent` 是不可逆动作：**只要执行过，窗口就已经离开正常窗口层了。**
+所以 `wallpaperAttached` 在调 `attachWallpaper()` **之前**就置位（宁可多摘一次，不能漏摘），
+只有 `detachWallpaper()` 成功后才清除。`restoreWindow()` 与 `before-quit` 都改判它
+（外加 `isAttachedToWallpaper()` 直接问系统），**不再只看 `wallpaperEnabled`**。
+
+**「窗口模式」就是唯一入口，不另设「强制…」那一项（踩坑记录）**
+
+一开始加过一个单独的逃生口「强制回到窗口模式」。两个问题：
+
+1. **文案吓人**：用户看到「强制」会以为出了故障（用户原话：「用户看见什么强制还以为咋了呢」）；
+2. **和切换项重名**：壁纸模式下切换项本来就显示「窗口模式」，再加一项就是两个「窗口模式」，更懵。
+
+所以**合并成一项**，壁纸模式下点「窗口模式」直接走 `restoreWindow()`：
+
+- 它三个条件**取或**判断「窗口是不是真的挂在桌面层」——`wallpaperEnabled`（意图）、
+  `wallpaperAttached`（事实）、`isAttachedToWallpaper()`（问系统）。
+  所以状态漂移时它也能救回来，**本身就已经是最稳的那条路径**，不需要额外的逃生口动作；
+- `setWallpaperMode(false)` 没确认成功时，它还会**再硬 `detach` 一次**；
+- 最后 `show()` + `focus()` —— 点「窗口模式」本来就该看到窗口。
+
+一句话：**逃生口的能力被并进了「窗口模式」这个正常入口**，而不是留一个单独的动作
+（见 `src/trayMenu/main.ts` 里 `action` 的注释）。
+
+**失败要出声**：`toggleWallpaper()` 在原生层不可用时广播 `wallpaper:unavailable`（带原因），
+渲染层弹一条提示。以前是空 `catch` 静默 —— 「点了没反应」没有任何线索，这是排查困难的主因。
 
 **「启动时进入桌面壁纸模式」这个设置的边界（踩坑记录）**：
 
@@ -723,10 +926,10 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 
 > 一句话：**「下次开机进壁纸」和「现在是不是壁纸」是两件事**，各管各的，谁也别去写对方。
 
-**为什么托盘菜单是自绘的，不是原生 `Menu.popup`**（`electron-as-wallpaper` 的源码结论，不是猜的）：
+**为什么托盘菜单是自绘的，不是原生 `Menu.popup`**（结论来自当时那个库的 Rust 源码，不是猜的）：
 
-`attach()` 干了三件事：`SendMessageTimeout(Progman, 0x052C, …)` 让 Explorer 生成 WorkerW、
-`SetParent(hwnd, worker_w)` 把窗口挂到桌面图标后面、以及 `forwardMouseInput: true` 时
+`electron-as-wallpaper` 的 `attach()` 除了 `SendMessageTimeout(Progman, 0x052C, …)` 让 Explorer 生成 WorkerW、
+`SetParent(hwnd, worker_w)` 把窗口挂到桌面图标后面，还会在 `forwardMouseInput: true` 时
 注册 `RIDEV_INPUTSINK` 原始输入 —— 后者会把**全系统的鼠标事件**都
 `PostMessageA(壁纸窗口, WM_LBUTTONDOWN/UP, …)` 塞进去。
 
@@ -735,8 +938,10 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 这个转发在 Rust 侧是全局装的，JS 这层没法「只在菜单开着时关掉」。
 结论：开着鼠标转发时，**任何原生弹出菜单都活不下来**。
 
-> 现在壁纸模式已经把 `forwardMouseInput` 关掉了（界面都隐藏了，没什么可点的），
+> 现在壁纸层换成自己写的 `winWallpaper.ts`，**压根不实现输入转发**（界面全隐藏，没什么可点的），
 > 所以这一整类问题在壁纸模式下不复存在；下面那些防护留着当保险。
+> 自绘菜单本身**照旧保留** —— 它现在是个完整的迷你控制台（进度条 / 音量 / 播放控制），
+> 原生菜单画不出这些控件，换回 `Menu.popup` 反而是功能倒退。
 
 所以托盘菜单自己画，跑在一个**独立的置顶窗口**里（`tray-menu.html` + `src/trayMenu/main.ts`）。
 它是个**迷你控制台**：
@@ -766,7 +971,7 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 | 关闭到托盘 | 菜单里「壁纸模式」那一项在窗口被藏起来时变成**「恢复窗口」**，动作也跟着换 |
 | **动作必须跟着状态走** | 踩过：登录那一项的文案会随登录态变成「退出登录」，但动作写死成 `'login'` —— 点「退出登录」发的还是 login，用户看到的就是「点了又登录上了」。凡是文案会变的项，`action` 也要是函数 |
 | **每次弹出都要装兜底显示** | 踩过：页面「高度没变就不回报」，而显示这件事绑在 `trayMenu:ready` 上 —— 第一次右键能弹（高度 0→N），第二次开始不再回报，菜单就再也不出现（「进了壁纸模式后右键弹不出来」）。现在 `showTrayMenu` 每次都装一个 120ms 的兜底显示，高度真变了再重新定位 |
-| **合成点击防护** | 已注释。它本来是挡「鼠标转发把点菜单这一下同时合成到壁纸窗口」，现在壁纸模式 `forwardMouseInput: false`（界面也全隐藏），不会再有合成点击。`trayMenuOpen` 标志留着 —— 菜单开着时要把进度推给菜单里的进度条 |
+| **合成点击防护** | 已注释。它本来是挡「鼠标转发把点菜单这一下同时合成到壁纸窗口」，而现在壁纸层（`winWallpaper.ts`）**根本不实现输入转发**（界面也全隐藏），不会再有合成点击。`trayMenuOpen` 标志留着 —— 菜单开着时要把进度推给菜单里的进度条 |
 | 左键语义 | 直接显示窗口（`restoreWindow`）：壁纸模式下先切回窗口模式，窗口在托盘里就恢复并前置；**同时广播 `tray:unlock` 让界面解锁** |
 | **左键要顺带解锁** | 踩过：窗口模式 + 锁定状态下界面只剩左下右下两个角按钮，用户会很自然地去点托盘图标 —— 以前那一下什么都不发生（窗口本来就可见），看着像卡死。现在左键在 `restoreWindow()` 之后广播 `tray:unlock`，渲染层用幂等的 `toggleLock(false)` 处理（没锁就什么都不做、也不多弹提示）。锁定态只在渲染层，主进程不猜也不存 |
 | **提示文案必须跟着行为走** | 踩过：左键从「播放 / 暂停」改成「回到窗口」之后，壁纸模式的 tooltip 还写着旧文案，用户照提示点了一下，结果窗口直接跳出来 —— 提示与行为不一致比没有提示更糟。tooltip 两种模式各写各的（应用模式「单击：显示窗口」/ 壁纸模式「单击：回到窗口」），菜单里每个按钮的 `title` 也随状态更新（播放/暂停、当前模式、静音/取消静音） |
@@ -1006,11 +1211,19 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 | 情况 | 用哪个目录 |
 | --- | --- |
 | `%APPDATA%/BiLiMusicVideo-desktop` 里**已经有本应用数据** | 就用它（安装版 / 便携版共用一份，换版本不会「数据不见了」） |
-| 没有数据，且当前是便携版（运行时带 `PORTABLE_EXECUTABLE_DIR`） | exe 同级的 `data/`（自动创建，数据跟着程序走） |
+| 没有数据，且当前是便携版（运行时带 `PORTABLE_EXECUTABLE_DIR`） | exe 同级的 **`blmvdata/`**（自动创建，数据跟着程序走） |
 | 没有数据，且是安装版（全新环境） | 默认的 `%APPDATA%/BiLiMusicVideo-desktop` |
 
 判断「已经有数据」看的是我们自己的文件（`setting.json` / `playlists.json` / `playlist.json` / `search-cache`），
 **不能只看目录存不存在** —— Electron 一启动就会把 userData 目录建出来，那样全新机器上永远走不到便携分支。
+
+**目录名是 `blmvdata` 而不是 `data`**：`data/` 太通用，绿色版常被丢在同一个文件夹里，容易和别的软件撞。
+
+> **刻意不做旧目录迁移**：早期版本用的是 `data/`，改名后旧目录原样留着、不读不写也不删。
+> 用户如果需要老数据，手动把 `setting.json` / `playlists.json` 拷进 `blmvdata/` 就行。
+> 这是有意的取舍 —— 自动 `rename` 一个可能正在被占用 / 权限受限的目录，
+> 失败路径（改名失败、跨盘、部分成功）比「让用户手动拷一次」麻烦得多，
+> 而且一旦出错就是数据事故。
 
 ### 关闭到托盘 / 任务栏进度 / 输出设备变化
 
@@ -1058,10 +1271,43 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 - **容量**：文件数上限 300，超出时按「最久未使用」淘汰到 80%（240）以下
 - **索引**：内存索引记录每个文件的使用时间，并在需要时与磁盘对齐
   （应对外部删文件、上次未正常退出等情况）
+- **空结果不写缓存**（见下）
 - 设置里可查看占用、手动「清理过期」或「全部清除」
 
 > 说明：`cache.enable` 与 `cache.maxAge` 在早期版本里只是声明了却从未被读取，
 > 属于「死设置」；现已真正生效。
+
+**空搜索结果不写缓存（踩坑记录）**
+
+`cacheManager.save()` 本身不做任何空值判断，而 `api:searchSong` 原来是无条件写盘的。
+于是「搜到 0 个」这个结果会被**当成正常缓存存 3 天**，后果是：
+
+- 省不下任何东西（下次还是得联网才知道有没有）；
+- 把一次**偶发失败**（断网、风控、接口抽风、登录态刚好过期）**固化**成
+  「这首歌 3 天内永远找不到视频」；
+- 更糟的是读的时候走缓存、**连网络都不会碰一下**，日志里什么都看不到，
+  用户只能手动点「刷新」才有救。
+
+现在在写入端收口：**过滤掉非视频条目之后条数为 0 就不写缓存**。
+判断依据是**过滤后的视频条数**而不是 `code` —— B 站有时正常返回 `code: 0`，
+但 `result` 里全是番剧 / 专栏，对播放器来说等于空。
+
+**渲染层的重试（配套）**：既然空结果不再落盘，`changeSong` 搜到 0 个时就可以放心重搜。
+现在的策略是**最多重试 3 次**（每次 `skipCache`，间隔 800ms），然后按登录态给不同提示：
+
+| 情况 | 提示 |
+| --- | --- |
+| 未登录 | 用 `$notify` 提示「未登录时 B 站只返回部分结果，去登录后再试」 |
+| 已登录 | 用 `$notify` 提示「已重试 3 次仍无结果，请检查网络 / 代理」 |
+
+> 为什么未登录要单独提示：B 站对未登录用户只放出一部分搜索结果，
+> 「一首都没有」在未登录状态下很可能只是权限问题。直接说「未找到视频」
+> 会让用户以为歌名写错了，白白错过解决办法。
+>
+> 为什么已登录是「检查网络」而不是「这首歌没有」：连着 3 次都搜不到，
+> 基本不是 B 站的问题（搜索接口本身很稳），更可能是本地网络 / 代理 / 风控。
+> 用 `$notify`（右上角浮层）而不是 `$message`（一闪而过），是因为这两句都带操作指引，
+> 用户需要时间读完、还要去点右上角头像登录。
 
 ---
 
@@ -1112,7 +1358,7 @@ electron-builder（asar）→ 打包 out/
 | **保护脚本崩了却没人发现** | 改加载器时在**模板字符串里用了反引号**，脚本直接语法报错；而 `build:only` 已经把明文写进 `out/`，于是「保护后的 asar」里全是明文。更糟的是**验证是瞎的**：解密函数对明文原样返回，`blmv://` 那条路照跑不误、测试全绿 | ①别用管道把 stderr 和退出码一起吞掉；②验收改成**字节级**：`out/renderer/index.html` 头必须是 `BLMV1`、`out/main/index.js` 只有几百字节且存在 `index.jsc` |
 | **`registerSchemesAsPrivileged` 的时机** | 必须在 `app.whenReady()` **之前**调用，否则 `blmv://` 不是标准/安全上下文，fetch、MSE、CORS 全按普通自定义协议处理 | 放在模块顶层（`setupUserDataPath()` 之后、`whenReady` 之前） |
 | **换协议把跨域取流搞挂** | 页面 origin 从 `file://` 变成 `blmv://app` 后 dash 音视频流的 `fetch` 开始报 CORS；实测 B 站 CDN 会把**第一个请求者的 Origin** 写进 `Access-Control-Allow-Origin` 并按 URL 缓存（报错原话：`has a value 'http://localhost:5173' that is not equal to the supplied origin`） | 在 `onHeadersReceived` 里对媒体域**统一改**成 `*`（并删掉 `Access-Control-Allow-Credentials`）。**必须大小写不敏感地先删再加**：CDN 回的是小写键，直接赋值等于又加一条，浏览器看到 `ACAO: blmv://app, *` 两个值会判非法（第一版就这么写的，报错从 1 条变 20 条） |
-| **asar 本身没有加密** | `asar` 只打包不加密；`asarUnpack` 更是把文件原样摊在磁盘上 | 自己加密 + 自定义协议解密。`bytenode` 必须进 `dependencies`（加载器运行时要用），`electron-as-wallpaper` 仍走 `asarUnpack` |
+| **asar 本身没有加密** | `asar` 只打包不加密；`asarUnpack` 更是把文件原样摊在磁盘上 | 自己加密 + 自定义协议解密。`bytenode` 必须进 `dependencies`（加载器运行时要用）；koffi 的原生二进制走 `asarUnpack`（见下面「打包体积」） |
 
 **验收方式**（以后改这块照这个来）：
 
@@ -1122,6 +1368,93 @@ electron-builder（asar）→ 打包 out/
 3. `npx electron-builder --dir` 后用 `@electron/asar` 抽文件看头是不是 `BLMV1`；
 4. 直接启动 `release/win-unpacked/BLMV.exe`，看窗口标题出不出来
    （标题来自渲染层，等于「解密 + 混淆后仍能跑」的端到端证明）。
+
+### 打包体积（踩坑记录：一个 `**` 通配符让安装包多了 47 MB）
+
+**结论：`asarUnpack` 里的 `**` 会把整个包（含构建中间产物）原样摊到磁盘上，必须精确到文件。**
+
+原来写的是：
+
+```json
+"asarUnpack": ["**/node_modules/electron-as-wallpaper/**"]
+```
+
+而 `electron-as-wallpaper` 安装后**带着 Rust 的 `target/` 目录**（`cargo build` 的中间产物，
+`.rlib` / `.rmeta` / build-script `.exe`）。实测：
+
+| 项 | 实测值 |
+| --- | --- |
+| `electron-as-wallpaper` 整包 | 302 文件 / **105.5 MB** |
+| └ 其中 `target/`（Rust 构建垃圾） | 286 文件 / **105.3 MB** |
+| └ 其中 `build/neon.node`（**唯一真正需要的**） | **214 KB** |
+| `app.asar.unpacked`（被 `**` 全量解包） | **134 MB** |
+| `app.asar`（真正的业务代码） | 仅 3.9 MB |
+
+也就是说：**134 MB 的解包目录里，99.8% 是纯垃圾**，是业务代码的 34 倍。
+这些文件在 asar 里（会被压缩）本来不占多少，一旦被 `asarUnpack` 摊到磁盘就全部实体化。
+
+改成 koffi 之后，连带这 105 MB 一起消失（koffi 是预编译包，没有构建目录）。
+现在只需要解包**一个 `.node` 文件**：
+
+```json
+"asarUnpack": ["**/node_modules/@koromix/**/*.node"]
+```
+
+`electronLanguages` 是第二笔（Electron 默认带 55 个语言包）：
+
+```json
+"electronLanguages": ["zh-CN", "en-US"]
+```
+
+实测收益（同一份代码，`--dir` + portable 目标）：
+
+| 项 | 之前 | 之后 |
+| --- | --- | --- |
+| `app.asar.unpacked` | 134 MB | **1.0 MB** |
+| `locales` | 49.5 MB（55 个 .pak） | **1.1 MB**（2 个） |
+| `win-unpacked` 总计 | 492 MB | **314 MB** |
+| **portable 安装包** | **130.8 MB** | **83.9 MB（−36%）** |
+
+剩下的 314 MB 里，Electron 内核自己占约 307 MB（`BLMV.exe` 一个就 221 MB，
+带 ICU + V8 snapshot），**这才是硬成本** —— 想再降只能换运行时（见下面「框架选型」）。
+
+> **别把 Element Plus 当体积元凶**：实测它的产物约 2.4 MB JS + 0.4 MB CSS，
+> 在 314 MB 里占 0.9%。按需引入能省约 0.4 MB，但会引入插件和回归风险，
+> 性价比远低于上面那两行配置。
+
+### 关于框架选型：为什么留在 Electron，不迁 Tauri
+
+评估过一次（Tauri 2 + WebView2），结论是**不迁**。理由按重要性：
+
+1. **成本比悬殊**：触发这次评估的壁纸 bug 是十几行修复；而 Tauri 要重写整个主进程
+   （约 5750 行 Rust，扣除与渲染层共用的 common 类型），估算 6–12 周达到功能对等 + 2–4 周稳定期。
+2. **Tauri 唯一真正的收益（摆脱 Rust 工具链）用 koffi 就拿到了** —— koffi 是预编译 N-API 包，
+   约 330 行 TS 就替掉了那个 105 MB 的原生包，还顺带拿到真实的 `GetLastError()`。
+3. **Tauri 会新增两个当前不存在的真实阻塞点**：
+   - **改请求头的能力没了**。本项目靠 `session.webRequest.onBeforeSendHeaders`（注入
+     `Referer: https://www.bilibili.com/`）和 `onHeadersReceived`（把 CDN 的 ACAO 一律覆盖成 `*`）
+     让渲染层直接 `fetch()` B 站媒体直链。Tauri 的 `on_web_resource_request` 官方文档明确写着
+     **对外部 URL 不生效** —— 要么在 Rust 侧做媒体代理（视频流全过一遍 Rust 进程），要么关 web security。
+     这是**架构级障碍**，不是工作量问题。
+   - **MSE 编解码从「自带」变成「看系统」**。Electron 自带 `ffmpeg.dll`，H.264/AAC 支持由应用保证；
+     WebView2 依赖系统 Edge 运行时 + OS 媒体组件（Win10 N 版没有 Media Feature Pack 就没 H.264）。
+     本项目核心是 MSE 播视频，这等于把「解码可用性」从应用可控变成机器相关。
+4. **体积优势在离线自包含的前提下会消失**：依赖系统 WebView2 时安装包约 5–10 MB，
+   但目标机是 Win10，老镜像不保证有 WebView2；要保证离线可用得用 `OfflineInstaller`（+127 MB）
+   或 `FixedRuntime`（+180 MB），**跟现在的 84 MB 相比没有优势**。
+5. **内存优势被夸大**：WebView2 同样是多进程架构（`msedgewebview2.exe` 会拉起 browser/renderer/GPU），
+   实际空载大概从 150–250 MB 降到 80–150 MB，约 30–40% 而非数量级。
+6. **反直觉但重要的一条**：迁移会**放大**「某台机器上不行」这类问题。
+   Electron 自带 Chromium，所有机器行为一致；WebView2 版本随机器变化。
+   对于核心是 MSE 视频播放的应用，把运行时从「自带」换成「随机器变化」是**可预测性上的净降级**。
+
+**什么条件下才值得迁**（满足任意两条再考虑）：需要跨平台（注意壁纸模式是 Windows 独有技巧，
+跨平台收益有限）；体积成为硬约束且愿意接受依赖系统 WebView2 的兼容性风险；
+想摆脱 Chromium CVE 的升级节奏；**本来就要重写主进程**；或已累积更多 Electron 生态的坑。
+
+**需要实测验证的点**（当时没验，别当已知事实）：WebView2 上透明窗口 + `backdrop-filter` 的表现、
+`navigator.mediaSession` 是否桥接到 Windows SMTC、H.264 在所有目标机的可用性、
+JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2 子窗口的渲染是否与 Tauri 窗口管理器冲突。
 
 ---
 
@@ -1162,12 +1495,18 @@ electron-builder（asar）→ 打包 out/
 | 主窗口可能被导航到站外（preload 会跟过去） | `will-navigate` 白名单 + `setWindowOpenHandler` 拒绝 |
 | 打开外链没有白名单 | `app:openExternal` 只放行 http/https |
 
-**顺手删掉的死代码**：`common/index.ts`（没人 import 的 barrel）、`koffi` 与 `wallpaperDetect.ts`
-（WorkerW 检测没人调用，壁纸走的是 `electron-as-wallpaper`）、三个「声明了但从没被读取」的设置
+**顺手删掉的死代码**：`common/index.ts`（没人 import 的 barrel）、`wallpaperDetect.ts`
+（WorkerW 检测没人调用，当时壁纸走的是 `electron-as-wallpaper`）、三个「声明了但从没被读取」的设置
 （`common.startupAutoPlay` / `common.windowSizeId` / `player.isSavePlayIndex`）、四个「三段齐全但零调用」的
 IPC（`playlist:get` / `playlist:save` / `auth:reLogin` / `cache:clearSingle`）、`store` 的 `has`/`set`/`all`、
 `BROADCAST_EVENT_NAME` 里没用到的成员、一批只为导出而导出的函数，以及 store 里那层
 「给每个设置项包一个 computed」的包装（组件统一直接读 `setting['xxx.yyy']`）。
+
+> **注意（后来翻案了）**：当时连 `koffi` 依赖一起删了，因为「WorkerW 检测没人调用」。
+> 但现在 `koffi` **回来了**，而且是壁纸模式的主力 —— `winWallpaper.ts` 用它直接调 Win32
+> （原因见上面「壁纸层用 koffi 自己调 Win32」）。删它的时候没错，错的是当时选错了实现路径：
+> 用 `electron-as-wallpaper` 换来了 Rust 工具链依赖和那个致命 bug。
+> 教训：**「暂时没用到」不等于「不需要」，尤其当替代方案会引入外部工具链时。**
 
 **后来又清掉的一批**（一次代码审查的结论）：`player.playIndex`（只写不读，续播用的是歌单的 `lastIndex`）、
 `DuplicatePolicy` 的 `'keep'` 与那个从没人传的 `duplicatePolicy` 参数（现在同步固定去重）、
@@ -1211,5 +1550,64 @@ cmd /c "set ELECTRON_RUN_AS_NODE=&& node_modules\electron\dist\electron.exe veri
   DOM 状态、索引有没有串位、播的是不是那一首、接口返回值、有没有 `console.error`。
 - **用户可能同时在用这个应用**：验证脚本跑的时候，真实鼠标点击会落进来（我遇到过一次
   被并发的 `quit` 打断测试）。所以脚本要幂等、少留可见窗口，结论要看日志而不是只看返回值。
+
+**验证壁纸层（`winWallpaper.ts`）时怎么做**：
+
+壁纸是 Win32 窗口层级操作，**光看应用日志判断不了对错**（这次就栽在这：校验 API 用错，
+日志显示「失败」但窗口其实已经挂上去了）。所以做一个**独立探针脚本**，自己建一个临时窗口，
+把同一套逻辑跑一遍，并且**同时读多个 API 交叉验证**：
+
+```js
+// 关键：一次打印三个 API，任何单个 API 的语义坑都会立刻暴露
+SetParentF(hwnd, worker)
+log('GetParent              =', GetParentF(hwnd))            // = 0，会误导
+log('GWLP_HWNDPARENT       =', GetWindowLongPtrA(hwnd, -8))  // = WorkerW，真实
+log('GetAncestor(GA_PARENT) =', GetAncestorF(hwnd, 1))       // = WorkerW，真实
+```
+
+几条经验：
+
+- **探针用自建临时窗口，别碰主窗口**：验完 `SetParent(hwnd, 0)` 还原 + `win.destroy()`。
+  这样即使逻辑写错，也不会把用户的窗口留在桌面层。
+- **判断成功要看「回读」而不是「返回值 / 错误码」**：`SetParent` 成功时返回的是**旧父窗口**
+  （顶层窗口就是 0），`GetLastError` 还可能是上一次调用的残留（实测拿到 87）。
+- **`EnumWindows` 回调要能改外部变量**：koffi 的 `koffi.proto` 注册回调原型后，
+  回调里改闭包变量是可行的（实测枚举到 368 个窗口、成功取到 WorkerW）。
+- **`SystemParametersInfoA(SPI_SETDESKWALLPAPER)` 在受限令牌下会失败**（实测返回 0、
+  `GetLastError` = 5 拒绝访问）。它只是「让桌面重画一下」，**故意忽略返回值**，
+  不要学那个库去 `.unwrap()`。
+- 这个环境里跑 Electron 必须**清掉 `ELECTRON_RUN_AS_NODE`**，否则窗口根本起不来
+  （症状是 `require('electron').app` 为 `undefined`）。
+
+**复现「没有 GPU 加速」的环境（这次最有用的一个技巧）**：
+
+「虚拟机里壁纸模式有声音没画面」这个 bug 的根因是**透明窗口在无 GPU 时降级成分层窗口**。
+不用真的去装虚拟机 —— 在物理机上加一个开关就能复现：
+
+```powershell
+# 复现：透明窗口会拿到 WS_EX_LAYERED（layered=1）
+node_modules\electron\dist\electron.exe --disable-gpu 你的探针.cjs
+
+# 对照：不加这个开关时，同一份代码 layered=0
+node_modules\electron\dist\electron.exe 你的探针.cjs
+```
+
+配套用 `app.getGPUFeatureStatus()` 看合成走的是硬件还是软件：
+
+```js
+const st = app.getGPUFeatureStatus()
+// 有 GPU：gpu_compositing=enabled
+// 无 GPU：gpu_compositing=disabled_software  ← 就是会中招的环境
+```
+
+以后凡是「只在某台机器上复现」的渲染类问题，先用这个办法试一次 ——
+比来回找机器快得多，而且能立刻区分「代码问题」和「环境降级问题」。
+
+**探针脚本的两个坑（都踩过）**：
+
+- **窗口全销毁后 Electron 会自己退出**，脚本只跑到第一个用例就结束了（现象是输出莫名其妙地短）。
+  探针里加 `app.on('window-all-closed', () => {})` 顶住。
+- **终端输出会被截断**，多用例的结果看不全。**把结果写进文件再 `read`**，
+  比在控制台里看可靠得多。
 
 

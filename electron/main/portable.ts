@@ -10,7 +10,7 @@
  *     这样安装版和便携版会共用同一份配置 / 歌单，换版本不会「数据不见了」。
  *  2. 否则，如果这是 electron-builder 打出来的**便携版**
  *     （运行时带 `PORTABLE_EXECUTABLE_DIR` 环境变量）->
- *     在 exe 同级建一个 `data` 目录，数据跟着程序走。
+ *     在 exe 同级建一个 `blmvdata` 目录，数据跟着程序走。
  *  3. 再否则（安装版且是全新环境）-> 用默认的 `%APPDATA%/<应用名>`。
  *
  * 判断「已经有数据」看的是我们自己的文件（setting.json / playlists.json / search-cache），
@@ -20,6 +20,17 @@
 import { app } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
+
+/**
+ * 便携版数据目录名
+ *
+ * 早期版本叫 `data`，太通用的名字放在 exe 同级容易和别的软件撞
+ * （用户把好几个绿色版丢一个文件夹里就冲突了），所以改成 `blmvdata` 做区分。
+ *
+ * 注意：**不做旧目录迁移**。旧版本留下的 `data/` 原样放着不动 ——
+ * 应用只认 `blmvdata/`，不会再读写那个旧目录。
+ */
+const PORTABLE_DATA_DIR_NAME = 'blmvdata'
 
 /** 当前是否在用便携目录 */
 let portable = false
@@ -49,7 +60,7 @@ export const setupUserDataPath = (): string => {
       // electron-builder 的 portable target 会带上这个变量，安装版没有
       const portableExeDir = process.env.PORTABLE_EXECUTABLE_DIR
       if (!hasOwnData(defaultUserData) && portableExeDir) {
-        const dataDir = path.join(portableExeDir, 'data')
+        const dataDir = path.join(portableExeDir, PORTABLE_DATA_DIR_NAME)
         fs.mkdirSync(dataDir, { recursive: true })
         // 两个都指过去：只改 userData 的话，Electron 内部仍可能往 Roaming 里写东西
         app.setPath('appData', dataDir)

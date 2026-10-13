@@ -139,7 +139,23 @@ export const registerApiHandlers = (context: ApiContext): void => {
         (item) => (item as { type?: string }).type === 'video',
       )
     }
-    if (cacheEnabled()) {
+    /**
+     * **空结果不写缓存**（踩过）
+     *
+     * 缓存的意义是「省一次网络往返」。而「搜到 0 个」这个结果：
+     *  - 省不下什么（下次还是得联网才知道有没有）；
+     *  - 却会把一次**偶发失败**（断网、风控、接口抽风、登录态刚好过期）
+     *    固化成「这首歌 3 天内永远找不到视频」—— 而且因为读的是缓存，
+     *    连网络都不会碰一下，用户只能手动点「刷新」才有救。
+     *
+     * 所以这里直接跳过写入：空结果永远不落盘，下次自然就是真实搜索。
+     * 注意判断的是**过滤后的视频条数**，不是 `code` —— B 站有时会正常返回
+     * 但 `result` 里全是非视频条目（番剧 / 专栏），对播放器来说等于空。
+     */
+    const videoCount = Array.isArray(result.data?.result) ? result.data.result.length : 0
+    if (videoCount === 0) {
+      console.warn(`[search] 《${keyword}》搜索结果为空，不写入缓存（避免把偶发失败固化）`)
+    } else if (cacheEnabled()) {
       const oldItems = (cached?.data as unknown as SearchPayload | undefined)?.data?.result
       const oldByBvid = new Map<string, CachedSearchItem>()
       if (Array.isArray(oldItems)) {

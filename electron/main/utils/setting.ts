@@ -183,6 +183,15 @@ export const resetSetting = (): AppSetting => {
     // tagBonus 是整体替换的对象，必须显式深拷贝一份，
     // 否则会把 defaultSetting 里的对象直接共享给运行时，被意外修改
     'player.tagBonus': structuredClone(defaultSetting['player.tagBonus']),
+    /**
+     * `customAspectRatios` 是**数组**，同样要深拷贝
+     *
+     * 原因和上面 tagBonus 一样：`{...defaultSetting}` 只做浅拷贝，
+     * 数组/对象成员和 `defaultSetting` 是**同一个引用**。用户之后往下拉列表里
+     * 加一个自定义比例，就会把模块级的 defaultSetting 一起改脏 ——
+     * 表现是「恢复默认设置」之后自定义比例还在（甚至越攒越多）。
+     */
+    'common.customAspectRatios': [...defaultSetting['common.customAspectRatios']],
   })
   appSetting = setting
   writeToDisk()

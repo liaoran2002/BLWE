@@ -145,6 +145,8 @@ export interface AppData {
   /** 左键点托盘图标 -> 解锁界面的监听摘除函数 */
   removeTrayUnlock: RemoveListener | null
   removeWallpaperState: RemoveListener | null
+  /** 壁纸模式不可用时提示用户原因（原生层加载失败 / 找不到桌面壁纸层） */
+  removeWallpaperUnavailable: RemoveListener | null
   /** 托盘菜单（迷你控制台）：进度条 / 音量 / 静音 */
   removeTraySeek: RemoveListener | null
   removeTrayVolume: RemoveListener | null

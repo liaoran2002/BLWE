@@ -30,8 +30,14 @@ export default defineConfig({
       outDir: 'out/main',
       rollupOptions: {
         input: resolve(__dirname, 'electron/main/index.ts'),
-        // 原生模块不能被打包，必须在运行时 require
-        external: ['electron-as-wallpaper'],
+        /**
+         * 原生模块不能被打包，必须在运行时 require
+         *
+         * koffi 是预编译的 N-API 包（带各平台 `.node` 二进制），打进 bundle 会失效。
+         * 它本来就在 `dependencies` 里、`externalizeDepsPlugin()` 已自动外部化，
+         * 这里显式列出是为了让「它为什么不能被 bundle」在配置里可见。
+         */
+        external: ['koffi'],
       },
     },
   },

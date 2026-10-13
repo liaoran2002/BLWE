@@ -150,6 +150,8 @@ const api = {
   wallpaperIsEnabled: (): Promise<boolean> => rendererInvoke('wallpaper:isEnabled'),
   onWallpaperState: (cb: (enabled: boolean) => void): RemoveListener =>
     rendererOn('wallpaper:state', cb),
+  onWallpaperUnavailable: (cb: (reason: string) => void): RemoveListener =>
+    rendererOn('wallpaper:unavailable', cb),
   // #endregion
 } as const satisfies RendererAPI
 

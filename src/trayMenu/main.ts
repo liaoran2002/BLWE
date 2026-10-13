@@ -118,8 +118,21 @@ interface Item {
 const ITEMS: Item[] = [
   { action: 'showPlaylist', label: () => '设置歌单' },
   {
-    // 窗口被收到托盘里时，这一项换成「恢复窗口」（动作也跟着换）
-    action: (s) => (s.windowHidden ? 'restoreWindow' : 'toggleWallpaper'),
+    /**
+     * 壁纸 / 窗口切换（**只有这一项**，不另设「强制…」那种吓人的逃生口）
+     *
+     * 两个状态各自的动作：
+     *  - 窗口被收到托盘里（`windowHidden`）→「恢复窗口」，把窗口叫回来；
+     *  - 正在壁纸模式（`wallpaperEnabled`）→「窗口模式」，走 `restoreWindow`：
+     *    它**不看状态标志**，而是问系统「窗口是不是真的还挂在桌面壁纸层」，
+     *    是就摘下来，然后 `show()` + `focus()`。
+     *
+     * 为什么壁纸模式用的是 `restoreWindow` 而不是 `toggleWallpaper`：
+     * 万一是「标志说在窗口模式、窗口其实还挂在桌面层」这种漂移，
+     * `restoreWindow` 也能救回来（它三个条件取或），而 `toggleWallpaper` 只看标志会走错方向。
+     * 顺带它还会把窗口显示出来并前置 —— 点「窗口模式」本来就该看到窗口。
+     */
+    action: (s) => (s.windowHidden || s.wallpaperEnabled ? 'restoreWindow' : 'toggleWallpaper'),
     label: (s) => (s.windowHidden ? '恢复窗口' : s.wallpaperEnabled ? '窗口模式' : '壁纸模式'),
   },
   {

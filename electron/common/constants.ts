@@ -73,6 +73,56 @@ export const GLASS_SHADOW_MAX = 20
 export const GLASS_SHADOW_PERCENT_STEP = 5
 export const GLASS_SHADOW_PERCENT_PER_PX = 5
 
+// #region 窗口宽高比
+
+/** 「不限制宽高比」的特殊值（用户可以任意拉伸窗口） */
+export const ASPECT_RATIO_FREE = 'free'
+
+/**
+ * 宽高比预设（界面上是下拉框的固定项）
+ *
+ * 只有这三项 —— 其它比例（21:9、9:16 竖屏…）由用户自己在设置里输入，
+ * 输入后会被**加进下拉列表并持久化**（存在 `common.customAspectRatios`）。
+ *
+ * `value` 存的就是比例字符串本身，这样「预设」和「用户自定义」在配置里是同一种东西，
+ * 消费方（主进程解析、界面回显）都不需要区分来源。
+ */
+export const ASPECT_RATIO_OPTIONS = [
+  { label: '16:9（默认）', value: '16:9' },
+  { label: '4:3', value: '4:3' },
+  { label: '不限制', value: ASPECT_RATIO_FREE },
+] as const
+
+/** 比例字符串允许的最大长度（防脏数据把下拉框撑爆） */
+export const ASPECT_RATIO_MAX_LENGTH = 16
+/** 自定义比例最多保留几个（同样是防脏数据） */
+export const CUSTOM_ASPECT_RATIO_MAX_COUNT = 12
+
+/** 宽高比字符串的格式：`数字:数字`（允许小数，如 `2.35:1`） */
+export const ASPECT_RATIO_PATTERN = /^\d+(?:\.\d+)?:\d+(?:\.\d+)?$/
+
+/**
+ * 把宽高比字符串解析成数值
+ *
+ * @returns 比例值（宽/高）；`'free'` 或非法值返回 `0`（= 不限制，对应 `setAspectRatio(0)`）
+ *
+ * 主进程和渲染层**共用这一个函数**，避免两边各写一份解析逻辑导致行为不一致
+ * （比如渲染层显示「已锁定」而主进程其实没锁）。
+ */
+export const parseAspectRatio = (value: string | null | undefined): number => {
+  if (!value || value === ASPECT_RATIO_FREE) return 0
+  if (!ASPECT_RATIO_PATTERN.test(value)) return 0
+  const [w, h] = value.split(':').map(Number)
+  // 高为 0 或解析出 NaN 一律当作「不限制」，别把非法比例喂给 setAspectRatio
+  if (!Number.isFinite(w) || !Number.isFinite(h) || h <= 0 || w <= 0) return 0
+  return w / h
+}
+
+/** 默认宽高比：16:9（等于改造前的行为，老用户无感） */
+export const DEFAULT_ASPECT_RATIO = '16:9'
+
+// #endregion
+
 /** 歌单集合数据的版本号（playlists.json 里的 version 字段） */
 export const PLAYLIST_DATA_VERSION = '1.0.0'
 

@@ -30,7 +30,7 @@ import {
 } from './utils/setting'
 import * as biliApi from './biliApi'
 import { initPlaylists, flushPlaylists } from './utils/playlist'
-import { PLAY_LOOP_MODES } from '@common/constants'
+import { PLAY_LOOP_MODES, parseAspectRatio } from '@common/constants'
 import {
   installProtectedProtocol,
   protectionEnabled,
@@ -39,15 +39,23 @@ import {
 } from './protection'
 import type { IpcEvent, IpcEventPayload, TrayMenuAction, TrayMenuState } from '@common/types/ipc'
 
-// electron-as-wallpaper 是原生模块，且只在 Windows 有意义，加载失败不应该影响主功能
-type AsWallpaper = typeof import('electron-as-wallpaper')
-let asWallpaper: AsWallpaper | null = null
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  asWallpaper = require('electron-as-wallpaper') as AsWallpaper
-} catch {
-  asWallpaper = null
-}
+/**
+ * 壁纸模式的原生实现（koffi 直接调 Win32，见 `winWallpaper.ts`）
+ *
+ * 原来这里是 `require('electron-as-wallpaper')`，用空 try/catch 吞掉加载失败，
+ * 结果是「点了没反应」而且完全没有日志。那个库还有两个更严重的问题（详见 winWallpaper.ts）：
+ *  1. `attach` 里先 `SetParent` 再设透明样式，中间态会让窗口不可见、且已经留在桌面层；
+ *  2. 失败回滚没有把窗口 `SetParent` 回来，窗口就永久找不回来了。
+ * 现在换成自己用 koffi 调：不需要 Rust 工具链，失败会返回原因而不是静默。
+ */
+import {
+  attachWallpaper,
+  detachWallpaper,
+  resetWallpaper,
+  isWallpaperAvailable,
+  getUnavailableReason,
+  isAttachedToWallpaper,
+} from './winWallpaper'
 
 const isDev = !app.isPackaged
 
@@ -57,7 +65,27 @@ let tray: Tray | null = null
 let isLoggedIn = false
 let isPaused = true
 let loopModeIndex = 0
+/**
+ * 应用层认为「当前处于壁纸模式」
+ *
+ * 注意：这是**应用自己的意图/状态**，不是「窗口真的挂在桌面层」的证据。
+ * 判断「要不要 detach」必须用 `wallpaperAttached`，不能用这个（原因见那边注释）。
+ */
 let wallpaperEnabled = false
+/**
+ * 窗口是否**真的**已经挂在桌面壁纸层（不可逆操作的唯一凭据）
+ *
+ * 为什么要和 `wallpaperEnabled` 分开：`attach()` 里 `SetParent` 是那一步不可逆的动作，
+ * 一旦执行，窗口就已经离开正常窗口层了 —— 此时哪怕后续步骤失败、`wallpaperEnabled`
+ * 被翻回 false，也**必须**把窗口摘回来，否则它永远卡在桌面层且不可见
+ * （老代码就是这样：失败回滚只还原了几何，没有 SetParent 回来，托盘也救不回来）。
+ *
+ * 所以这个标志：
+ *  - 在调 `attach()` **之前**置位（宁可多摘一次，也不能漏摘）；
+ *  - 只有 `detach()` 成功后才清除；
+ *  - `restoreWindow()` 与 `before-quit` 都看它，不看 `wallpaperEnabled`。
+ */
+let wallpaperAttached = false
 /** 是否正在退出应用（区分「点关闭按钮」与「真的要退出」） */
 let isQuitting = false
 /** 托盘悬浮提示里显示的「当前在播什么」（由渲染层同步） */
@@ -75,20 +103,52 @@ let lastTrayTip = ''
  *
  * 关键：这是**应用层自己维护**的状态，绝对不要读 `mainWindow.isFullScreen()`。
  *
- * 主窗口是 `transparent: true`，Windows 上透明窗口的原生全屏是失效的：
- * `setFullScreen(true)` 只会把窗口撑到屏幕大小，`isFullScreen()` 依旧返回 false
- * （electron/electron#27286）。于是老代码里出现了一连串问题：
+ * 当初引入应用层模拟的原因：主窗口是 `transparent: true`，而 Windows 上透明窗口的
+ * 原生全屏是失效的 —— `setFullScreen(true)` 只会把窗口撑到屏幕大小，
+ * `isFullScreen()` 依旧返回 false（electron/electron#27286）。于是老代码里出现了一连串问题：
  *   - 状态被原生值回写，全屏标志永远为 false；
  *   - 退出壁纸模式时「还原」逻辑反而把窗口撑成整屏，且因为没有状态可翻转，
  *     再点全屏只会一路往「进入全屏」走，永远退不出去。
  *
- * 所以全屏改成应用层模拟：解除 16:9 约束 + setBounds 铺满主屏 + 置顶盖住任务栏。
+ * 注意：主窗口现在**已经不透明**了（见 `createMainWindow` 里关于壁纸模式的说明），
+ * 所以「透明导致原生全屏失效」这个前提不再成立。但**应用层模拟继续保留**：
+ * 它已经过大量验证、并且 `fullScreenRestore` 那套还原逻辑完全建立在它之上，
+ * 没有理由为了「用回原生 API」去冒回归风险。
+ *
+ * 所以全屏仍是应用层模拟：解除 16:9 约束 + setBounds 铺满主屏 + 置顶盖住任务栏。
  */
 let isFullScreen = false
 let isMaximized = false
 
-/** 主窗口的宽高比约束（视频播放器保持 16:9） */
-const FULLSCREEN_ASPECT = 16 / 9
+/**
+ * 初始窗口尺寸按哪个比例算
+ *
+ * 只用于**创建窗口时算初始高度**，不构成约束：
+ * 用户选了 `'free'`（不限制）时窗口没有比例约束，但初始尺寸总得是个合理值，
+ * 所以这里退回 16:9。真正的约束由 `currentAspect()` 决定。
+ */
+const INITIAL_SIZE_FALLBACK_ASPECT = 16 / 9
+
+/**
+ * 当前应该锁定的宽高比数值（0 = 不限制）
+ *
+ * 从设置里读，**不要写死** —— 踩过的坑：原来这里是 `const FULLSCREEN_ASPECT = 16/9`，
+ * 散落在「建窗口 / 退出全屏 / 退出壁纸 / 拖出全屏」四处；一旦用户把比例改成 4:3，
+ * 这几处会把它悄悄改回 16:9（退出全屏后比例莫名变回去）。
+ * 现在统一走这个函数，改设置后行为一致。
+ */
+const currentAspect = (): number => parseAspectRatio(getSetting()['common.windowAspectRatio'])
+
+/**
+ * 把用户设置的宽高比应用到主窗口（幂等）
+ *
+ * 注意全屏 / 壁纸模式下**不要**调用它 —— 那两种情况要铺满屏幕，
+ * 由 `applyFullScreenGeometry()` 里的 `setAspectRatio(0)` 解除约束。
+ */
+const applyAspectRatio = (): void => {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.setAspectRatio(currentAspect())
+}
 
 const MODE_NAMES = ['列表循环', '单曲循环', '随机播放']
 
@@ -143,15 +203,60 @@ const loadIcon = (file: string): Electron.NativeImage => {
 }
 
 function createMainWindow(): void {
+  /**
+   * 初始尺寸：尽量用「屏幕宽的 0.8」，但要**等比夹紧到屏幕内**
+   *
+   * **高必须显式给**（实测过）：只给 `width` 时 Electron 用默认高度 600，
+   * 而 `setAspectRatio` 会**按高度反推宽度**，你指定的宽度会被覆盖掉
+   * （实测给 1138 结果变成 1069）。所以这里自己算高。
+   *
+   * 但只按宽度算高会**超出屏幕**（实测）：
+   *   - `4:3`  → 1138×854，已经比 771 的可用高还高；
+   *   - `9:16` → 1138×2023，是屏幕高的 2.6 倍。
+   * 窗口一旦高过屏幕，用户看不到底部的控制栏，而且拖动/还原的位置会很怪。
+   * 所以两条边都按可用区域的 0.8 封顶，超了就**等比缩回来**（比例不能动，
+   * 否则 `setAspectRatio` 会跟初始尺寸打架）。
+   *
+   * 用 `workArea` 而不是 `bounds`：任务栏要扣掉。
+   */
+  const workArea = screen.getPrimaryDisplay().workArea
+  const maxWidth = Math.round(workArea.width * 0.8)
+  const maxHeight = Math.round(workArea.height * 0.8)
+  // 解析不出比例（用户选了「不限制」或填了非法值）时，退回 16:9 只为算一个合理初始尺寸
+  const initialAspect = currentAspect() || INITIAL_SIZE_FALLBACK_ASPECT
+
+  let initialWidth = maxWidth
+  let initialHeight = Math.round(maxWidth / initialAspect)
+  if (initialHeight > maxHeight) {
+    initialHeight = maxHeight
+    initialWidth = Math.round(maxHeight * initialAspect)
+  }
+
   mainWindow = new BrowserWindow({
-    width: 1600,
-    height: 900,
+    width: initialWidth,
+    height: initialHeight,
     minWidth: 800,
     minHeight: 450,
     title: 'B站音乐视频',
     frame: false,
     center: true,
-    transparent: true,
+    /**
+     * **不透明窗口**（刻意不用 `transparent: true`）
+     *
+     * 踩过：透明窗口在**没有 GPU 加速**的环境（虚拟机、远程桌面、显卡驱动异常、
+     * `--disable-gpu`）下，Chromium 会退回 GDI「分层窗口」来实现透明，于是窗口被设上
+     * `WS_EX_LAYERED`。而分层窗口一旦 `SetParent` 到桌面壁纸层（WorkerW），
+     * 桌面层的合成路径画不出它 —— 现象是**声音还在、画面没了**（实测可复现：
+     * 同一台物理机加 `--disable-gpu` 立刻复现，`exstyle` 从 0x0 变成 0x80000）。
+     *
+     * 不透明窗口不需要分层，`exstyle` 干净（实测 `0x100`，无 `WS_EX_LAYERED`），
+     * 从根上绕开这个问题。
+     *
+     * 界面上的毛玻璃（`--glass-bg` + `backdrop-filter`）**不受影响** ——
+     * 那些元素模糊的是页面内部的视频画面，不需要窗口本身透明。
+     */
+    transparent: false,
+    backgroundColor: '#000000',
     icon: loadIcon('bili.ico'),
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
@@ -180,7 +285,8 @@ function createMainWindow(): void {
   } else {
     void mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
-  mainWindow.setAspectRatio(FULLSCREEN_ASPECT)
+  // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
+  applyAspectRatio()
 
   /**
    * 导航护栏：只允许留在我们自己的页面上。
@@ -336,7 +442,8 @@ const exitFullScreen = (): void => {
   if (!mainWindow || mainWindow.isDestroyed()) return
   isFullScreen = false
   mainWindow.setAlwaysOnTop(false)
-  mainWindow.setAspectRatio(FULLSCREEN_ASPECT)
+  // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
+  applyAspectRatio()
 
   const point = fullScreenRestore
   fullScreenRestore = null
@@ -366,7 +473,8 @@ const exitWallpaperGeometry = (): void => {
 
   isFullScreen = false
   mainWindow.setAlwaysOnTop(false)
-  mainWindow.setAspectRatio(FULLSCREEN_ASPECT)
+  // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
+  applyAspectRatio()
   if (!point) {
     // 没有记录（异常情况）：给一个合理的默认窗口尺寸，别把用户困在全屏
     mainWindow.setSize(1600, 900)
@@ -437,9 +545,8 @@ const captureWallpaperRestore = (): void => {
  *  1. **先把窗口几何铺满主屏，再挂壁纸层**。
  *     原实现是先 attach 再切全屏，挂载时窗口还是普通尺寸，
  *     所以「进了壁纸模式但没在壁纸层全屏」。
- *  2. 完全不调用原生 setFullScreen：主窗口是 `transparent: true`，
- *     Windows 上原生全屏对透明窗口无效（见 isFullScreen 的注释），
- *     改用「解除宽高比约束 + 铺满主屏 + 置顶」在应用层实现。
+ *  2. 完全不调用原生 setFullScreen：改用「解除宽高比约束 + 铺满主屏 + 置顶」
+ *     在应用层实现（原因见 isFullScreen 的注释）。
  *  3. 进入前用独立的 wallpaperRestore 记录窗口状态，退出时原样还原
  *     （原本是全屏就回到全屏，原本是最大化就回到最大化），
  *     不会再出现「退不出去的全屏」。
@@ -448,6 +555,13 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
   if (!mainWindow || mainWindow.isDestroyed()) return false
 
   if (enabled) {
+    // 0) 原生层不可用就直接失败，别把窗口改成「铺满 + 无任务栏」的怪状态
+    if (!isWallpaperAvailable()) {
+      const reason = getUnavailableReason() ?? '未知原因'
+      console.error('[wallpaper] 壁纸模式不可用:', reason)
+      return false
+    }
+
     // 1) 先记住进入前的状态（已有记录则保留更早的那个）
     captureWallpaperRestore()
 
@@ -458,47 +572,30 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
     // 壁纸层跟随窗口几何，等系统把尺寸应用完再挂载，否则 attach 拿到的是旧几何
     await new Promise((resolve) => setTimeout(resolve, 120))
 
-    // 3) 几何就绪后再挂到壁纸层
-    try {
-      asWallpaper?.attach(mainWindow, {
-        transparent: true,
-        /**
-         * 壁纸模式**不转发鼠标**
-         *
-         * 界面上的标题栏和控制栏在壁纸模式下是隐藏的（`.wm-hidden`），窗口里没有可点的东西，
-         * 所以不需要把全系统的鼠标事件合成进壁纸窗口。
-         *
-         * 而且这个转发本身就是一堆麻烦的源头：它会在 `RIDEV_INPUTSINK` 里把**每一次**
-         * 鼠标按下都 `PostMessage` 给壁纸窗口，Chromium 随即在那里 `SetCapture`，
-         * 于是别的窗口（托盘菜单、原生弹出菜单）的点击会被抢走一半。
-         * 关掉之后壁纸模式下点击/拖拽都交还给系统，桌面该怎么用还怎么用。
-         */
-        forwardMouseInput: false,
-        forwardKeyboardInput: false,
-      })
-    } catch (err) {
-      console.error('[wallpaper] attach 失败:', err)
-    }
+    if (!mainWindow || mainWindow.isDestroyed()) return false
 
     /**
-     * attach 之后校验一下**真的挂上了没有**
+     * 3) 几何就绪后再挂到壁纸层
      *
-     * 库会在窗口上写 `wallpaperState.isAttached`（见
-     * node_modules/electron-as-wallpaper/dist/main.js:23）。只看有没有抛异常是不够的：
-     * 静默失败时窗口已经处于「解除宽高比 + 铺满 + 置顶 + 无任务栏按钮」的状态，
-     * 却不在壁纸层 —— 用户得到的是一块盖住桌面、又没法从任务栏找回来的普通窗口，
-     * 而托盘和渲染层都还显示「壁纸模式」。
-     * 这种情况直接回滚成窗口模式，别把状态留在半空中。
+     * **必须在调 attach 之前置位 `wallpaperAttached`**：`attachWallpaper` 内部
+     * 只要执行到 `SetParent`，窗口就已经离开正常窗口层了 —— 哪怕它返回失败，
+     * 也可能已经挂上去（比如 SetParent 成功但 GetParent 回读时机有偏差）。
+     * 宁可多摘一次，也不能漏摘：漏摘 = 窗口永久卡在桌面层且不可见。
      */
-    if (!mainWindow.wallpaperState?.isAttached) {
-      console.error('[wallpaper] attach 没有生效，回滚到窗口模式')
-      mainWindow.setSkipTaskbar(false)
-      mainWindow.setAlwaysOnTop(false)
-      mainWindow.setVisibleOnAllWorkspaces(false)
-      exitWallpaperGeometry()
-      isFullScreen = false
-      applyTrayMode()
-      // 状态由调用方（setWallpaperMode）按返回值纠正，这里不自己改 wallpaperEnabled
+    wallpaperAttached = true
+    const attachResult = attachWallpaper(mainWindow)
+
+    if (!attachResult.ok) {
+      console.error('[wallpaper] attach 失败，回滚到窗口模式:', attachResult.reason)
+      /**
+       * 回滚：**这里必须真的 detach**
+       *
+       * 老代码的回滚只还原了几何 / 任务栏 / 置顶，没有把窗口 SetParent 回来 ——
+       * 于是窗口留在桌面层且不可见，任务栏按钮也没有，托盘和渲染层还都以为
+       * 自己是窗口模式（`wallpaperEnabled` 被翻成 false），`restoreWindow()`
+       * 因此永远不会去 detach，用户点「恢复窗口」也救不回来。这是最恶劣的那个 bug。
+       */
+      rollbackWallpaperAttach()
       return false
     }
 
@@ -515,20 +612,19 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
     applyTrayMode()
   } else {
     // 退出壁纸模式：先脱离壁纸层，再恢复窗口状态
-    try {
-      asWallpaper?.detach(mainWindow)
-    } catch {
-      /* ignore */
+    const detachResult = mainWindow ? detachWallpaper(mainWindow) : { ok: false }
+    if (mainWindow && !detachResult.ok) {
+      console.warn('[wallpaper] detach 未确认成功，仍继续还原窗口:', detachResult.reason)
     }
-    try {
-      asWallpaper?.reset()
-    } catch {
-      /* ignore */
-    }
+    resetWallpaper()
+    // detach 已确认（或已尽力）→ 清除「原生层可能挂着」的标志
+    if (detachResult.ok) wallpaperAttached = false
 
-    mainWindow.setVisibleOnAllWorkspaces(false)
-    // 任务栏按钮恢复（进入壁纸模式时被 setSkipTaskbar(true) 摘掉了）
-    mainWindow.setSkipTaskbar(false)
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setVisibleOnAllWorkspaces(false)
+      // 任务栏按钮恢复（进入壁纸模式时被 setSkipTaskbar(true) 摘掉了）
+      mainWindow.setSkipTaskbar(false)
+    }
 
     // 等壁纸层把窗口还回来，再还原尺寸，否则 setBounds 会被忽略
     await new Promise((resolve) => setTimeout(resolve, 80))
@@ -541,6 +637,35 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
   // 通知渲染进程同步状态（全屏标志可能变了）
   syncFullScreenState()
   return true
+}
+
+/**
+ * attach 失败后的回滚
+ *
+ * 把窗口从桌面层摘回来，并把几何 / 任务栏 / 置顶全部还原。
+ * 无条件尝试 detach —— 此时不知道 SetParent 到底有没有生效，
+ * 而「多摘一次」是幂等且无害的，「漏摘」则是永久性故障。
+ */
+function rollbackWallpaperAttach(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    wallpaperAttached = false
+    return
+  }
+
+  const detachResult = detachWallpaper(mainWindow)
+  if (!detachResult.ok) {
+    console.warn('[wallpaper] 回滚 detach 未确认成功:', detachResult.reason)
+  } else {
+    wallpaperAttached = false
+  }
+  resetWallpaper()
+
+  mainWindow.setSkipTaskbar(false)
+  mainWindow.setAlwaysOnTop(false)
+  mainWindow.setVisibleOnAllWorkspaces(false)
+  exitWallpaperGeometry()
+  isFullScreen = false
+  applyTrayMode()
 }
 
 /**
@@ -567,7 +692,7 @@ async function setWallpaperMode(want: boolean): Promise<void> {
       const target = wallpaperWant
       wallpaperWant = null
       wallpaperEnabled = target
-      // 失败（attach 没生效）时 applyWallpaperMode 会回滚窗口状态并返回 false
+      // 失败（attach 没生效）时 applyWallpaperMode 会回滚窗口状态（含 detach）并返回 false
       const ok = await applyWallpaperMode(target)
       if (!ok) wallpaperEnabled = !target
       sendToMain('wallpaper:state', wallpaperEnabled)
@@ -579,7 +704,15 @@ async function setWallpaperMode(want: boolean): Promise<void> {
 }
 
 async function toggleWallpaper(): Promise<boolean> {
-  if (!asWallpaper || !mainWindow || mainWindow.isDestroyed()) return wallpaperEnabled
+  // 原生层不可用时直接返回当前状态：界面会按返回值纠正按钮文案，
+  // 同时下面会把原因告诉渲染层，用户能看到「为什么没反应」而不是一脸茫然
+  if (!isWallpaperAvailable()) {
+    const reason = getUnavailableReason() ?? '未知原因'
+    console.warn('[wallpaper] 原生层不可用，忽略切换请求:', reason)
+    sendToMain('wallpaper:unavailable', reason)
+    return wallpaperEnabled
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) return wallpaperEnabled
   // 基准取「最后一次目标」：连点时第二次应基于第一次的目标反向，而不是基于旧的实际值
   const want = !(wallpaperWant ?? wallpaperEnabled)
   await setWallpaperMode(want)
@@ -1085,6 +1218,13 @@ function runTrayMenuAction(action: TrayMenuAction, value?: number): void {
       void toggleWallpaper()
       break
     case 'restoreWindow':
+      /**
+       * 「窗口模式」/「恢复窗口」都走这里
+       *
+       * `restoreWindow` 自己会判断「窗口是不是真的挂在桌面层」（三个条件取或），
+       * 所以**不需要**一个单独的「强制…」逃生口动作：它本身就是最稳的那条路径，
+       * 状态漂移时也能救回来，而且顺带 `show()` + `focus()`（点「窗口模式」就该看到窗口）。
+       */
       void restoreWindow()
       break
     case 'login':
@@ -1104,15 +1244,30 @@ function runTrayMenuAction(action: TrayMenuAction, value?: number): void {
  *
  * 壁纸模式下窗口挂在桌面层，`show()/focus()` 是看不见效果的，
  * 所以先退出壁纸模式再显示 —— 用户要的「点一下就回到窗口」。
+ *
+ * **判定条件是「窗口是不是真的挂在桌面层」，不是 `wallpaperEnabled`。**
+ * 老代码只看 `wallpaperEnabled`：一旦某次 attach 失败把标志翻回 false，
+ * 而窗口其实还挂在 WorkerW 上，这里就会跳过 detach、直接 show() —— 而 show()
+ * 对桌面层的子窗口无效，于是「点恢复窗口也回不来」。
  */
 async function restoreWindow(): Promise<void> {
-  if (wallpaperEnabled) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  const attachedToWallpaper = wallpaperEnabled || wallpaperAttached || isAttachedToWallpaper(mainWindow)
+  if (attachedToWallpaper) {
     try {
-      await toggleWallpaper()
+      await setWallpaperMode(false)
     } catch (err) {
       console.warn('[win] 退出壁纸模式失败:', err)
     }
+    // setWallpaperMode 没确认成功就硬来一次，保证窗口不在桌面层
+    if (wallpaperAttached && mainWindow && !mainWindow.isDestroyed()) {
+      const retry = detachWallpaper(mainWindow)
+      if (retry.ok) wallpaperAttached = false
+      resetWallpaper()
+    }
   }
+
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
@@ -1274,7 +1429,17 @@ void app.whenReady().then(async () => {
    * （用户明确要求：打开这个开关也不要立刻进壁纸模式）。
    * 当前状态只由按钮/托盘切换（`toggleWallpaper`），那边也**不回写**这个设置 —— 两件事互不干涉。
    */
-  onSettingChange(() => {
+  onSettingChange((_updated, keys) => {
+    /**
+     * 宽高比改了就立刻生效（改了设置要马上看到效果，不能等重启）
+     *
+     * 但**全屏 / 壁纸模式下不要动**：那两种状态由 `applyFullScreenGeometry()`
+     * 用 `setAspectRatio(0)` 解除了约束，这里插一脚会把窗口缩回去。
+     * 那两个状态退出时都会调 `applyAspectRatio()`，所以新比例不会丢。
+     */
+    if (keys.includes('common.windowAspectRatio') && !isFullScreen && !wallpaperEnabled) {
+      applyAspectRatio()
+    }
     refreshTray()
   })
 
@@ -1443,7 +1608,8 @@ function startWindowDrag(): { offsetX: number; offsetY: number } | null {
     isFullScreen = false
     fullScreenRestore = null
     mainWindow.setAlwaysOnTop(false)
-    mainWindow.setAspectRatio(FULLSCREEN_ASPECT)
+    // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
+  applyAspectRatio()
     syncFullScreenState()
     mainWindow.setBounds({
       x: Math.round(cursor.x - ratioX * normalBounds.width),
@@ -1565,15 +1731,18 @@ app.on('before-quit', () => {
    * 壁纸模式下退出：先把窗口从桌面层摘下来
    *
    * 不摘的话，BrowserWindow 是带着 `SetParent(WorkerW)` 被直接销毁的，
-   * 库提供的 `reset()`（恢复原始壁纸层）永远不会执行 —— 桌面壁纸/图标层可能停在
-   * 非正常状态，用户重启前都能看到。必须在窗口销毁**之前**做。
+   * 桌面壁纸 / 图标层可能停在非正常状态，用户重启前都能看到。
+   * 必须在窗口销毁**之前**做。
+   *
+   * 判定用 `wallpaperAttached` 而不是 `wallpaperEnabled`：只要曾经执行过
+   * `SetParent`，窗口就可能挂在桌面层 —— 哪怕状态标志因为某次失败已经翻回 false。
    */
-  if (wallpaperEnabled && mainWindow && !mainWindow.isDestroyed()) {
-    try {
-      asWallpaper?.detach(mainWindow)
-      asWallpaper?.reset()
-    } catch (err) {
-      console.warn('[wallpaper] 退出前 detach 失败（忽略）:', err)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const needDetach = wallpaperAttached || wallpaperEnabled || isAttachedToWallpaper(mainWindow)
+    if (needDetach) {
+      const result = detachWallpaper(mainWindow)
+      if (!result.ok) console.warn('[wallpaper] 退出前 detach 未确认成功（忽略）:', result.reason)
+      resetWallpaper()
     }
   }
   flushSetting()

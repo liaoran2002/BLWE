@@ -435,6 +435,7 @@ export default defineComponent({
       /** 左键点托盘图标 -> 解锁 */
       removeTrayUnlock: null as null | (() => void),
       removeWallpaperState: null,
+      removeWallpaperUnavailable: null,
       removeTraySeek: null,
       removeTrayVolume: null,
       removeTrayToggleMute: null,
@@ -2012,7 +2013,42 @@ export default defineComponent({
         // searchSong 的 data 形状由搜索接口决定，这里收敛成 BiliVideo
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         // 收藏的视频固定排在最前面，并按 bvid 去重
-        this.videoList = this.applyFavoriteOrder(this.sortSearchedVideos(videos, songName), songName);
+        let list = this.applyFavoriteOrder(this.sortSearchedVideos(videos, songName), songName);
+
+        /**
+         * 一首都没搜到 -> 重试几次（最多 3 次）
+         *
+         * 空结果现在已经**不会写进缓存**了（见 `api:searchSong`），所以重试一定是真联网。
+         * 之所以还要重试：单次搜索为空往往只是偶发（网络抖动、风控、接口抽风），
+         * B 站搜索本身很稳，连着 3 次都搜不到才值得怀疑是环境问题。
+         *
+         * 每次都用 `skipCache`，避免上一次的空结果又被读出来。
+         */
+        if (list.length === 0) {
+          const MAX_RETRY = 3;
+          for (let attempt = 1; attempt <= MAX_RETRY && list.length === 0; attempt++) {
+            if (token !== this._songToken) return;
+            console.warn(
+              `[search] 《${songName}》搜索结果为空，第 ${attempt}/${MAX_RETRY} 次重试`,
+            );
+            const retry = await electronApi.searchSong(songName, true);
+            if (token !== this._songToken) return;
+            const retryVideos = (retry.data as { result?: BiliVideo[] } | null)?.result ?? [];
+            list = this.applyFavoriteOrder(
+              this.sortSearchedVideos(retryVideos, songName),
+              songName,
+            );
+            if (list.length > 0) {
+              console.log(`[search] 《${songName}》第 ${attempt} 次重试成功，找到 ${list.length} 个视频`);
+              res.data = retry.data as never;
+              break;
+            }
+            // 还有下一次的话，稍等一下再试 —— 连着打三次反而更容易被风控
+            if (attempt < MAX_RETRY) await new Promise((r) => setTimeout(r, 800));
+          }
+        }
+
+        this.videoList = list;
         this.videoListKeyword = songName;
         if (this.videoList.length > 0) {
           const selectedBvid =
@@ -2020,9 +2056,9 @@ export default defineComponent({
             this.videoList[0].bvid;
           await this.changeVideo(selectedBvid, songName);
         } else {
-          // 没搜到视频：把上一首的播放状态彻底停掉，别出现「新歌名 + 旧视频在播」
+          // 重试完还是没有：把上一首的播放状态彻底停掉，别出现「新歌名 + 旧视频在播」
           this.clearNowPlaying();
-          this.$message.warning(`《${songName}》未找到视频`);
+          this.notifySearchEmpty(songName);
         }
       } catch (err) {
         if (token !== this._songToken) return;
@@ -2032,6 +2068,36 @@ export default defineComponent({
         this.clearNowPlaying();
         this.$message.error(`《${songName}》${this.errMsg(err)}`);
       }
+    },
+    /**
+     * 搜索彻底失败（重试 3 次仍没有结果）时的提示
+     *
+     * 分两种情况说，因为**解决办法完全不同**：
+     *  - 未登录：B 站对未登录用户只放出一部分搜索结果，提示去登录；
+     *  - 已登录：连着 3 次都搜不到，基本不是 B 站的问题了（它没那么拉），
+     *    更可能是本地网络 / 代理 / 风控，让用户检查网络。
+     *
+     * 用 `$notify`（右上角浮层）而不是 `$message`（一闪而过的 toast）：
+     * 这两句话都带操作指引，用户需要时间读，而且要点右上角头像去登录。
+     */
+    notifySearchEmpty(songName: string): void {
+      if (!this.isLoggedIn) {
+        this.$notify({
+          title: `《${songName}》没有找到视频`,
+          message:
+            '未登录时 B 站只会返回部分搜索结果。点右上角头像登录后再试，通常就能找到了。',
+          type: 'warning',
+          duration: 8000,
+        });
+        return;
+      }
+      this.$notify({
+        title: `《${songName}》搜索失败`,
+        message:
+          '已经重试了 3 次都没有结果。请检查一下网络连接（或代理 / VPN）是否正常，稍后再试。',
+        type: 'error',
+        duration: 8000,
+      });
     },
     /**
      * 切换到某个视频
@@ -2940,6 +3006,17 @@ export default defineComponent({
     this.removeWallpaperState = electronApi.onWallpaperState((enabled) => {
       this.wallpaperEnabled = enabled;
     });
+    /**
+     * 壁纸模式不可用：把原因告诉用户
+     *
+     * 以前这种情况是**完全静默**的（主进程用空 catch 吞掉了原生模块加载失败），
+     * 用户点了按钮什么都不发生，无从判断是环境不支持还是程序坏了。
+     */
+    this.removeWallpaperUnavailable = electronApi.onWallpaperUnavailable(
+      (reason) => {
+        this.$message.warning(`壁纸模式不可用：${reason}`);
+      },
+    );
     this.initWallpaperState();
     this.removeMaximizedListener = electronApi.onMaximized((val) => {
       this.isMaximized = val;
@@ -3015,6 +3092,7 @@ export default defineComponent({
     if (this.removeTrayShowLogoutConfirm) this.removeTrayShowLogoutConfirm();
     if (this.removeTrayUnlock) this.removeTrayUnlock();
     if (this.removeWallpaperState) this.removeWallpaperState();
+    if (this.removeWallpaperUnavailable) this.removeWallpaperUnavailable();
     if (this.removeMaximizedListener) this.removeMaximizedListener();
     if (this.removeFullscreenListener) this.removeFullscreenListener();
     document.removeEventListener('keydown', this.handleKeydown);
