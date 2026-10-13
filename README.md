@@ -7,36 +7,35 @@
 
 > 名字：**BLMV** = **B**i**L**i**M**usic**V**ideo（原名 BiLiMusicVideo-desktop）
 
-\<p>
-  \<img alt="platform" src="https://img.shields.io/badge/platform-Windows-0078D4">
-  \<img alt="electron" src="https://img.shields.io/badge/Electron-42-47848F">
-  \<img alt="vue" src="https://img.shields.io/badge/Vue-3.5-42B883">
-  \<img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-blue">
-\</p>
+<p>
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows-0078D4">
+  <img alt="electron" src="https://img.shields.io/badge/Electron-42-47848F">
+  <img alt="vue" src="https://img.shields.io/badge/Vue-3.5-42B883">
+  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-blue">
+</p>
 
 ---
 
 ## 目录
 
-- [软件截图](#%E8%BD%AF%E4%BB%B6%E6%88%AA%E5%9B%BE)
-- [功能特性](#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)
-- [技术栈](#%E6%8A%80%E6%9C%AF%E6%A0%88)
-- [快速开始](#%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B)
-- [使用说明](#%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E)
-- [配置文件位置](#%E9%85%8D%E7%BD%AE%E6%96%87%E4%BB%B6%E4%BD%8D%E7%BD%AE)
-- [常见问题](#%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98)
+- [软件截图](#软件截图)
+- [功能特性](#功能特性)
+- [技术栈](#技术栈)
+- [快速开始](#快速开始)
+- [使用说明](#使用说明)
+- [配置文件位置](#配置文件位置)
+- [常见问题](#常见问题)
 - [实现笔记](ARCHITECTURE.md)（架构 / 数据流 / 踩坑记录，改代码再看）
-- [免责声明](#%E5%85%8D%E8%B4%A3%E5%A3%B0%E6%98%8E) · [许可证](#%E8%AE%B8%E5%8F%AF%E8%AF%81)
+- [免责声明](#免责声明) · [许可证](#许可证)
 
 ## 软件截图
 
-![窗口模式](.%5Cscreenshot%5C%E7%AA%97%E5%8F%A3%E6%A8%A1%E5%BC%8F.png)
-![全屏模式](.%5Cscreenshot%5C%E5%85%A8%E5%B1%8F%E6%A8%A1%E5%BC%8F.png)
-![壁纸模式](.%5Cscreenshot%5C%E5%A3%81%E7%BA%B8%E6%A8%A1%E5%BC%8F.png)
-![歌单管理](.%5Cscreenshot%5C%E6%AD%8C%E5%8D%95%E7%AE%A1%E7%90%86.png)
-![设置](.%5Cscreenshot%5C%E8%AE%BE%E7%BD%AE.png)
-![关于](.%5Cscreenshot%5C%E5%85%B3%E4%BA%8E.png)
-![查毒](.%5Cscreenshot%5C%E6%9F%A5%E6%AF%92.png)
+![窗口模式](screenshot/windowMode.png)
+![全屏模式](screenshot/fullscreenMode.png)
+![壁纸模式](screenshot/wallpaperMode.png)
+![歌单管理](screenshot/musicManage.png)
+![设置](screenshot/options.png)
+![关于](screenshot/about.png)
 
 ## 功能特性
 
