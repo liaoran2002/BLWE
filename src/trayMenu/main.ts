@@ -159,8 +159,8 @@ const ITEMS: Item[] = [
  * 统一包一层失败处理
  *
  * 托盘菜单页里所有调用都是「发出去就不管」的：主进程 handler 一旦抛错，
- * 渲染侧就是未处理的 promise rejection —— 而动作的前半段（收起菜单）已经执行了，
- * 用户看到的是「点了没反应」，也没有任何地方能看出失败。
+ * 渲染侧就是未处理的 promise rejection，用户看到的是「点了没反应」，
+ * 也没有任何地方能看出失败。
  */
 const run = (action: TrayMenuAction, value?: number): void => {
   api.trayMenuAction(action, value).catch((err) => {
@@ -266,7 +266,8 @@ const finishSeek = (e: PointerEvent): void => {
   } catch {
     /* 忽略 */
   }
-  // 主进程会顺手收起菜单
+  // 主进程**不会**收起菜单（seek 在 KEEP_MENU_OPEN 里），
+  // 用户拖完可以接着拖、或者点下一首
   run('seek', seekRatio)
   repaintSeekDrag()
 }
@@ -331,7 +332,7 @@ volumeTrack.addEventListener('pointercancel', finishVolume)
 /**
  * 音量按钮：静音开关
  *
- * 菜单**不收起**（主进程那边 volume/toggleMute 也不收），所以能立刻看到图标与数字变化；
+ * 菜单**不收起**（静音属于 KEEP_MENU_OPEN），所以能立刻看到图标与数字变化；
  * 这里先按本地状态画一下（乐观更新），主进程推回权威状态后会再对齐。
  */
 volumeBtn.addEventListener('mouseup', (e) => {

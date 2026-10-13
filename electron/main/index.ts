@@ -1167,6 +1167,31 @@ function scheduleHideAfterBlur(recheck = 0): void {
 }
 
 /**
+ * 执行这些菜单动作时**不收起菜单**
+ *
+ * 判据是「这个动作会不会被连续使用」：
+ *  - 进度条 / 音量：拖动是连续的，收起后用户看不到数字、也没法接着拖
+ *    （踩过：鼠标一碰音量条菜单就没了）；
+ *  - 上一首 / 播放暂停 / 下一首 / 循环模式：控制栏是「连点」场景 ——
+ *    连着切两首、或者暂停后顺手换个模式再播。收起菜单等于每点一下
+ *    都要重新右键托盘图标，很难用。
+ *
+ * 与之相对，下面那几项（设置歌单 / 壁纸模式 / 退出登录 / 退出程序）
+ * 都是**一次性的跳转或命令**，执行完就该收起来。
+ *
+ * 菜单不收起时，用户仍然可以：按 `Esc`、点菜单外面、或左键点托盘图标来关掉它。
+ */
+const KEEP_MENU_OPEN: ReadonlySet<TrayMenuAction> = new Set([
+  'seek',
+  'volume',
+  'toggleMute',
+  'playControl',
+  'prev',
+  'next',
+  'toggleMode',
+])
+
+/**
  * 执行菜单动作：先收起菜单，再复用应用里已有的那套事件
  *
  * 进度条 / 音量这两个带参数，所以接 `value`。
@@ -1174,13 +1199,7 @@ function scheduleHideAfterBlur(recheck = 0): void {
 function runTrayMenuAction(action: TrayMenuAction, value?: number): void {
   // 菜单动作都记一行：出问题时能一眼看出「点了什么、有没有传参」
   console.log(`[tray] 菜单动作: ${action}${value === undefined ? '' : ' ' + value}`)
-  /**
-   * 音量与静音**不收起菜单**
-   *
-   * 这两个是连续操作：调音量时菜单一关，用户看不到音量数字、也没法接着调，
-   * 之前的现象就是「鼠标一碰音量条菜单就没了」。
-   */
-  if (action !== 'volume' && action !== 'toggleMute') {
+  if (!KEEP_MENU_OPEN.has(action)) {
     hideTrayMenu()
   }
   switch (action) {
