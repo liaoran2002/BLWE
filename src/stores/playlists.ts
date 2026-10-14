@@ -2,18 +2,26 @@
  * 歌单 store（渲染进程）
  *
  * 与 setting store 一样，这里只做**响应式副本 + 业务编排**，
- * 持久化由主进程的 playlists.json 负责（savePlaylists 整体覆盖）。
+ * 持久化由主进程负责（`playlists:save` 整体覆盖，落到 SQLite 的
+ * `playlists` + `playlist_songs` 两张表）。
  *
  * 职责：
  *  - 歌单的增删改查、当前歌单切换
- *  - 每首歌已选定的 B 站视频缓存（videoCache），用于续播时还原上次看的视频
  *  - 自动同步编排（启动时 / 定时），实际解析在主进程
+ *
+ * **收藏视频与「每首歌选中的视频」不在这里**（`getFavorites` / `addFavorite` /
+ * `removeFavorite` / `setVideoForSong` / `getVideoForSong` 都已删除）。
+ * 它们搬到了主进程的 `videos` / `song_meta` 表，渲染层直接调
+ * `api.setFavorite` / `api.getFavoriteBvids` / `api.getSelectedBvid`。
+ * 为什么必须搬走：收藏带「列表顺序」语义，而这个 store 的
+ * 持久化是**整个歌单集合全量覆盖**——每收藏一次就把所有歌单所有曲目重写一遍，
+ * 而且同步进行中还会被主进程的 `syncingIds` 拦下（收藏静默丢失）。
+ * （写入 `selected_bvid` 连 `get` 之外的接口都不需要：`resolveVideoUrl` 内部会写。）
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import api from '@/api/electron'
 import type {
-  FavoriteVideo,
   PlaylistRecord,
   PlaylistSong,
   PlaylistStoreData,
@@ -103,7 +111,6 @@ export const usePlaylistStore = defineStore('playlists', () => {
       createdAt: now,
       updatedAt: now,
       lastIndex: 0,
-      videoCache: {},
     }
     playlists.value = [...playlists.value, record]
     currentId.value = record.id
@@ -138,79 +145,8 @@ export const usePlaylistStore = defineStore('playlists', () => {
   }
 
   /**
-   * 记录某首歌选定的视频
-   *
-   * 续播时优先还原这个视频，避免每次重新匹配挑到不同的版本。
+   * 记录当前歌单播放到第几首
    */
-  const setVideoForSong = async (
-    songName: string,
-    video: { bvid: string; title: string; cover?: string | null },
-  ): Promise<void> => {
-    const target = current.value
-    if (!target) return
-    const cache = { ...(target.videoCache ?? {}) }
-    cache[songName] = { ...video, pickedAt: Date.now() }
-    const next = playlists.value.map((p) =>
-      p.id === target.id ? { ...p, videoCache: cache, updatedAt: Date.now() } : p,
-    )
-    playlists.value = next
-    await persist()
-  }
-
-  const getVideoForSong = (
-    songName: string,
-  ): { bvid: string; title: string; cover?: string | null } | null => {
-    const hit = current.value?.videoCache?.[songName]
-    return hit ? { bvid: hit.bvid, title: hit.title, cover: hit.cover ?? null } : null
-  }
-
-  /**
-   * 某首歌收藏的视频（按收藏时间从新到旧？——不，按插入顺序：最新的在最前面）
-   *
-   * 视频列表里这些条目固定排在最前面，重新搜索也不会丢。
-   */
-  const getFavorites = (songName: string): FavoriteVideo[] =>
-    current.value?.favorites?.[songName] ?? []
-
-  /** 收藏一个视频（同一 bvid 去重，已存在就更新信息并提到最前） */
-  const addFavorite = async (
-    songName: string,
-    video: { bvid: string; title: string; cover?: string | null; author?: string | null; duration?: number | null },
-  ): Promise<void> => {
-    const target = current.value
-    if (!target) return
-    const all = { ...(target.favorites ?? {}) }
-    const list = (all[songName] ?? []).filter((v) => v.bvid !== video.bvid)
-    list.unshift({
-      bvid: video.bvid,
-      title: video.title,
-      cover: video.cover ?? null,
-      author: video.author ?? null,
-      duration: video.duration ?? null,
-      savedAt: Date.now(),
-    })
-    all[songName] = list
-    playlists.value = playlists.value.map((p) =>
-      p.id === target.id ? { ...p, favorites: all, updatedAt: Date.now() } : p,
-    )
-    await persist()
-  }
-
-  /** 取消收藏（顺便记下这个 bvid 是否本来就在收藏里） */
-  const removeFavorite = async (songName: string, bvid: string): Promise<void> => {
-    const target = current.value
-    if (!target?.favorites?.[songName]) return
-    const all = { ...target.favorites }
-    const list = (all[songName] ?? []).filter((v) => v.bvid !== bvid)
-    if (list.length > 0) all[songName] = list
-    else delete all[songName]
-    playlists.value = playlists.value.map((p) =>
-      p.id === target.id ? { ...p, favorites: all, updatedAt: Date.now() } : p,
-    )
-    await persist()
-  }
-
-  /** 记录当前歌单播放到第几首 */
   const setLastIndex = async (index: number): Promise<void> => {
     const target = current.value
     if (!target || target.lastIndex === index) return
@@ -293,11 +229,6 @@ export const usePlaylistStore = defineStore('playlists', () => {
     updatePlaylist,
     removePlaylist,
     setCurrent,
-    setVideoForSong,
-    getVideoForSong,
-    getFavorites,
-    addFavorite,
-    removeFavorite,
     setLastIndex,
     sync,
     syncAll,

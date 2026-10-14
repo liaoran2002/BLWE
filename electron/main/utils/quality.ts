@@ -14,15 +14,18 @@
  */
 import { VIDEO_QUALITY_OPTIONS } from '@common/constants'
 
-/** playurl 响应的形状（字段很多，只声明用到的） */
+/**
+ * playurl 响应的形状（字段很多，只声明用到的）
+ *
+ * **不再声明 `quality` / `support_formats`**：schema v4 删了这两列，
+ * 所以从库里拼回来的最小形状里也不会有它们。durl 的档位改从
+ * `durl[0].url` 反推（见 `qualityFromDurlUrl`），展示名走内置档位表。
+ *
+ * 注意这里仍然要能吃下**联网新解析的整包响应** —— 多出来的字段无所谓，
+ * 结构类型允许它。
+ */
 interface PlayUrlLike {
   data?: {
-    quality?: number
-    support_formats?: Array<{
-      quality?: number
-      display_desc?: string
-      new_description?: string
-    }>
     dash?: {
       video?: Array<{
         id?: number
@@ -31,18 +34,51 @@ interface PlayUrlLike {
         height?: number
       }>
     }
+    durl?: Array<{ url?: string }>
   }
 }
 
 /**
- * qn 代码 -> 标签（`support_formats` 缺失时才用到）
+ * qn 代码 -> 标签
  *
  * 直接复用 `@common/constants` 的档位表，**别再抄一份**：同一份映射写两处，
  * 以后加档位（比如 8K 的变体）只改一处就会出现「设置里叫 X、角标里叫 Y」。
+ *
+ * schema v4 之后这就是**唯一**的档位名来源（那条「优先用 B 站 support_formats
+ * 文案」的分支已经删掉 —— 内置表本来就覆盖了全部 12 档，而每行存一份映射纯属冗余）。
  */
 const QUALITY_LABELS: Record<number, string> = Object.fromEntries(
   VIDEO_QUALITY_OPTIONS.map((opt) => [opt.id, opt.label]),
 )
+
+/**
+ * 从 durl 地址反推清晰度
+ *
+ * **为什么能这么干**：B 站的 durl 地址把档位编码在文件名里。实测 24/24 成立：
+ *
+ * ```
+ * ...-1-192.mp4  -> quality 64   (64 + 128)
+ * ...-1-208.mp4  -> quality 80   (80 + 128)
+ * ```
+ *
+ * 也就是说 `quality = URL 里的那个数字 - 128`。schema v4 正是因此删掉了
+ * `videos.quality` 列 —— 从 `durl_url` 反推即可，不丢信息。
+ *
+ * ⚠️ 这是 B 站的**命名约定而不是契约**，所以反推失败时返回 `null`
+ * （调用方会当作「读不出档位」），**绝不猜一个值** ——
+ * 宁可角标空着，也不要显示一个错的清晰度。
+ */
+export const qualityFromDurlUrl = (url: string | null | undefined): number | null => {
+  if (!url) return null
+  // 形如 `.../460901307-1-192.mp4?e=...`：取 `-数字.mp4` 里的数字
+  const m = /-(\d+)\.mp4(?:[?#]|$)/.exec(url)
+  if (!m) return null
+  const encoded = Number(m[1])
+  if (!Number.isFinite(encoded)) return null
+  const quality = encoded - 128
+  // 反推出的档位必须是个合理的正数，否则说明这个 URL 不是我们理解的那种格式
+  return quality > 0 ? quality : null
+}
 
 export interface VideoQualityInfo {
   /** qn 代码，便于排查 */
@@ -54,8 +90,11 @@ export interface VideoQualityInfo {
 }
 
 /**
- * @param playData playurl 响应（缓存里是 `playurl_result`，新解析的是 `playData`）
- * @param videoUrl 最终交给 `<video>` 的地址，用来确认 dash 里播的是哪一条流
+ * @param playData playurl 响应。两条来源都可用：新解析时是接口原始响应，
+ *                 读缓存时是 `cache.ts` 用结构化列拼回来的**最小形状**
+ *                 （只含 `dash` / `durl`，见 `toPlayUrlLike`）
+ * @param videoUrl 最终交给 `<video>` 的地址。dash 时用它确认播的是哪一条流；
+ *                 durl 时它**本身就是** durl 地址，档位从它反推
  */
 export const readVideoQuality = (
   playData: unknown,
@@ -79,18 +118,23 @@ export const readVideoQuality = (
     }
   }
 
-  // durl：顶层 quality 就是这条渐进式流的清晰度
-  if (code === null && typeof data.quality === 'number') code = data.quality
+  /**
+   * durl：档位编码在地址里（`URL 数字 - 128`），不再依赖已删除的 `quality` 列。
+   *
+   * 只在 dash 取不到档位时才走这里 —— dash 有 `id` 就用它，那是最准的。
+   */
+  if (code === null) {
+    const fromUrl = qualityFromDurlUrl(
+      videoUrl ?? (data.durl?.[0]?.url as string | undefined) ?? null,
+    )
+    if (fromUrl !== null) code = fromUrl
+  }
   if (code === null) return null
 
-  const hit = data.support_formats?.find((f) => f?.quality === code)
-  const fromApi = typeof hit?.display_desc === 'string' ? hit.display_desc : ''
-  const label =
-    fromApi || QUALITY_LABELS[code] || (height && height > 0 ? `${height}P` : '')
+  const label = QUALITY_LABELS[code] || (height && height > 0 ? `${height}P` : '')
   if (!label) return null
 
-  const descFromApi =
-    typeof hit?.new_description === 'string' ? hit.new_description : ''
+  const known = VIDEO_QUALITY_OPTIONS.find((o) => o.id === code)
 
-  return { code, label, description: descFromApi || label }
+  return { code, label, description: known?.description ?? label }
 }

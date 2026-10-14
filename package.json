@@ -1,5 +1,5 @@
 {
-  "name": "BiLiMusicVideo-desktop",
+  "name": "BiLiMusicVideo",
   "version": "1.0.0",
   "author": "liaoran2002",
   "description": "BLMV：把音乐歌单变成B站MV视频播放列表的桌面播放器。",
@@ -20,6 +20,7 @@
     "dist": "npm run build:protected && electron-builder"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "bytenode": "^1.7.0",
     "koffi": "^3.3.3"
   },
@@ -48,7 +49,10 @@
       "package.json",
       "!**/node_modules/**/{test,tests,__tests__,example,examples,benchmark,benchmarks}/**",
       "!**/node_modules/**/{CHANGELOG,CHANGES,HISTORY}.{md,markdown,txt}",
-      "!**/node_modules/.bin/**"
+      "!**/node_modules/.bin/**",
+      "!**/node_modules/better-sqlite3/{deps,src}/**",
+      "!**/node_modules/better-sqlite3/prebuilds/*.node",
+      "node_modules/better-sqlite3/prebuilds/win32-x64.node"
     ],
     "extraResources": [
       {
@@ -60,7 +64,8 @@
       }
     ],
     "asarUnpack": [
-      "**/node_modules/@koromix/**/*.node"
+      "**/node_modules/@koromix/**/*.node",
+      "**/node_modules/better-sqlite3/prebuilds/*.node"
     ],
     "electronLanguages": [
       "zh-CN",

@@ -98,6 +98,17 @@ const api = {
   /** 「添加视频」：解析 B 站链接 / BV 号 */
   parseVideo: (input: string): Promise<ParsedVideoInfo> =>
     rendererInvoke('api:parseVideo', { input }),
+  /** 收藏 / 取消收藏；返回值是收藏后的完整列表（顺带刷新界面顺序） */
+  setFavorite: (
+    searchKey: string,
+    bvid: string,
+    favorite: boolean,
+  ): Promise<{ favorites: string[] }> =>
+    rendererInvoke('api:setFavorite', { searchKey, bvid, favorite }),
+  getFavoriteBvids: (searchKey: string): Promise<string[]> =>
+    rendererInvoke('api:getFavoriteBvids', { searchKey }),
+  getSelectedBvid: (searchKey: string): Promise<string | null> =>
+    rendererInvoke('api:getSelectedBvid', { searchKey }),
   resolveVideoUrl: (
     bvid: string,
     keyword?: string,

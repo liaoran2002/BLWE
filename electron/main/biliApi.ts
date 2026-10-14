@@ -619,11 +619,16 @@ const audioLabelOf = (item: DashItem): string => {
  * 读出「这个视频当前可选的清晰度 / 音质」
  *
  * **只列响应里真正能拿到的档位**，不铺静态全表：
- *  - 有 dash 时以 `dash.video[]` 为准 —— 那才是实际能播的流；
- *    `accept_quality` 只能说明账号有权限，durl 通道会给不了（实测它列出 1080P 却只回 720P）；
- *  - 没有 dash（durl 兜底）时才退回 `accept_quality`；
+ *  - 有 dash 时以 `dash.video[]` 为准 —— 那才是实际能播的流。
+ *    **按 id 分 URL，没有 URL 就放不出来**，所以它比 `accept_quality`
+ *    （只说明账号有权限，durl 通道可能给不了，实测列出 1080P 却只回 720P）权威得多；
  *  - 音质来自 `dash.audio[]`。
- * 展示名一律取 `support_formats` 的官方文案，取不到再退回内置档位表。
+ *  - 展示名一律走 `@common/constants` 的内置档位表（覆盖全部 12 档）。
+ *    **不再读响应里的 `support_formats`** —— schema v4 认为那是静态映射、
+ *    每行存一份纯属冗余，所以库里也不再有它。
+ *
+ * 因此**没有 dash 时这个列表就是空的**（那是 durl 兜底通道，只有一条流、
+ * 没什么可切）—— 这是刻意的：宁可菜单空着，也不要列出切不过去的档位。
  *
  * 注意：这里**不按设置里的上限裁剪**。
  * 设置页那个上限管的是「自动播放时最高选到哪一档」，
@@ -635,33 +640,16 @@ export const readQualityOptions = (
   const data = (playData as { data?: Record<string, unknown> } | null | undefined)?.data
   if (!data) return null
 
-  const formats = Array.isArray(data.support_formats)
-    ? (data.support_formats as Array<{
-        quality?: number
-        display_desc?: string
-        new_description?: string
-      }>)
-    : []
-  const accept = Array.isArray(data.accept_quality)
-    ? (data.accept_quality as number[]).filter((q) => typeof q === 'number')
-    : []
   const dash = data.dash as { video?: DashItem[]; audio?: DashItem[] } | undefined
   const dashVideoIds = Array.isArray(dash?.video)
     ? dash.video.map((v) => v.id).filter((id): id is number => typeof id === 'number')
     : []
 
-  const videoIds = dashVideoIds.length > 0 ? dashVideoIds : accept
-  const video: QualityOption[] = videoIds
+  const video: QualityOption[] = dashVideoIds
     .map((id) => {
-      const hit = formats.find((f) => f.quality === id)
       const known = findQualityOption(VIDEO_QUALITY_OPTIONS, id)
-      const label =
-        (typeof hit?.display_desc === 'string' && hit.display_desc) || known?.label || String(id)
-      const description =
-        (typeof hit?.new_description === 'string' && hit.new_description) ||
-        known?.description ||
-        label
-      return { id, label, description }
+      const label = known?.label || String(id)
+      return { id, label, description: known?.description || label }
     })
     // 去重后按档位从高到低
     .filter((o, i, arr) => arr.findIndex((x) => x.id === o.id) === i)

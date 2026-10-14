@@ -7,7 +7,7 @@
  *   1. 图片实际加载不出来
  *   2. 系统媒体控件（SMTC）直接拒绝该 artwork
  *      （报 "MediaImage src can only be of http/https/data/blob scheme"）
- *   3. 把它写进 videoCache 后再拿去解析视频地址会抛 DOMException
+ *   3. 把它写进缓存后再拿去解析视频地址会抛 DOMException
  *
  * 所以所有要展示/传出去的图片地址都必须先经过这里规整成绝对 https。
  */

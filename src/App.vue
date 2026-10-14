@@ -249,6 +249,18 @@ const PREFETCH_AHEAD_S = 15;
  * 而用户手动点下一首的忍耐时间大概也就这么长。命中后先重解析一次，再不行才跳歌。
  */
 const STALL_MS = 12000;
+/**
+ * 预热失败后的重试次数与间隔
+ *
+ * 心跳（`startEndWatch`）是**每秒**一次，所以光靠计数做不到「间隔 3 秒」——
+ * 必须同时看时间戳，否则三次重试会在 3 秒内打完。
+ *
+ * 为什么是 3 次 / 3 秒：B 站搜索偶发返回空（风控、抖动），隔几秒再试往往就好了；
+ * 但连着 3 次都空基本就是「这首歌在 B 站真的没有」或「未登录导致结果被裁」，
+ * 再试只是白烧网络（用户反馈过「日志刷几十行、界面卡住」）。
+ */
+const WARM_MAX_TRIES = 3;
+const WARM_RETRY_DELAY_MS = 3000;
 import type {
   AppData,
   BiliVideo,
@@ -278,21 +290,22 @@ export default defineComponent({
     return { settingStore, playlistsStore };
   },
   computed: {
-    /** 当前这首歌收藏的 bvid 列表（视频列表里显示实心爱心） */
-    favoriteBvids(): string[] {
-      return this.playlistsStore.getFavorites(this.songName).map((f) => f.bvid);
-    },
     /**
-     * 关键词加权配置直接读 store，不再在组件里硬编码一份。
+     * 当前这首歌收藏的 bvid 列表（视频列表里显示实心爱心）
      *
-     * 注意命名：这里**不能**叫 `tagBonus`。
-     * options API 里 computed 的优先级高于 methods，一旦重名，
-     * 下面 `tagBonus(title)` 这个方法就会被同名 computed 覆盖，
-     * 调用时抛 "this.tagBonus is not a function"。
+     * 直接从 `videoList` 读 `favorites` 字段：收藏状态的主进程那份是权威
+     * （`videos.favorites`），而搜索返回的列表已经把它带上来了。
+     * 以前是去歌单 store 里翻一份独立的收藏记录 —— 两份数据在「收藏后重排顺序」
+     * 这类操作后必然对不上（界面上心是实的，位置却没动）。
      */
-    tagBonusConfig(): AppSetting['player.tagBonus'] {
-      return this.settingStore.tagBonus;
+    favoriteBvids(): string[] {
+      return this.videoList.filter((v) => v?.favorites).map((v) => v.bvid);
     },
+    /*
+     * `tagBonusConfig`（关键词加权表）也已搬走 —— 它唯一的用途是喂给
+     * `tagBonus()` 打分，而打分现在在主进程（`@common/utils/videoRank`，
+     * 直接读主进程的设置）。渲染层不再需要这份配置。
+     */
     /** 当前播放歌曲的结构化信息（供详情弹窗右侧与 SMTC 使用） */
     currentSong(): StructuredSong | null {
       return this.songs[this.currentIndex] ?? null;
@@ -503,6 +516,20 @@ export default defineComponent({
        */
       _warmed: { next: false, prev: false },
       _warming: { next: false, prev: false },
+      /**
+       * 某个方向的预热**失败了几次**（用来实现「重试 3 次、间隔 3 秒」）
+       *
+       * 为什么需要它：心跳每秒都会调 `warmApi`，而搜不到视频时不能靠 `_warm[dir]`
+       * 拦截（那个槽位是空的）—— 没有这个计数就会**每秒重试一次真网络请求**，
+       * 一直不停（用户反馈「日志刷了几十行、界面卡住」就是这么来的）。
+       *
+       * 达到上限后记进 `_warm[dir]`（带 `failed` 标记）彻底停掉，直到换歌才重置。
+       */
+      _warmTries: { next: 0, prev: 0 },
+      /** 某个方向的预热结果是否已彻底失败（不再重试，等换歌清掉） */
+      _warmFailed: { next: false, prev: false },
+      /** 上次预热失败的时间戳（配合 `WARM_RETRY_DELAY_MS` 实现「间隔 3 秒」） */
+      _warmRetryAt: { next: 0, prev: 0 },
       _warmEl: { next: null, prev: null } as AppData['_warmEl'],
       _warmSession: { next: null, prev: null } as AppData['_warmSession'],
       _warmTimer: { next: null, prev: null } as AppData['_warmTimer'],
@@ -709,19 +736,34 @@ export default defineComponent({
      * 恢复某首歌对应的视频
      *
      * 直接走一次正常搜索把候选列表铺满 —— 这首歌上次就是「正在播」的那首，
-     * `api:searchSong` 基本命中主进程的搜索结果缓存（磁盘缓存，秒回），
+     * `api:searchSong` 基本命中主进程的搜索结果缓存（数据库命中，秒回），
      * 所以没必要为了省这一趟请求让 `videoList` 只放一条占位
      * （那样续播后点开视频列表只有孤零零一行）。
      *
-     * 播哪个视频仍然以歌单里记住的 bvid 为准，而且直链一律交给
-     * `api:resolveVideo` 现取：搜索结果里带的地址可能早就过了签名时效。
+     * 播哪个视频以主进程记的 `selectedBvid`（`song_meta` 表）为准，
+     * 而且直链一律交给 `api:resolveVideo` 现取：缓存里的地址可能早就过了签名时效。
      *
      * @param seekTo 播放起点（秒），0 表示从头
      * @returns 是否成功
      */
     async restoreSongVideo(songName: string, seekTo = 0): Promise<boolean> {
-      const cached = this.playlistsStore.getVideoForSong(songName);
-      if (!cached) return false;
+      /**
+       * 没有「上次播的视频」记录 -> 交给默认流程
+       *
+       * 这一条以前查的是歌单里的 `videoCache`，现在换成主进程的
+       * `song_meta.selected_bvid`。语义没变：**没有记录就说明这首歌从没播过**，
+       * 此时应该走 `loadPlaylist` 那套（它会播搜索结果里的第一个），
+       * 而不是在这里造一个「随便挑一个」的行为 —— 两条路径都得挑第一个的话，
+       * 不如只留一条，省得以后改挑选规则时漏改一处。
+       */
+      let remembered: string | null = null;
+      try {
+        remembered = await electronApi.getSelectedBvid(songName);
+      } catch (err) {
+        console.warn('[resume] 读取上次播放的视频失败，回退到默认流程', err);
+      }
+      if (!remembered) return false;
+      const cachedBvid = remembered;
 
       // 歌曲信息先切过来：搜索往返期间界面显示的也该是这首歌
       this.songName = songName;
@@ -729,12 +771,15 @@ export default defineComponent({
       try {
         const res = await electronApi.searchSong(songName);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-        // 收藏的视频固定排在最前面，并按 bvid 去重
-        this.videoList = this.applyFavoriteOrder(this.sortSearchedVideos(videos, songName), songName);
+        /**
+         * 顺序已经是最终顺序：主进程合并时就按「收藏在前、其余保持搜索顺序」
+         * 排好了，这里只做打分排序（`sortSearchedVideos` 会把收藏那一段原样保留）。
+         */
+        this.videoList = this.sortSearchedVideos(videos);
         this.videoListKeyword = songName;
       } catch (err) {
-        // 搜索失败不致命：至少还能把歌单里记住的那条播起来
-        console.warn('[resume] 搜索失败，只按歌单里记住的视频续播', err);
+        // 搜索失败不致命：至少还能把记住的那个视频播起来
+        console.warn('[resume] 搜索失败，只按记住的视频续播', err);
         this.videoList = [];
       }
 
@@ -744,12 +789,12 @@ export default defineComponent({
       }
 
       // 交给 changeVideo 解析并起播：它顺手回填标题/封面/清晰度，地址过期会自动重取
-      await this.changeVideo(cached.bvid, songName);
-      if (this.currentBvid === cached.bvid && (this.videoUrl || this.dashSource)) {
+      await this.changeVideo(cachedBvid, songName);
+      if (this.currentBvid === cachedBvid && (this.videoUrl || this.dashSource)) {
         // 记住的视频不在这轮搜索结果里 -> 补成列表第一项，别让「正在播的」在列表里找不到
         if (this.currentVideoIndex < 0) {
           this.videoList = [
-            { bvid: cached.bvid, title: this.videoName, pic: this.videoPic || null },
+            { bvid: cachedBvid, title: this.videoName, pic: this.videoPic || null },
             ...this.videoList,
           ];
           this.currentVideoIndex = 0;
@@ -759,8 +804,8 @@ export default defineComponent({
 
       // 记住的视频已经播不了（被删 / 换源）-> 退回搜索结果第一条
       const first = this.videoList[0];
-      if (!first || first.bvid === cached.bvid) return false;
-      console.warn('[resume] 歌单里记住的视频已失效，改用搜索结果第一条', first.bvid);
+      if (!first || first.bvid === cachedBvid) return false;
+      console.warn('[resume] 记住的视频已失效，改用搜索结果第一条', first.bvid);
       await this.changeVideo(first.bvid, songName);
       return Boolean(this.videoUrl || this.dashSource);
     },
@@ -1390,6 +1435,15 @@ export default defineComponent({
     /** 搜索 + 解析某个方向的下一首（结果放进槽位，供切歌时直接命中缓存） */
     async warmApi(dir: 'next' | 'prev'): Promise<void> {
       if (this._warming[dir]) return;
+      // 已经彻底失败过：不再重试，等换歌 / 换歌单时由 clearWarm 重置
+      if (this._warmFailed[dir]) return;
+      /**
+       * 失败后的重试节流：心跳是每秒一次，光看 `_warmTries` 做不到「间隔 3 秒」——
+       * 三次会在 3 秒内打完。所以还要看上次失败的时间戳。
+       */
+      if (this._warmTries[dir] > 0 && Date.now() - this._warmRetryAt[dir] < WARM_RETRY_DELAY_MS) {
+        return;
+      }
       const idx = this.indexForDir(dir);
       if (idx < 0) return;
       const songName = this.getSongName(idx);
@@ -1399,11 +1453,66 @@ export default defineComponent({
       try {
         const res = await electronApi.searchSong(songName);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-        const list = this.sortSearchedVideos(videos, songName);
-        // 与 changeSong 的挑选规则一致，保证预热的就是待会儿真正要播的那个
+        const list = this.sortSearchedVideos(videos);
+        /**
+         * 与 `changeSong` 的挑选规则**逐字一致**，保证预热的就是待会儿真正要播的那个。
+         *
+         * 必须也问 `getSelectedBvid`：`changeSong` 现在优先用它，
+         * 而搜索返回体里那份 `selectedBvid` 只是兜底。两边规则不一样的话，
+         * 预热好的地址到了切歌时会被换掉（白预热，用户还是要等一次解析）。
+         */
+        const remembered = await electronApi.getSelectedBvid(songName);
         const bvid =
-          (res.data as { selectedBvid?: string } | null)?.selectedBvid || list[0]?.bvid;
-        if (!bvid) return;
+          remembered ||
+          (res.data as { selectedBvid?: string } | null)?.selectedBvid ||
+          list[0]?.bvid;
+        if (!bvid) {
+          /**
+           * 搜不到视频 —— **必须记账，否则会每秒重试**
+           *
+           * 踩过：这里原来直接 `return`，而 `_warm[dir]` 是空的，所以
+           * `_warm[dir]?.song === songName` 那个「已经是热的」判断永远不成立，
+           * 而 `finally` 又把 `_warming` 复位了 —— 心跳每秒进来一次，
+           * **每秒发一次真网络请求，永不停止**。
+           *
+           * 症状：控制台同一个关键词刷几十行「搜索结果为空」，
+           * 界面变卡（尤其是「歌名-歌手」很长的搜索键，B 站必然搜不到）。
+           *
+           * 现在按「重试 3 次、间隔 3 秒」处理：没到上限就等下一轮心跳
+           * （心跳本身是 1 秒一次，所以额外加一个 3 秒的节流由 `_warmTries` 的时间戳控制）。
+           */
+          this._warmTries[dir] += 1;
+          // 记下这次失败的时刻：下一轮心跳要靠它判断「够 3 秒了没」
+          this._warmRetryAt[dir] = Date.now();
+          if (this._warmTries[dir] >= WARM_MAX_TRIES) {
+            this._warmFailed[dir] = true;
+            console.warn(
+              `[prefetch] ${dir === 'next' ? '下一首' : '上一首'}《${songName}》预热失败 ` +
+                `${WARM_MAX_TRIES} 次（搜不到视频），不再重试。` +
+                (this.isLoggedIn ? '' : '（未登录时 B 站只返回部分结果，登录后可能就能找到了）'),
+            );
+            /**
+             * 提示用户 —— 但**只在未登录时**弹，因为那才是他能采取行动的情况。
+             *
+             * 已登录还搜不到，多半是这首歌本身在 B 站没有对应视频（歌名太长、
+             * 多歌手用「、」连起来那种），提示「请登录」是误导。
+             */
+            if (!this.isLoggedIn) {
+              this.$notify({
+                title: '有歌曲预热失败',
+                message: `《${songName}》搜不到视频。未登录时 B 站只返回部分结果，登录后可能就能找到了。`,
+                type: 'warning',
+                duration: 6000,
+              });
+            }
+          } else {
+            console.warn(
+              `[prefetch] ${dir === 'next' ? '下一首' : '上一首'}《${songName}》搜不到视频，` +
+                `第 ${this._warmTries[dir]}/${WARM_MAX_TRIES} 次（${WARM_RETRY_DELAY_MS / 1000}s 后再试）`,
+            );
+          }
+          return;
+        }
         const url = await electronApi.resolveVideoUrl(
           bvid,
           songName,
@@ -1510,6 +1619,15 @@ export default defineComponent({
       this._warm[dir] = null;
       // 结果作废 → 「热过了」的标记也一起清掉，下一首才有机会再预热
       this._warmed[dir] = false;
+      /**
+       * 失败计数与「已彻底失败」标记**一起清掉** —— 换了歌就该重新给机会。
+       *
+       * 不清的话：某一首歌搜不到导致该方向被永久封禁，
+       * 后面所有歌的预热都不再发生（用户会感觉「切歌越来越慢」却找不到原因）。
+       */
+      this._warmTries[dir] = 0;
+      this._warmFailed[dir] = false;
+      this._warmRetryAt[dir] = 0;
     },
     /** 两个方向全部作废（换歌单 / 清空播放） */
     clearAllWarm(): void {
@@ -1933,21 +2051,21 @@ export default defineComponent({
     /**
      * 把搜索结果按「像不像这首原曲」排序
      *
-     * 抽出来是因为续播后台补列表也要用同一套排序，
-     * 两处各写一份迟早会不一致。
+     * ⚠️ **已废弃，保留仅为兼容调用点** —— 打分排序搬到主进程了
+     * （`@common/utils/videoRank` 的 `sortByRelevance`），并且**在写库之前**执行，
+     * 所以 `videos.ord` 直接等于最终显示顺序，搜索返回的列表**已经是排好的**。
+     *
+     * 为什么必须搬走：原来主进程按「收藏 + B 站顺序」写 `ord`，渲染层拿到后又按打分
+     * 重排一遍，于是界面顺序和库里顺序是两套 ——「收藏再取消来提升顺序」这种
+     * 依赖持久化顺序的用法一重新搜索就散（取消后 `favorites` 变 0，
+     * 合并时不再保留它的位置，它就回到 B 站顺序了）。
+     *
+     * 这里保留成恒等函数（而不是删掉），是因为调用点分布在续播 / 预热 / 重试等
+     * 好几处，逐个删容易漏；恒等之后行为立刻正确，且渲染层不再有第二套顺序。
+     * 两处各写一份打分早晚会漂移，这也是它被抽成共享模块的原因。
      */
-    sortSearchedVideos(videos: BiliVideo[], songName: string): BiliVideo[] {
-      const keywords = songName.replace(/-/g, '').trim();
-      const parts = songName.split('-').map((s) => s.trim());
-      const realSongName = parts[0] || '';
-      const artistName = parts[1] || '';
-      return [...videos].sort((a, b) => {
-        const sa =
-          this.matchScore(a.title, keywords) + this.nameBonus(a.title, realSongName, artistName);
-        const sb =
-          this.matchScore(b.title, keywords) + this.nameBonus(b.title, realSongName, artistName);
-        return sb + this.tagBonus(b.title) - (sa + this.tagBonus(a.title));
-      });
+    sortSearchedVideos(videos: BiliVideo[]): BiliVideo[] {
+      return videos;
     },
     async changeSong(index: number): Promise<void> {
       const songName = this.getSongName(index);
@@ -2007,13 +2125,30 @@ export default defineComponent({
       this.currentTime = 0;
       this.duration = 0;
 
+      /**
+       * `selectedBvid`（「这首歌上次播的是哪个视频」）不在这里写。
+       *
+       * 它由 `api:resolveVideo` 在**每次真正切到某个视频时**落库（一行 upsert）。
+       * 换 SQLite 之前之所以要攒到「切歌 / 退出」才写，是因为旧实现是 JSON 文件：
+       * 每写一次都要把整份候选列表 stringify 再 rename，切视频那么频繁根本受不了。
+       * 现在按主键更新一行，成本和一次 setItem 差不多，所以**每次切视频直接写**，
+       * 语义反而更准（不必再担心「切了视频但没切歌就退出」会丢）。
+       *
+       * 预热（`warmApi`）走的是同一个 `resolveVideoUrl`，而它挑的 bvid 与 `changeSong`
+       * 逐字一致，所以它写进去的也是「这首歌该播的那个」，不会写错。
+       */
+
       try {
         const res = await electronApi.searchSong(songName);
         if (token !== this._songToken) return;
         // searchSong 的 data 形状由搜索接口决定，这里收敛成 BiliVideo
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-        // 收藏的视频固定排在最前面，并按 bvid 去重
-        let list = this.applyFavoriteOrder(this.sortSearchedVideos(videos, songName), songName);
+        /**
+         * 顺序已经是最终顺序：主进程合并时就按「收藏在前、其余保持搜索顺序」排好了，
+         * 这里只做打分排序（`sortSearchedVideos` 会把收藏那一段原样保留在最前面）。
+         * 原来那层 `applyFavoriteOrder` 已经删掉 —— 它和主进程各排一次，必然对不上。
+         */
+        let list = this.sortSearchedVideos(videos);
 
         /**
          * 一首都没搜到 -> 重试几次（最多 3 次）
@@ -2034,10 +2169,7 @@ export default defineComponent({
             const retry = await electronApi.searchSong(songName, true);
             if (token !== this._songToken) return;
             const retryVideos = (retry.data as { result?: BiliVideo[] } | null)?.result ?? [];
-            list = this.applyFavoriteOrder(
-              this.sortSearchedVideos(retryVideos, songName),
-              songName,
-            );
+            list = this.sortSearchedVideos(retryVideos);
             if (list.length > 0) {
               console.log(`[search] 《${songName}》第 ${attempt} 次重试成功，找到 ${list.length} 个视频`);
               res.data = retry.data as never;
@@ -2051,7 +2183,23 @@ export default defineComponent({
         this.videoList = list;
         this.videoListKeyword = songName;
         if (this.videoList.length > 0) {
+          /**
+           * 播哪个视频：**优先「上次这首歌播的那个」**
+           *
+           * 以前读的是搜索返回体里的 `selectedBvid`，那是个 bug 的来源 ——
+           * 它由 `api:resolveVideo` 写回，而那个写回要等「真的联网重新解析」才发生
+           * （缓存命中时不写）。于是切回上一首歌时读到的往往是**很久以前**那次
+           * 解析留下的 bvid，而不是上次真正在播的那个。
+           *
+           * 现在 `selected_bvid` 由 `api:resolveVideo` 在**每次切到某个视频时**写库
+           * （一行 upsert），所以这里读到的就是「上次真正在播的那个」。
+           * 搜索返回体里那份仍然兜底读一次 —— 主进程写库后立即返回的新结果会带上它，
+           * 少一次 IPC 往返。
+           */
+          const remembered = await electronApi.getSelectedBvid(songName);
+          if (token !== this._songToken) return;
           const selectedBvid =
+            remembered ||
             (res.data as { selectedBvid?: string } | null)?.selectedBvid ||
             this.videoList[0].bvid;
           await this.changeVideo(selectedBvid, songName);
@@ -2131,7 +2279,7 @@ export default defineComponent({
          * 主进程解析失败时**不抛异常**，而是回 `{ videoUrl: null, error }`。
          * 原来这里完全不看 `error`：既没有提示，`applyVideoSource()` 又因为
          * videoUrl 为空什么都不做（旧视频接着播），可 currentBvid / 标题 / 清晰度
-         * 已经被换成这个失败视频的空值，还会把它的 bvid 记进 videoCache，
+         * 已经被换成这个失败视频的空值，还会把它记成「上次播的视频」，
          * 下次续播继续踩同一个坑。所以失败必须在这里拦住。
          */
         if (res.error && !res.videoUrl && !res.dash) {
@@ -2165,8 +2313,14 @@ export default defineComponent({
         this.audioQualityDesc = res.audioQualityDesc ?? '';
         // 这个视频此刻可选的档位（切换菜单用）
         this.qualityOptions = res.options ?? null;
-        // 记录「这首歌选了哪个视频」，下次续播可直接精确还原
-        void this.recordCurrentVideo(bvid, keyword, this.videoName, this.videoPic);
+        /**
+         * 这里**不再**调 `recordCurrentVideo`。
+         *
+         * 原来它把「这首歌选了哪个视频」写进歌单的 `videoCache`。那个字段已经删掉，
+         * 而它要记的东西现在由主进程负责：`api:resolveVideo` 会写
+         * `song_meta.selected_bvid`（本次改造放宽了它的写回条件，缓存命中也写）。
+         * 渲染层再写一遍就是同一件事做两次，而且两处判据不一致时必然漂移。
+         */
       } catch (err) {
         if (token !== this._videoToken) return;
         /**
@@ -2373,7 +2527,12 @@ export default defineComponent({
     /**
      * 当前歌曲对应的视频封面（B 站缩略图）
      *
-     * 优先用正在播放的那个视频的缩略图，其次用该歌在 videoCache 里记住的封面。
+     * 优先用正在播放的那个视频的缩略图，其次用候选列表里那一条的缩略图。
+     *
+     * 这里删掉了最后那级「歌单 videoCache 里记住的封面」兜底：那个字段已经不存在，
+     * 而它记录的封面本来就来自 `videoList` 的同一项（`changeVideo` 写进去的就是
+     * `video?.pic`），所以列表里没有的时候它也不会有新东西 —— 属于查不到还会
+     * 多一次 IPC 的兜底，直接去掉。
      */
     currentVideoCover(): string | null {
       // 正在播的那个视频的缩略图：主进程随播放地址一起回传，最可靠
@@ -2384,10 +2543,7 @@ export default defineComponent({
         this.videoList.find((item) => item.bvid && item.title === this.videoName);
       const pic = normalizeImageUrl(v?.pic ?? null);
       if (pic) return pic;
-      const cached = normalizeImageUrl(
-        this.songName ? this.playlistsStore.getVideoForSong(this.songName)?.cover : null,
-      );
-      return cached;
+      return null;
     },
     /** 当前歌曲的封面：优先平台专辑图，退回视频缩略图 */
     currentCover(): string | null {
@@ -2395,37 +2551,6 @@ export default defineComponent({
       const own = normalizeImageUrl(song?.cover ?? null);
       if (own) return own;
       return this.currentVideoCover();
-    },
-    /**
-     * 收藏的视频排到最前面，并按 bvid 去重
-     *
-     * 收藏项如果这次搜索里也有，就用搜索里的新数据（标题/封面可能变了）；
-     * 搜索里没有（下架、排序变化）就用收藏时存下来的快照，保证它不会凭空消失。
-     */
-    applyFavoriteOrder(list: BiliVideo[], songName: string): BiliVideo[] {
-      const favs = this.playlistsStore.getFavorites(songName);
-      const seen = new Set<string>();
-      const out: BiliVideo[] = [];
-      for (const fav of favs) {
-        if (seen.has(fav.bvid)) continue;
-        seen.add(fav.bvid);
-        const hit = list.find((v) => v.bvid === fav.bvid);
-        out.push(
-          hit ?? {
-            bvid: fav.bvid,
-            title: fav.title,
-            pic: fav.cover ?? null,
-            author: fav.author ?? null,
-            duration: fav.duration ?? null,
-          },
-        );
-      }
-      for (const v of list) {
-        if (!v?.bvid || seen.has(v.bvid)) continue;
-        seen.add(v.bvid);
-        out.push(v);
-      }
-      return out;
     },
     /**
      * 左上角刷新（两个列表共用一个按钮）
@@ -2461,10 +2586,7 @@ export default defineComponent({
         const res = await electronApi.searchSong(songName, true);
         if (token !== this._songToken) return;
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-        this.videoList = this.applyFavoriteOrder(
-          this.sortSearchedVideos(videos, songName),
-          songName,
-        );
+        this.videoList = this.sortSearchedVideos(videos);
         this.videoListKeyword = songName;
         // 当前播放的视频可能还在列表里（下标要跟着更新），也可能被搜没了
         this.currentVideoIndex = this.videoList.findIndex((v) => v.bvid === this.currentBvid);
@@ -2474,60 +2596,52 @@ export default defineComponent({
       }
     },
     /**
-     * 时长统一成秒（收藏里存数字，展示时再格式化）
+     * 收藏 / 取消收藏视频列表里的某一项
      *
-     * B 站搜索接口给的是 `"4:03"` 这类字符串，view 接口给秒数 ——
-     * 存之前统一成秒，免得两种形状在下游到处判断。
+     * 顺序完全交给主进程：收藏会把该条挪到第一位（`videos.ord`），
+     * 取消收藏**位置不动**。所以这里不自己重排，只按返回值刷新
+     * 「哪些是收藏」+ 把变动的那一条挪到本地列表最前面 ——
+     * 如果自己重排，就会和库里的 ord 产生两套顺序。
      */
-    durationToSeconds(raw: number | string | null | undefined): number | null {
-      if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? raw : null;
-      if (typeof raw === 'string') {
-        const s = raw.trim();
-        if (!s) return null;
-        const parts = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
-        if (parts) {
-          const a = Number(parts[1]);
-          const b = Number(parts[2]);
-          const c = parts[3] ? Number(parts[3]) : 0;
-          return parts[3] ? a * 3600 + b * 60 + c : a * 60 + b;
-        }
-        const n = Number(s);
-        return Number.isFinite(n) && n > 0 ? n : null;
-      }
-      return null;
-    },
-    /** 收藏 / 取消收藏视频列表里的某一项 */
     async onToggleFavorite(bvid: string): Promise<void> {
       if (!bvid || !this.songName) return;
-      const favs = this.playlistsStore.getFavorites(this.songName);
-      if (favs.some((f) => f.bvid === bvid)) {
-        await this.playlistsStore.removeFavorite(this.songName, bvid);
-        this.videoList = this.applyFavoriteOrder(this.videoList, this.songName);
+      const songName = this.songName;
+      const isFav = this.favoriteBvids.includes(bvid);
+      try {
+        const { favorites } = await electronApi.setFavorite(songName, bvid, !isFav);
+        /**
+         * 用返回值刷新收藏标记（而不是本地取反）：主进程可能因为
+         * 「这条已经不在候选列表里」而新建一行，本地取反就与它不一致了。
+         */
+        const favSet = new Set(favorites);
+        this.videoList = this.videoList.map((v) => ({
+          ...v,
+          favorites: favSet.has(v.bvid),
+        }));
+
+        if (!isFav) {
+          /**
+           * 收藏：把该条挪到 videoList 第一位
+           *
+           * 为什么不等下次搜索：用户点了爱心，界面**当场**就该看到它跳上去，
+           * 否则会怀疑没生效。主进程那边同步也做了同样的挪动，两边一致。
+           */
+          const idx = this.videoList.findIndex((v) => v.bvid === bvid);
+          if (idx > 0) {
+            const [moved] = this.videoList.splice(idx, 1);
+            this.videoList.unshift(moved);
+          }
+        }
+        // 下标跟着列表走（挪动 / 顺序变化后必须重算，否则「正在播放」高亮会错位）
         this.currentVideoIndex = this.videoList.findIndex((v) => v.bvid === this.currentBvid);
-        return;
+      } catch (err) {
+        this.$message.error(`收藏操作失败：${this.errMsg(err)}`);
       }
-      const item = this.videoList.find((v) => v.bvid === bvid);
-      await this.playlistsStore.addFavorite(this.songName, {
-        bvid,
-        title: item?.title ?? '',
-        cover: item?.pic ?? null,
-        author: item?.author ?? null,
-        duration: this.durationToSeconds(item?.duration),
-      });
-      // 收藏项要排到最前面：立刻重排，界面不用等下次搜索
-      this.videoList = this.applyFavoriteOrder(this.videoList, this.songName);
-      this.currentVideoIndex = this.videoList.findIndex((v) => v.bvid === this.currentBvid);
     },
-    /** 「添加视频」确认：加到这首歌的收藏里（也就是列表最前面） */
+    /** 「添加视频」确认：加进候选列表并收藏（收藏 = 排在最前面） */
     async onAddVideo(info: ParsedVideoInfo): Promise<void> {
       if (!this.songName) return;
-      await this.playlistsStore.addFavorite(this.songName, {
-        bvid: info.bvid,
-        title: info.title,
-        cover: info.pic,
-        author: info.author,
-        duration: info.duration,
-      });
+      const songName = this.songName;
       if (!this.videoList.some((v) => v.bvid === info.bvid)) {
         this.videoList = [
           {
@@ -2540,7 +2654,28 @@ export default defineComponent({
           ...this.videoList,
         ];
       }
-      this.videoList = this.applyFavoriteOrder(this.videoList, this.songName);
+      try {
+        /**
+         * 走 `setFavorite` 而不是新增一个「加视频」接口：
+         * 添加的语义就是「这首歌多一个我一定要用到的候选」，也就是收藏。
+         * 主进程会在库里补插这一行（搜索没搜到的 bvid 本来不在 videos 表里），
+         * 并把它挪到第一位 —— 与收藏完全同一条路径，不需要另写一套。
+         */
+        const { favorites } = await electronApi.setFavorite(songName, info.bvid, true);
+        const favSet = new Set(favorites);
+        this.videoList = this.videoList.map((v) => ({
+          ...v,
+          favorites: favSet.has(v.bvid),
+        }));
+        const idx = this.videoList.findIndex((v) => v.bvid === info.bvid);
+        if (idx > 0) {
+          const [moved] = this.videoList.splice(idx, 1);
+          this.videoList.unshift(moved);
+        }
+      } catch (err) {
+        this.$message.error(`添加视频失败：${this.errMsg(err)}`);
+        return;
+      }
       this.currentVideoIndex = this.videoList.findIndex((v) => v.bvid === this.currentBvid);
       this.$message.success(`已添加《${info.title || info.bvid}》`);
     },
@@ -2617,37 +2752,6 @@ export default defineComponent({
       }
     },
 
-    /** 把当前选定的视频写进歌单（用于续播精确还原）
-     *
-     * @param song  「这首歌」的搜索键。由调用方显式传入而不是读 this.songName，
-     *              因为切歌后 this.songName 已经是新歌，而这次解析可能属于上一首。
-     * @param title 正在播的视频标题（主进程回传）
-     * @param cover 正在播的视频封面（主进程回传）
-     */
-    async recordCurrentVideo(
-      bvid: string,
-      song: string,
-      title = '',
-      cover = '',
-    ): Promise<void> {
-      if (!song || !bvid) return;
-      const hit = this.videoList.find((v) => v.bvid === bvid);
-      // 已有的记录不要被空值覆盖：写坏一次就会一直续播成「无标题、无封面」
-      const existing = this.playlistsStore.getVideoForSong(song);
-      const finalTitle = title || hit?.title || existing?.title || '';
-      const finalCover =
-        cover || normalizeImageUrl(hit?.pic ?? null) || existing?.cover || null;
-      try {
-        await this.playlistsStore.setVideoForSong(song, {
-          bvid,
-          title: finalTitle,
-          // 一并记住封面（规整成绝对 https），续播时列表里也能显示缩略图
-          cover: finalCover,
-        });
-      } catch (err) {
-        console.warn('[playlist] 记录视频失败', err);
-      }
-    },
     /**
      * 记录当前播放信息（歌单 / 歌曲下标 / 视频 / 进度）
      *
@@ -2725,11 +2829,19 @@ export default defineComponent({
       };
       this.settingStore.update(patch);
       this.playlistsStore.setLastIndex(this.currentIndex);
+      /**
+       * 退出时**不需要**再写 `selectedBvid`
+       *
+       * 它已经在每次切视频时落库了（见 `changeVideo` / `api:resolveVideo`），
+       * 这里再写一次是重复的。而且 `beforeunload` 是同步的、Electron 不会等 promise，
+       * 真要写还得依赖 `ipcRenderer.invoke` 的同步投递，属于把正确性押在一个
+       * 不好验证的行为上 —— 没必要，那条数据早就是最新的了。
+       */
     },
     /**
      * 取第 index 首歌的「搜索键」（`"歌名-歌手"`）
      *
-     * 匹配打分、搜索缓存 key、videoCache key 全部沿用这个格式，
+     * 匹配打分、搜索缓存 key、收藏/选中视频的 key 全部沿用这个格式，
      * 所以曲目改成结构化对象后，这里统一用 toSearchKey 兼容旧链路。
      */
     getSongName(index: number): string | null {
@@ -2741,43 +2853,11 @@ export default defineComponent({
     getSong(index: number): StructuredSong | null {
       return this.songs[index] ?? null;
     },
-    matchScore(title: string, keywords: string): number {
-      const t = (title || '').replace(/<[^>]*>/g, '').toLowerCase();
-      const k = keywords.toLowerCase().replace(/\s/g, '');
-      let score = 0;
-      let remaining = t;
-      for (const ch of k) {
-        const idx = remaining.indexOf(ch);
-        if (idx !== -1) {
-          score++;
-          remaining = remaining.slice(0, idx) + remaining.slice(idx + 1);
-        }
-      }
-      return score;
-    },
-    tagBonus(title: string): number {
-      const t = (title || '').replace(/<[^>]*>/g, '');
-      let bonus = 0;
-      for (const [score, keywords] of Object.entries(this.tagBonusConfig)) {
-        for (const kw of keywords) {
-          if (t.toLowerCase().includes(kw.toLowerCase())) {
-            bonus += Number(score);
-          }
-        }
-      }
-      return bonus;
-    },
-    nameBonus(title: string, songName: string, artistName: string): number {
-      if (!title) return 0;
-      const t = title.replace(/<[^>]*>/g, '');
-      let bonus = 0;
-      const songMatch = songName && t.includes(songName);
-      const artistMatch = artistName && t.includes(artistName);
-      if (songMatch) bonus += 5;
-      if (artistMatch) bonus += 3;
-      if (songMatch && artistMatch) bonus += 5;
-      return bonus;
-    },
+    /*
+     * `matchScore` / `tagBonus` / `nameBonus` 三个打分函数已**移到主进程**：
+     * 见 `@common/utils/videoRank`。它们现在由 `api:searchSong` 在写库前调用，
+     * 好让 `videos.ord` 直接等于最终显示顺序。渲染层不再需要它们。
+     */
     next(): void {
       if (!this.songs || this.songs.length === 0) return;
       const index =

@@ -16,34 +16,20 @@ export interface PlaylistSync {
   intervalMs: number
 }
 
-/** 一首歌的 B 站视频 */
-export interface VideoRef {
-  bvid: string
-  title: string
-  /** 视频封面（B 站缩略图） */
-  cover?: string | null
-  /** 用户/匹配选定的时间戳 */
-  pickedAt: number
-}
-
 /**
- * 一首歌「收藏」的视频
+ * 一首歌「收藏」的视频、以及「上次播的是哪个视频」，**都已经不在这个文件里了**。
  *
- * 收藏是**按歌**记的：重新搜索这首歌时，收藏的条目要固定排在最前面，
- * 所以除了 bvid 还要把标题 / 封面 / UP 主一起存下来 ——
- * 否则搜索没搜到它的时候（下架、改名、排序变化）列表里就只剩一个空壳。
+ * 改造后它们存在 SQLite 的 `videos` / `song_meta` 两张表中（见
+ * `electron/main/utils/cache.ts` 的 `VideoRow` 与收藏相关函数）：
+ *  - 收藏：`videos.favorites` + `videos.ord`（顺带承载列表顺序）
+ *  - 上次播的：`song_meta.selected_bvid`
+ *
+ * 为什么搬走：两者都是**按搜索键**索引、且带「列表顺序」语义的数据，
+ * 和歌单（按 id 索引、全量覆盖）的写入节奏完全不同。以前塞在歌单记录里，
+ * 每次切歌/收藏都要把整个歌单集合 `savePlaylists` 全量覆盖一遍，
+ * 同步进行时还会被 `syncingIds` 拦下来（收藏丢了都没人知道）。
+ * 原来的 `VideoRef` / `FavoriteVideo` 两个接口因此一并删除。
  */
-export interface FavoriteVideo {
-  bvid: string
-  title: string
-  cover?: string | null
-  /** UP 主 */
-  author?: string | null
-  /** 时长（秒） */
-  duration?: number | null
-  /** 收藏时间（毫秒时间戳） */
-  savedAt: number
-}
 
 /**
  * 歌单里的一首歌（结构化）
@@ -58,8 +44,14 @@ export interface PlaylistSong {
   album?: string
   /** 音乐平台给的专辑封面；可能为空（如酷我列表接口不返回封面） */
   cover?: string | null
-  /** 时长 mm:ss */
-  duration?: string | null
+  /**
+   * 时长（**秒**）
+   *
+   * 原来存的是音乐平台原样给的 `"4:03"` 字符串，而候选视频那边
+   * （`videos.duration`）一直是秒 —— 两种形状在下游到处判断。
+   * schema v2 起统一成秒，展示时用 `formatDuration()` 转回 `mm:ss`。
+   */
+  duration?: number | null
 }
 
 /**
@@ -98,14 +90,6 @@ export interface PlaylistRecord {
   updatedAt: number
   /** 该歌单上一次播放到第几首 */
   lastIndex: number
-  /** key = `"歌名-歌手"`（toSearchKey），value = 已选定的视频 */
-  videoCache?: Record<string, VideoRef>
-  /**
-   * key = `"歌名-歌手"`（toSearchKey），value = 这首歌收藏的视频
-   *
-   * 收藏项在视频列表里固定排在最前面，并且重新搜索时不会丢（去重按 bvid）。
-   */
-  favorites?: Record<string, FavoriteVideo[]>
 }
 
 

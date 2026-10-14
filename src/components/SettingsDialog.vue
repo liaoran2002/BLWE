@@ -205,6 +205,30 @@
           />
         </div>
         <div class="st-row">
+          <div class="st-name">搜索结果过期时间</div>
+          <div class="st-actions">
+            <!--
+              单位是「天」，存的是毫秒，所以读写都要换算（见 expireDays / setExpireDays）。
+              `el-input-number` 自带左右加减按钮，正好用来一档一档地点。
+
+              「0 = 永久」用**旁边的说明文字**表达，没有用 formatter/parser：
+              那对钩子会把输入框里的文本和 v-model 的数字来回转换，
+              用户手输（尤其是清空、只留一个「0」）时的行为不容易验证，
+              而这里要表达的只是「0 是什么意思」，一句话就够清楚了。
+            -->
+            <el-input-number
+              :model-value="expireDays"
+              size="small"
+              style="width: 130px"
+              :min="CACHE_EXPIRE_DAYS_MIN"
+              :max="CACHE_EXPIRE_DAYS_MAX"
+              :step="CACHE_EXPIRE_DAYS_STEP"
+              @update:model-value="(v: number | undefined) => setExpireDays(v)"
+            />
+            <span class="st-desc">{{ expireHint }}</span>
+          </div>
+        </div>
+        <div class="st-row">
           <div class="st-name">搜索缓存</div>
           <div class="st-actions">
             <span class="st-desc">{{ cacheText }}</span>
@@ -241,6 +265,9 @@ import {
   ASPECT_RATIO_OPTIONS,
   ASPECT_RATIO_PATTERN,
   AUDIO_QUALITY_OPTIONS,
+  CACHE_EXPIRE_DAYS_MAX,
+  CACHE_EXPIRE_DAYS_MIN,
+  CACHE_EXPIRE_DAYS_STEP,
   CUSTOM_ASPECT_RATIO_MAX_COUNT,
   GLASS_BLUR_PERCENT_PER_PX,
   GLASS_BLUR_PERCENT_STEP,
@@ -249,6 +276,7 @@ import {
   GLASS_TRANSPARENCY_MAX,
   GLASS_TRANSPARENCY_MIN,
   GLASS_TRANSPARENCY_STEP,
+  MS_PER_DAY,
   VIDEO_QUALITY_OPTIONS,
 } from '@common/constants';
 import type { AppSetting } from '@common/types/app_setting';
@@ -297,6 +325,10 @@ export default defineComponent({
       /** 模糊强度 / 阴影强度：滑块是百分比（0-100%，5% 一档），存的却是 0-20px */
       GLASS_BLUR_PERCENT_STEP,
       GLASS_SHADOW_PERCENT_STEP,
+      /** 搜索结果过期时间：界面按「天」，范围与步进都从常量来 */
+      CACHE_EXPIRE_DAYS_MIN,
+      CACHE_EXPIRE_DAYS_MAX,
+      CACHE_EXPIRE_DAYS_STEP,
     };
   },
   computed: {
@@ -316,7 +348,26 @@ export default defineComponent({
     },
     cacheText(): string {
       const { count, bytes } = this.cacheStats;
-      return `${count} 个文件 / ${formatBytes(bytes)}`;
+      return `${count} 个视频 / ${formatBytes(bytes)}`;
+    },
+    /**
+     * 搜索结果过期时间：界面上的「天」
+     *
+     * 存储是毫秒（`cache.searchResultExpireMs`），界面按天 —— 用户不会想输 259200000。
+     * 换算在这里做一次，别的地方一律用毫秒。
+     */
+    expireDays(): number {
+      return Math.round(this.setting['cache.searchResultExpireMs'] / MS_PER_DAY);
+    },
+    /**
+     * 过期时间那一行的说明文字
+     *
+     * **0 必须被说出来**：它是有意义的选项（永久不清理播放直链），
+     * 而不是「填了个很小的数」。光看一个「0」用户没法知道这是「马上过期」还是「不过期」，
+     * 而这两种理解的后果完全相反。
+     */
+    expireHint(): string {
+      return this.expireDays === 0 ? '永久（不清理播放地址）' : '天后重新解析播放地址';
     },
     /**
      * 下拉框的选项 = 固定预设 + 用户自己输入过的比例
@@ -448,6 +499,21 @@ export default defineComponent({
         this.set('common.customAspectRatios', next);
       }
     },
+    /**
+     * 设置搜索结果过期时间（界面输入「天」，存储「毫秒」）
+     *
+     * 做了三件收敛：
+     *  1. 输入框可能回 `undefined`（用户清空），按 0 处理 —— 0 就是「永久」，
+     *     语义上比「保持上一次的值」更贴近用户的意图（他刚把内容删了）；
+     *  2. 夹进 `[MIN, MAX]`：手输可以越过 `:min` / `:max`（Element Plus 只在
+     *     步进/失焦时钳制），而超出上限的毫秒值没有意义；
+     *  3. 取整：小数点后的「天」没有意义，还会让毫秒值变成小数。
+     */
+    setExpireDays(v: number | undefined): void {
+      const days = Math.round(Number(v) || 0);
+      const clamped = Math.min(CACHE_EXPIRE_DAYS_MAX, Math.max(CACHE_EXPIRE_DAYS_MIN, days));
+      this.set('cache.searchResultExpireMs', clamped * MS_PER_DAY);
+    },
     async clearCache() {
       this.cacheBusy = true;
       try {
@@ -460,13 +526,20 @@ export default defineComponent({
         this.cacheBusy = false;
       }
     },
-    /** 手动触发一次「过期 + LRU」清理 */
+    /**
+     * 手动触发一次过期清理
+     *
+     * 注意现在**只清播放地址那一批列**（`durl_url` / `dash_video` / `dash_audio` /
+     * `quality` / `support_formats` / `playurl_at`），不再有 LRU 淘汰 ——
+     * 元数据（标题/封面/收藏/顺序）永不过期，所以清理之后条数不会变少，
+     * 只有体积会掉下来。
+     */
     async pruneCache() {
       this.cacheBusy = true;
       try {
         const stats = await api.pruneCache();
         this.cacheStats = stats;
-        ElMessage.success(`清理完成，当前 ${stats.count} 个文件 / ${formatBytes(stats.bytes)}`);
+        ElMessage.success(`清理完成，当前 ${stats.count} 个视频 / ${formatBytes(stats.bytes)}`);
       } catch (err) {
         ElMessage.error(err instanceof Error ? err.message : String(err));
       } finally {

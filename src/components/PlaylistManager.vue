@@ -216,7 +216,7 @@
                   </span>
                 </div>
               </div>
-              <div class="plm-song-dur">{{ row.song.duration || '' }}</div>
+              <div class="plm-song-dur">{{ formatDuration(row.song.duration) }}</div>
             </div>
             <div v-if="filtered.length === 0" class="plm-empty">
               {{ selected.songs.length === 0 ? '这个歌单还没有曲目' : '没有匹配的歌曲' }}
@@ -236,6 +236,8 @@ import { ElMessage } from 'element-plus';
 import { SOURCE_LABELS, SYNC_INTERVAL_OPTIONS } from '@common/constants';
 import type { PlaylistRecord, PlaylistSong } from '@common/types/playlist';
 import { parseSearchKey } from '@common/types/playlist';
+// 库里存的是**秒**（schema v2 起统一），展示要转回 mm:ss；反向转换在解析音源时用
+import { durationToSeconds, formatDuration } from '@common/utils/duration';
 import api from '../api/electron';
 import { usePlaylistStore } from '../stores/playlists';
 import { normalizeImageUrl } from '../utils/image';
@@ -354,6 +356,13 @@ export default defineComponent({
     coverOf(song: PlaylistSong): string | null {
       return normalizeImageUrl(song.cover);
     },
+    /**
+     * 时长（秒 -> `mm:ss`）给模板用
+     *
+     * 曲目行显示时长走这个方法，而不是直接 `{{ song.duration }}` ——
+     * 库里存的是秒（`402`），直接显示会变成「402」而不是「06:42」。
+     */
+    formatDuration,
     isPlayingRow(row: Row): boolean {
       // 只有展示的是「当前播放歌单」时才高亮当前曲
       if (this.selected?.id !== this.store.currentId) return false;
@@ -446,7 +455,8 @@ export default defineComponent({
             singer: s.singer,
             album: s.albumName,
             cover: s.cover ?? null,
-            duration: s.interval,
+            // 音源给的是 "4:03" 这类字符串，库里存秒（schema v2 起统一）
+            duration: durationToSeconds(s.interval),
           }));
           source = detail.source;
           remoteName = detail.info.name || '';

@@ -2,8 +2,10 @@
  * 歌单 IPC
  *
  * 只保留新版 `playlists:*`（多歌单集合 + 同步）。
- * 旧的单歌单接口 `playlist:get` / `playlist:save` 全项目没有任何调用方，
- * 已经删掉；旧的 `playlist.json` 只在启动时被 `utils/playlist.ts` 当迁移源读一次。
+ * 旧的单歌单接口 `playlist:get` / `playlist:save` 全项目没有任何调用方，已经删掉。
+ *
+ * 存储已经是 SQLite（`utils/playlist.ts` + `utils/db.ts`），
+ * 旧的 `playlist.json` / `playlists.json` **不再读也不再迁移**（用户明确要求）。
  */
 import { mainHandle } from '@common/mainIpc'
 import {

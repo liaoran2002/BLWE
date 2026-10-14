@@ -29,6 +29,7 @@ import {
   onSettingChange,
 } from './utils/setting'
 import * as biliApi from './biliApi'
+import * as cacheManager from './utils/cache'
 import { initPlaylists, flushPlaylists } from './utils/playlist'
 import { PLAY_LOOP_MODES, parseAspectRatio } from '@common/constants'
 import {
@@ -1458,6 +1459,24 @@ void app.whenReady().then(async () => {
      */
     if (keys.includes('common.windowAspectRatio') && !isFullScreen && !wallpaperEnabled) {
       applyAspectRatio()
+    }
+    /**
+     * 「搜索结果过期时间」改小了要立刻见效
+     *
+     * 这个值只在**清理时**被读取（`prune` / 启动时的一次），所以如果不在改动的当下
+     * 跑一遍清理，用户把 365 天改成 0 天之后**看不到任何变化**（既没有地址被清，
+     * 也没有日志），会以为设置没生效。这里改成变化时立刻清一次：
+     * 新值更短就真清掉一批，更长（或 0=永久）时这次 `clearExpiredPlayurl`
+     * 自然什么都不做 —— 于是「改设置 -> 立刻看到结果」是成立的。
+     */
+    if (keys.includes('cache.searchResultExpireMs')) {
+      /**
+       * 用 `_updated` 里的**新值**而不是 `getSetting()`：两者此时一致，
+       * 但显式取新值能表明「本次变化就是要用这个值算过期」，不会被以后
+       * 改动 updateSetting 的时序搞坏（比如将来改成先广播再落内存）。
+       */
+      const maxAge = Number(_updated['cache.searchResultExpireMs']) || 0
+      cacheManager.clearExpiredPlayurl(maxAge)
     }
     refreshTray()
   })

@@ -2,9 +2,18 @@
  * B 站接口相关 IPC
  *
  * 逻辑与迁移前的 electron/ipcHandlers.js 保持一致，仅补充类型。
+ *
+ * 本次数据层改造后这里有两处**行为**变化（都是需求，不是顺手改的）：
+ *  1. `api:searchSong` 用「主进程合并」产出的顺序取代了渲染层的 `applyFavoriteOrder`：
+ *     收藏项在前、保持相对顺序，新结果接在后面 —— 渲染层拿到的顺序就是最终顺序。
+ *  2. `api:resolveVideo` 原来靠「整包读缓存 → 改一条 → 整包写回」来落盘解析结果，
+ *     现在改成按主键更新一行（见 cache.ts 的 `updateVideoResult`），
+ *     那段「写回前重读一次再合并、且只挑本次动过的那一条覆盖」的防御逻辑随之删除。
  */
 import { mainHandle } from '@common/mainIpc'
 import { AUDIO_QUALITY_OPTIONS, findQualityOption, qualityLabelOf } from '@common/constants'
+import { sortByRelevance } from '@common/utils/videoRank'
+import { durationToSeconds } from '@common/utils/duration'
 import * as biliApi from '../biliApi'
 import { isUrlUsable, readQualityOptions } from '../biliApi'
 import type { DashStreams } from '../biliApi'
@@ -25,19 +34,19 @@ interface ApiContext {
  *
  * `title` / `pic` / `author` 等字段直接来自 B 站搜索接口，
  * 解析播放地址时**必须原样保留**（见 resolveVideo 里的合并注释）。
+ *
+ * **这里不再有 `view_result` / `playurl_result`**：schema v2 把解析结果拆成了
+ * `videos` 表上的结构化列，`cache.listVideos()` 交出来的 `VideoRow.playurl`
+ * 是拼好的最小响应形状，够喂给 `extractDashStreams` / `readQualityOptions`。
  */
 interface CachedSearchItem {
   bvid: string
   title?: string
   pic?: string
   author?: string
-  duration?: number
-  view_result?: BiliApiResponse
-  playurl_result?: BiliApiResponse & {
-    loginState?: boolean
-    /** 这次解析有没有试过 dash（试过但没拿到，下次就别反复重取） */
-    dashTried?: boolean
-  }
+  duration?: number | string | null
+  /** 是否已收藏；由主进程写入并回传，渲染层据此显示实心爱心 */
+  favorites?: boolean
   [key: string]: unknown
 }
 
@@ -48,60 +57,112 @@ interface SearchPayload {
   data?: {
     result?: CachedSearchItem[]
     selectedBvid?: string
+    [key: string]: unknown
   }
+  [key: string]: unknown
 }
 
 /**
  * 「缓存地址已过期」的原因（写在注释里，日志保持一行）
  *
- * 直链寿命约 2 小时、缓存却有 3 天，隔一阵再听就会成片过期 ——
+ * 直链寿命约 2 小时、元数据永不过期，隔一阵再听就会成片过期 ——
  * 属于预期内现象，所以不单独做日志闸门，直接在下面注释说明。
  */
 
-/**
- * 取 durl（渐进式 mp4）地址
+/*
+ * 注意：这里**没有** `extractDurl`。
  *
- * dash 的双轨不在这里处理 —— 它需要两条流一起给，见 `extractDashStreams`。
+ * 它现在只在 `cache.ts` 里有一份（写库时提取 `durl_url` 用）。读缓存那条路
+ * 改成结构化列之后，handler 不再需要自己从响应里抠地址 —— 而「优先常规 CDN
+ * 的备用地址」这条规则一旦两处各写一份，改一处漏一处就会出现「有的视频放不出来」。
  */
-const extractDurl = (playData: BiliApiResponse | undefined): string | null => {
-  const durl = (
-    playData?.data as
-      | { durl?: Array<{ url?: string; backup_url?: string[]; backupUrl?: string[] }> }
-      | undefined
-  )?.durl
-  const first = durl?.[0]
-  if (!first) return null
-  // 和 biliApi 那边同一套规则：`url` 可能是 P2P 节点（普通请求 403），优先用常规 CDN 的备用地址
-  return biliApi.pickNormalCdnUrl(first.url, first.backup_url ?? first.backupUrl)
-}
 
 /**
- * 用 `view_result` 里的信息补齐搜索条目缺失的 `title` / `pic`
+ * 合并「收藏项 + 本次新搜索结果」
  *
- * 旧版本解析播放地址时把条目整个替换成 `{ bvid, view_result, playurl_result }`，
- * 丢掉了标题和封面并写回了缓存。这类坏数据不会自己好：
- * 缓存命中时走的是「地址还能用」分支，根本不会碰条目。
- * 所以每次解析都顺手回填一次，让坏缓存随使用自愈。
+ * 顺序规则（用户明确要求，顺序不能错）：
+ *  1. 已收藏的条目保留在数组**最前面**，且保持它们**原有的相对顺序**；
+ *  2. 新搜索结果里同 bvid 的：用它**覆盖**元数据（标题/封面/UP主/时长），
+ *     但保留 `favorites` 标记；
+ *  3. 其余新结果接在收藏项后面；
+ *  4. 最后再回源刷新「新结果里没有的收藏项」的标题/封面。
+ *
+ * 为什么必须在主进程合并：渲染层只看得到「最终列表」，
+ * 如果让渲染层自己把收藏插到前面，那「哪些是新搜到的、哪些是收藏快照」
+ * 就只有它知道，重新搜索时又得再拼一次 —— 两处各拼一次必然对不上。
+ *
+ * 调用点只有一处（空结果那条路先返回了，不会走到这里），所以不做
+ * 「要不要回源刷新」的参数 —— 一个永真的开关只会让人以为它可配。
  */
-const backfillFromView = (item: CachedSearchItem): CachedSearchItem => {
-  const info = item.view_result?.data
-  const title =
-    typeof item.title === 'string' && item.title
-      ? item.title
-      : typeof info?.title === 'string'
-        ? info.title
-        : undefined
-  const pic =
-    typeof item.pic === 'string' && item.pic
-      ? item.pic
-      : typeof info?.pic === 'string'
-        ? info.pic
-        : undefined
-  return {
-    ...item,
-    ...(title ? { title } : {}),
-    ...(pic ? { pic } : {}),
+const mergeWithFavorites = async (
+  freshItems: CachedSearchItem[],
+  oldRows: ReturnType<typeof cacheManager.listVideos>,
+): Promise<CachedSearchItem[]> => {
+  const favoriteRows = oldRows.filter((row) => row.favorites)
+  const freshByBvid = new Map<string, CachedSearchItem>()
+  for (const item of freshItems) {
+    if (item?.bvid) freshByBvid.set(item.bvid, item)
   }
+
+  const merged: CachedSearchItem[] = []
+  const seen = new Set<string>()
+
+  // 规格里的第 1、2 条：收藏项在前（保持相对顺序），元数据以新搜索结果为准
+  for (const row of favoriteRows) {
+    if (seen.has(row.bvid)) continue
+    seen.add(row.bvid)
+    const hit = freshByBvid.get(row.bvid)
+    merged.push(
+      hit
+        ? { ...hit, bvid: row.bvid, favorites: true }
+        : {
+            bvid: row.bvid,
+            title: row.title,
+            pic: row.pic ?? undefined,
+            author: row.author ?? undefined,
+            duration: row.duration ?? undefined,
+            favorites: true,
+          },
+    )
+  }
+
+  /**
+   * 规格里的第 3 条（顺序上的最后一步）：其余新结果接在收藏项后面
+   *
+   * 注意这一步在**回源刷新之前**完成（见下面第 4 条）：先把列表顺序定死，
+   * 再去做那个会用几秒的网络请求。
+   */
+  for (const item of freshItems) {
+    if (!item?.bvid || seen.has(item.bvid)) continue
+    seen.add(item.bvid)
+    merged.push({ ...item, favorites: false })
+  }
+
+  /**
+   * 规格里的第 4 条：新结果里没有的收藏项，回源补标题 / 封面
+   *
+   * **必须是最后一步**（用户特别强调了顺序）：它是逐个 await 的网络请求，
+   * 要是插在拼装过程中间，整个列表的顺序就得等网络跑完才定得下来；
+   * 放在最后，它只在这条 item 上原地改 title / pic，动不了任何顺序。
+   */
+  for (const item of merged) {
+    if (!item.favorites || freshByBvid.has(item.bvid)) continue
+    try {
+      const info = await biliApi.parseVideoInput(item.bvid)
+      if (info.title) item.title = info.title
+      if (info.pic) item.pic = info.pic
+      if (info.author) item.author = info.author
+      if (typeof info.duration === 'number') item.duration = info.duration
+    } catch (err) {
+      /**
+       * 刷新失败**不能**影响这次搜索：收藏项的标题/封面在库里本来就有一份，
+       * 刷不出来就继续用旧的（列表里也不会变成空壳）。
+       */
+      console.warn(`[search] 刷新收藏视频信息失败（沿用已存的值）: ${item.bvid}`, err)
+    }
+  }
+
+  return merged
 }
 
 export const registerApiHandlers = (context: ApiContext): void => {
@@ -115,11 +176,11 @@ export const registerApiHandlers = (context: ApiContext): void => {
     }
 
     /**
-     * `skipCache`（视频列表的刷新按钮）会真的重新搜一次。
+     * 缓存命中直接返回（`skipCache` 是视频列表的刷新按钮，会真的重搜）。
      *
-     * 重新搜到的结果**不带** view/playurl 数据，直接写回会把缓存里已解析好的
-     * dash 地址全冲掉（下次每首都要重解析），所以这里与旧条目做一次合并：
-     * 同一个 bvid 保留旧的 view_result / playurl_result。
+     * 缓存的整包内容已经由 `cacheManager.get` 按 `videos.ord` 拼好，
+     * 也就是「收藏在前、其余按上次搜索顺序」—— 与下面重新搜索后的合并结果同构，
+     * 所以这里不需要再做任何排序。
      */
     const cached = cacheEnabled() ? await cacheManager.get<SearchPayload>(keyword) : null
     if (cached && cached.data && !skipCache) {
@@ -133,12 +194,48 @@ export const registerApiHandlers = (context: ApiContext): void => {
     if (result.code !== 0) {
       throw new Error(result.message ?? '搜索失败')
     }
+
+    /**
+     * 记下**这份搜索结果是在什么登录态下取的**（`song_meta.search_login_state`）。
+     *
+     * 为什么和 `videos.playurl_login_state` 分开：两者是**不同时刻、不同请求**的快照 ——
+     * 搜索可能几小时前就做了，而播放地址是刚刚解析的。合成一个字段必然互相覆盖。
+     *
+     * 用途：未登录时 B 站只返回部分结果（这正是界面提示「登录后再试」的依据），
+     * 有了这个快照就能判断「这份结果该不该在登录后重搜」。
+     *
+     * `ensureLoginState()` 可能返回 `null`（这次没问到）—— 那时**不覆盖**已有值，
+     * 因为「未知」不等于「未登录」：把未知写成 0，下次登录后就会白重搜一遍。
+     */
+    if (cacheEnabled()) {
+      try {
+        cacheManager.setSearchLoginState(keyword, await biliApi.ensureLoginState())
+      } catch (err) {
+        // 登录态记不上不影响搜索结果本身，别让它把整次搜索搞失败
+        console.warn('[search] 记录搜索登录态失败（忽略）:', err)
+      }
+    }
+
     const results = result.data?.result
     if (Array.isArray(results)) {
       result.data!.result = results.filter(
         (item) => (item as { type?: string }).type === 'video',
       )
     }
+
+    const freshItems = (
+      Array.isArray(result.data?.result) ? result.data.result : []
+    ) as CachedSearchItem[]
+
+    /**
+     * 旧数据（收藏项要从这里取）在**合并之前**读一次。
+     *
+     * 为什么不复用上面那份 `cached`：`skipCache` 时压根没读缓存，
+     * 而「刷新列表」恰恰是最需要保住收藏顺序的场景 ——
+     * 那时候 `cached` 是 null，用它当收藏来源等于「一刷新收藏全散了」。
+     */
+    const oldRows = cacheEnabled() ? cacheManager.listVideos(keyword) : []
+
     /**
      * **空结果不写缓存**（踩过）
      *
@@ -151,38 +248,110 @@ export const registerApiHandlers = (context: ApiContext): void => {
      * 所以这里直接跳过写入：空结果永远不落盘，下次自然就是真实搜索。
      * 注意判断的是**过滤后的视频条数**，不是 `code` —— B 站有时会正常返回
      * 但 `result` 里全是非视频条目（番剧 / 专栏），对播放器来说等于空。
+     *
+     * **这里刻意不把「库里已有的收藏项」拼进返回值**（虽然规则 1-4 也说得通）。
+     * 渲染层的 `changeSong` 是靠 `list.length === 0` 判断「要不要重试 3 次」的，
+     * 返回收藏项会让它认为搜索成功了，从而**吞掉那 3 次重试** ——
+     * 一次偶发空结果就直接少一批候选，而重试本来正是为了救这种情况。
+     * 收藏项并没有丢：它们还在 `videos` 表里，下一次搜索成功就会出现在最前面。
      */
-    const videoCount = Array.isArray(result.data?.result) ? result.data.result.length : 0
+    const videoCount = freshItems.length
     if (videoCount === 0) {
       console.warn(`[search] 《${keyword}》搜索结果为空，不写入缓存（避免把偶发失败固化）`)
-    } else if (cacheEnabled()) {
-      const oldItems = (cached?.data as unknown as SearchPayload | undefined)?.data?.result
-      const oldByBvid = new Map<string, CachedSearchItem>()
-      if (Array.isArray(oldItems)) {
-        for (const item of oldItems) {
-          if (item?.bvid) oldByBvid.set(item.bvid, item)
-        }
-      }
-      if (oldByBvid.size > 0 && Array.isArray(result.data?.result)) {
-        result.data.result = (result.data.result as CachedSearchItem[]).map((item) => {
-          const old = item?.bvid ? oldByBvid.get(item.bvid) : undefined
-          if (!old) return item
-          // 旧数据打底、新搜索结果覆盖标题/封面等展示字段，但保留解析结果
-          return {
-            ...old,
-            ...item,
-            view_result: old.view_result,
-            playurl_result: old.playurl_result,
-          }
-        })
-      }
-      await cacheManager.save(keyword, result)
+      return { data: { ...(result.data ?? {}), result: [] } }
     }
-    return { data: result.data ?? [] }
+
+    const merged = await mergeWithFavorites(freshItems, oldRows)
+
+    /**
+     * **在这里把「其余候选」按打分排好，然后才写库** —— 顺序不能颠倒
+     *
+     * 这是这次改动要解决的核心不一致：库里的 `videos.ord` 原来只是
+     * 「收藏 + 其余按 B 站返回顺序」，而渲染层拿到列表后又按打分重排一遍，
+     * 于是**界面顺序和库里的顺序是两套**（`sortSearchedVideos` 那层）。
+     * 后果是「收藏再取消来提升顺序」这类依赖持久化顺序的用法一刷新就散。
+     *
+     * 现在打分搬到主进程（`@common/utils/videoRank`，与渲染层共用同一份实现），
+     * **写库前**就排好，`ord` 直接等于用户看到的顺序。渲染层不再排序。
+     *
+     * 注意 `save()` 是按数组下标写 `ord`，所以这一步必须在 `save` 之前。
+     */
+    const ordered = sortByRelevance(merged, keyword, getSetting()['player.tagBonus'])
+
+    if (cacheEnabled()) {
+      /**
+       * 传整包（`{ code, data: { result, selectedBvid } }`）而不是里面的 `data`：
+       * `cacheManager.save` 按这个形状拆列，而 `selectedBvid` 也要一起落到 `song_meta`。
+       *
+       * `save` 会保留库里已有的 `favorites`（新搜索结果里没有「收藏」这个概念），
+       * 而 `view_result` / `playurl_result` 已经搬去 `video_details`，压根不会被碰到。
+       */
+      await cacheManager.save(keyword, {
+        ...result,
+        data: { ...(result.data ?? {}), result: ordered },
+      })
+    }
+    return { data: { ...(result.data ?? {}), result: ordered } }
   })
 
   /** 「添加视频」：把用户粘贴的链接 / BV 号解析成可预览的信息 */
   mainHandle('api:parseVideo', async ({ input }) => biliApi.parseVideoInput(input))
+
+  /**
+   * 收藏 / 取消收藏
+   *
+   * 返回收藏后的完整列表是刻意为之：**顺序由主进程的 `videos.ord` 决定**
+   * （收藏时挪到第一位、取消收藏位置不动），只有主进程知道权威结果。
+   * 返回 void 的话渲染层只能自己猜「现在排第几」，迟早和库里不一致。
+   */
+  mainHandle('api:setFavorite', async ({ searchKey, bvid, favorite }) => {
+    /**
+     * 收藏一个「库里还没有」的视频时，先把它的元数据补上
+     *
+     * 典型场景就是「添加视频」：用户粘贴一个 BV 号，那个视频很可能**不在**
+     * 这首歌的搜索结果里（否则他直接点列表就行了），所以 `videos` 表里没有这一行。
+     * `setFavorite` 会补插一行，但那时标题/封面是空的 —— 而界面刚通过
+     * `api:parseVideo` 拿到过完整信息，不写进去的话下次刷新列表它就成了一条
+     * 只有 BV 号的空壳。
+     *
+     * 为什么在这里回源而不是让渲染层把信息传进来：IPC 的参数形状是定好的
+     * （`{ searchKey, bvid, favorite }`），不该为了这一件事改契约；
+     * 而 `parseVideoInput` 本来就是这个 BV 号必跑的一步（`AddVideoDialog` 已经调过一次），
+     * 主进程再取一次只是多一次走缓存/接口的请求。
+     *
+     * 失败**不影响收藏**：`api:searchSong` 的合并逻辑里，对「新结果里没有的收藏项」
+     * 还会再回源刷新一次，所以标题终究会被补上（那条路径本来就有）。
+     */
+    if (favorite) {
+      try {
+        const existing = cacheManager.listVideos(searchKey).find((v) => v.bvid === bvid)
+        if (!existing || !existing.title) {
+          const info = await biliApi.parseVideoInput(bvid)
+          cacheManager.upsertVideoMeta(searchKey, {
+            bvid,
+            title: info.title,
+            pic: info.pic,
+            author: info.author,
+            duration: info.duration,
+          })
+        }
+      } catch (err) {
+        console.warn(`[favorite] 补齐视频信息失败（收藏照常进行）: ${bvid}`, err)
+      }
+    }
+    cacheManager.setFavorite(searchKey, bvid, favorite)
+    return { favorites: cacheManager.getFavorites(searchKey) }
+  })
+
+  mainHandle('api:getFavoriteBvids', ({ searchKey }) => cacheManager.getFavorites(searchKey))
+
+  mainHandle('api:getSelectedBvid', ({ searchKey }) => cacheManager.getSelectedBvid(searchKey))
+
+  /*
+   * 没有 `api:setSelectedBvid`：写入在 `api:resolveVideo` 内部完成
+   * （每次真正切到某个视频时一行 upsert）。独立的 set 频道是 JSON 时代的
+   * 「攒到切歌/退出才写一次」的产物，换 SQLite 后不再需要，已删。
+   */
 
   mainHandle('api:resolveVideo', async ({ bvid, keyword, skipCache, noDash, qn, audioId }) => {
     try {
@@ -201,7 +370,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
       const wantQn = qn ?? getSetting()['player.videoQuality']
       const wantAudioId = audioId ?? getSetting()['player.audioQuality']
 
-      /** 本次是不是真的重新解析过（决定要不要写缓存，见下面的保存处） */
+      /** 本次是不是真的重新解析过（决定要不要写 playurl，见下面的保存处） */
       let resolvedFresh = false
       /** durl（渐进式 mp4）地址；走 dash 时为 null */
       let videoUrl: string | null = null
@@ -212,7 +381,14 @@ export const registerApiHandlers = (context: ApiContext): void => {
       let cached: Awaited<ReturnType<typeof cacheManager.get<SearchPayload>>> = null
       let results: CachedSearchItem[] = []
 
-      // 读取缓存（有 keyword 才走缓存逻辑）
+      /**
+       * 读缓存列表（**只有元数据**）。
+       *
+       * `cacheManager.get()` 走的是 `videos_meta` 视图，不含地址列 ——
+       * 那两段 dash JSON 每行几十 KB，300 行就是好几 MB，而这里只需要
+       * 「列表里有哪些 bvid / 收藏标记 / 顺序」。地址单独按 bvid 取一行，
+       * 见下面的 `getVideoAddress`。
+       */
       if (keyword && cacheEnabled()) {
         cached = await cacheManager.get<SearchPayload>(keyword)
         const payload = cached?.data as unknown as SearchPayload | undefined
@@ -223,32 +399,32 @@ export const registerApiHandlers = (context: ApiContext): void => {
       const targetIndex = results.findIndex((item) => item.bvid === bvid)
       let targetVideo: CachedSearchItem | undefined = results[targetIndex]
 
+      /**
+       * 这个 bvid 的**地址**（单独读一行，避免把整份列表的 dash 都拖出来）。
+       *
+       * 只在「列表里有这一项」时才有意义 —— 不在列表里说明没缓存过，
+       * 直接走下面的重新解析分支。
+       */
+      const cachedAddress = keyword && targetVideo
+        ? cacheManager.getVideoAddress(keyword, bvid)
+        : null
+
       // 分支：使用缓存 / 重新解析
-      if (targetVideo && !skipCache) {
-        const prevDashTried = targetVideo.playurl_result?.dashTried === true
-        const cachedDurl = extractDurl(targetVideo.playurl_result)
-        const cachedDash = biliApi.extractDashStreams(
-          targetVideo.playurl_result,
-          wantQn,
-          wantAudioId,
-        )
-        const hasValidData = Boolean(targetVideo.view_result && targetVideo.playurl_result)
-        /**
-         * 缓存是不是「未登录时取的」。
-         *
-         * `loginState` 是解析当时由主进程写进缓存的登录态快照。
-         * 未登录能拿到的清晰度被平台压得很低（实测只有 360P/720P），
-         * 所以「缓存是未登录时取的 + 现在已登录」必须重取，
-         * 否则登录完还得重启才看得到高清。
-         */
+      if (targetVideo && cachedAddress && !skipCache) {
+        const prevDashTried = cachedAddress.dashTried
+        const cachedDurl = cachedAddress.durlUrl
+        const cachedDash = cachedAddress.playurl
+          ? biliApi.extractDashStreams(cachedAddress.playurl, wantQn, wantAudioId)
+          : null
+        const hasValidData = Boolean(cachedAddress.playurl)
         /**
          * 缓存条目里记的登录态快照。
          *
          * **只有明确是 `false`（当时确实未登录）才值得重取**：
-         * 没有这个字段（老条目 / 当时登录态未知）不该被当成「未登录时取的」，
+         * 没有这个值（当时登录态未知）不该被当成「未登录时取的」，
          * 否则每次解析都要白重取一遍 —— 这就是「没退出登录却老在重新解析」的来源之一。
          */
-        const cachedLoginState = targetVideo.playurl_result?.loginState
+        const cachedLoginState = cachedAddress.loginState
         const loginChanged = loggedIn === true && cachedLoginState === false
         /**
          * 关键：以前只判断「缓存里有没有数据」，从不检查播放地址是否过期。
@@ -275,7 +451,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
           }
           if (!urlUsable && (cachedDurl || cachedDash)) {
             /**
-             * 这条是**预期内**的，不是故障：实测 B 站直链签名寿命中位正好 120 分钟，而搜索缓存默认留 3 天。
+             * 这条是**预期内**的，不是故障：实测 B 站直链签名寿命中位正好 120 分钟。
              * 所以「隔一阵再听」必然碰到，重新解析即可 —— 不解析反而会拿死链去播。
              */
             console.log(`[video] 缓存地址已过期，重新解析:`, bvid)
@@ -297,124 +473,35 @@ export const registerApiHandlers = (context: ApiContext): void => {
           dash = resolved.dash
           viewData = resolved.viewData
           playData = resolved.playData
-          targetVideo.view_result = viewData
-          targetVideo.playurl_result = {
-            ...playData,
-            /**
-             * 记下解析当时的登录态快照。
-             *
-             * `loggedIn` 为 `null`（这次没问到）时**保留上一次的快照**：
-             * 以前无条件写 `!!loggedIn`，一次网络抖动就把条目标成「未登录时取的」，
-             * 于是以后每次解析都判定「未登录时取的，现已登录」→ 白重取一遍。
-             */
-            ...(loggedIn === null
-              ? cachedLoginState === undefined
-                ? {}
-                : { loginState: cachedLoginState }
-              : { loginState: loggedIn }),
-            // 记下「这次试过 dash」：试过但没拿到，下次就别反复重取
-            dashTried: !noDash || prevDashTried,
-          }
+          /**
+           * 登录态与 `dash_tried` 的快照**不在这里写** —— 它们由下面的
+           * `updateVideoResult()` 统一落库，那里集中处理「未知（null）时保留旧值」
+           * 和「试过 dash 就永久记 1」两条规则。在内存对象上再写一份必然漂移。
+           */
         }
       } else {
-        // 无缓存项 / 强制跳过缓存：直接调用接口解析
+        /**
+         * 无缓存项 / 强制跳过缓存：直接调用接口解析。
+         *
+         * **这里不再往 `targetVideo` 上挂 `view_result` / `playurl_result`** ——
+         * schema v2 之后解析结果不存在内存对象里，而是由下面的
+         * `updateVideoResult()` 直接提取成 `videos` 表的列。
+         *
+         * 旧实现是 `targetVideo = { bvid, view_result, playurl_result }`，
+         * 那会把搜索结果里的 `title` / `pic` / `author` / `duration` **整个丢掉**
+         * （它们随后会被写回缓存），表现是「播放器里标题空白、封面回退不出来」。
+         * 现在展示字段根本不经手这里，那个 bug 从结构上就不可能再发生。
+         */
         resolvedFresh = true
         const resolved = await biliApi.resolveVideoUrl(bvid, {
-            noDash,
-            qn: wantQn,
-            audioId: wantAudioId,
-          })
+          noDash,
+          qn: wantQn,
+          audioId: wantAudioId,
+        })
         videoUrl = resolved.videoUrl
         dash = resolved.dash
         viewData = resolved.viewData
         playData = resolved.playData
-        /**
-         * 关键修复：这里必须**合并**而不是**替换**。
-         *
-         * 原来写的是 `targetVideo = { bvid, view_result, playurl_result }`，
-         * 于是搜索结果条目里的 `title` / `pic` / `author` / `duration` 全被丢掉；
-         * 而这个数组稍后会被写回搜索缓存（见下面的 selectedBvid 写回），
-         * 下次 searchSong 拿到的这一项就没有标题和封面了 ——
-         * 表现是播放器里视频标题空白、视频封面也回退不出来，
-         * 并且会把 `title: ''` / `cover: null` 一起写进歌单的 videoCache。
-         */
-        targetVideo = {
-          ...targetVideo,
-          bvid,
-          view_result: viewData,
-          // 登录态未知（null）时干脆不写这个字段：写了 false 就等于「未登录时取的」
-          playurl_result: {
-            ...playData,
-            ...(loggedIn === null ? {} : { loginState: loggedIn }),
-            dashTried: !noDash,
-          },
-        }
-        if (targetIndex >= 0) results[targetIndex] = targetVideo
-        else results.push(targetVideo)
-      }
-
-      // 补齐旧版本写坏的条目（缓存命中分支不会碰 title/pic，必须在这里回填）
-      if (targetVideo) {
-        targetVideo = backfillFromView(targetVideo)
-        if (targetIndex >= 0) results[targetIndex] = targetVideo
-      }
-
-      // 有 keyword 时统一更新缓存（selectedBvid + 数据）
-      /**
-       * 只有**真的重新解析过**才写回
-       *
-       * 踩过：原来只要读到过这个 keyword 的缓存就无条件整包 `save` ——
-       * 纯缓存命中、续播、预热下一首都会触发一次「同步 stringify + 写盘 + rename」
-       * （这个 JSON 最大能到几 MB），既阻塞主进程又白白磨损磁盘，而且什么都没改。
-       * （`backfillFromView` 那种老条目修补属于极少数情况，交给下次重解析一并落盘。）
-       */
-      if (keyword && cached && resolvedFresh) {
-        /**
-         * 这里存的必须是**整包返回体**（`{ code, data: { result, selectedBvid } }`），
-         * 不是里面的 `data` —— `api:searchSong` 与渲染层都按外层结构读。
-         */
-        const cachedPayload = cached.data as unknown as SearchPayload | undefined
-        if (cachedPayload?.data) {
-          /**
-           * 写回前**重新读一次**缓存再合并。
-           *
-           * 上面这段解析要跑 view + playurl 两次网络往返（秒级），期间
-           * `api:searchSong`（同一 keyword）或者用户快速切歌可能已经写了新结果；
-           * 直接把手里这份老快照整体 save 回去会把新结果覆盖掉（反向顺序则丢掉刚解析出的地址）。
-           * 两个 handler 都是 async，await 处一定会交错，所以必须合并而不是覆盖。
-           */
-          const fresh = cacheEnabled() ? await cacheManager.get<SearchPayload>(keyword) : null
-          const freshPayload = fresh?.data as unknown as SearchPayload | undefined
-          const freshResults = Array.isArray(freshPayload?.data?.result)
-            ? [...(freshPayload.data.result as CachedSearchItem[])]
-            : [...results]
-          /**
-           * 只把**本次真正动过的那一个条目**覆盖进去
-           *
-           * 踩过：这里原来遍历整份本地快照 `results`，逐条 `{...fresh, ...item}` ——
-           * 等于把「开始解析之前看到的其它条目」也一起写回去。快速连点两个候选视频
-           * （同 keyword、不同 bvid）或预热与切歌重叠时，后写的一方会用它快照里别的 bvid 的
-           * 旧 view/playurl 回滚对方刚解析出的新地址，表现就是「地址刚解析完又没了、反复重新解析」。
-           */
-          const changed = targetVideo?.bvid ? [targetVideo] : []
-          for (const item of changed) {
-            if (!item?.bvid) continue
-            const at = freshResults.findIndex((x) => x?.bvid === item.bvid)
-            if (at >= 0) freshResults[at] = { ...freshResults[at], ...item }
-            else freshResults.push(item)
-          }
-          cachedPayload.data.result = freshResults
-          cachedPayload.data.selectedBvid = bvid
-          // 其它字段（分页 / 总数之类）如果新快照有，就一起带上
-          if (freshPayload?.data && freshPayload.data !== cachedPayload.data) {
-            Object.assign(cachedPayload.data, {
-              ...freshPayload.data,
-              result: freshResults,
-              selectedBvid: bvid,
-            })
-          }
-          if (cacheEnabled()) await cacheManager.save(keyword, cachedPayload)
-        }
       }
 
       /**
@@ -427,14 +514,103 @@ export const registerApiHandlers = (context: ApiContext): void => {
        * 清晰度同理：只认 playurl 响应自己报的 `quality`
        * （请求里固定写的 qn=64 会被平台降级，不代表实际档位）。
        */
-      const viewInfo = targetVideo?.view_result?.data
+      /**
+       * **标题 / 封面 / 时长刻意来自不同来源**：
+       *  - 标题取**搜索结果**里的：它带 `<em class="keyword">` 关键词高亮，
+       *    界面上用 `sanitizeTitleHtml` 净化后 `v-html` 渲染，关键词会加粗；
+       *  - 封面取 **view 响应**里的：尺寸比搜索结果里的大；
+       *  - 时长也取 **view 响应**里的：**搜索接口有些结果压根不带 `duration`**
+       *    （实测存在），于是那些条目在视频列表里没有时长。而 view 响应里一定有
+       *    `data.duration`（秒），而这次解析**无论如何都要调 view**（为了拿 `cid`，
+       *    playurl 必须带它）—— 白拿的数据就该用来补上。
+       *
+       * `viewData` 只在这次真的联网解析过时才有值；纯缓存命中时它是 undefined，
+       * 那时就退回库里存的那份（`targetVideo.pic` / `title` / `duration`）。
+       *
+       * 补时长的效果不止「补插新行」：`updateVideoResult` 里更新已有行的那条 SQL 是
+       * `duration = COALESCE(duration, ?)`，所以**库里已经是 NULL 的行也会被补上** ——
+       * 那些没时长的候选，**播过一次就有了**。
+       */
+      const viewInfo = viewData?.data as
+        | { title?: unknown; pic?: unknown; duration?: unknown }
+        | undefined
       const title =
         (typeof targetVideo?.title === 'string' && targetVideo.title) ||
         (typeof viewInfo?.title === 'string' ? viewInfo.title : null)
       const pic =
-        typeof viewInfo?.pic === 'string' ? viewInfo.pic : (targetVideo?.pic ?? null)
+        (typeof viewInfo?.pic === 'string' ? viewInfo.pic : null) ??
+        (typeof targetVideo?.pic === 'string' ? targetVideo.pic : null)
+      /**
+       * 时长优先用 view 的（搜索结果常缺），再退回库里已有的那份。
+       *
+       * 两种形状都要收敛成「秒」再传下去：view 给的是数字秒，
+       * 而搜索结果/缓存里那份可能是 `"4:03"` 字符串 —— `meta.duration` 的类型是
+       * `number | null`，把字符串塞进去 typecheck 会拦住（这正是它该拦的）。
+       * 归一用共享的 `durationToSeconds`，别再手写一份解析。
+       */
+      const duration =
+        durationToSeconds(viewInfo?.duration) ?? durationToSeconds(targetVideo?.duration)
+
+      /**
+       * 写回缓存 —— 两件事的时机**故意不同**
+       *
+       * 1. **地址列**：只在**真的重新解析过**时写（`resolvedFresh`）。
+       *    踩过：原来只要读到过这个 keyword 的缓存就无条件整包 `save` ——
+       *    纯缓存命中、续播、预热下一首都会触发一次「同步 stringify + 写盘 + rename」
+       *    （那个 JSON 最大能到几 MB），既阻塞主进程又白白磨损磁盘，而且什么都没改。
+       *    现在按主键更新一行，没解析就什么都不写。
+       *
+       * 2. `selectedBvid`：**放宽成「只要用户切到了这个视频就写」**。
+       *    这里修的是一个实打实的 bug：原条件 `keyword && cached && resolvedFresh` 里
+       *    `resolvedFresh` 只在联网重新解析时才为 true，于是**缓存命中时压根不写回** ——
+       *    用户在缓存有效期内换了视频，`selectedBvid` 一直停在很久以前那次解析的 bvid 上，
+       *    表现就是「切回上一首歌，播的不是上次那首最后播的视频」。
+       *    现在是一行 upsert，写入成本和「一次 setItem」差不多，不值得再省。
+       *
+       *    注意这里**没有**区分「用户切过来的」和「预热顺手解析的」：
+       *    `warmApi` 也会走这个接口，所以预热同样会把它探测的那首歌的 selectedBvid 写掉 ——
+       *    而预热挑的 bvid 与 `changeSong` 逐字一致，写进去的就是「这首歌该播的那个」。
+       *
+       * `meta` 只在**这一行还不在库里**时用得上（见 updateVideoResult 的注释）：
+       * 正在续播的视频可能早已不在搜索结果里，补插时顺手把 view 响应里的
+       * 标题/封面一起写上，免得列表里出现一个空壳。
+       */
+      if (keyword && cacheEnabled()) {
+        if (resolvedFresh) {
+          cacheManager.updateVideoResult(
+            keyword,
+            bvid,
+            // 传整包 playurl 响应：cache 那边负责提取结构化列
+            playData,
+            // `loggedIn` 为 null = 这次没问到，cache 那边会保留旧值
+            loggedIn,
+            // IPC 参数是可选的，这里收敛成确定的布尔再传下去
+            noDash === true,
+            { title: title ?? '', pic, author: targetVideo?.author ?? null, duration },
+          )
+        }
+        cacheManager.setSelectedBvid(keyword, bvid)
+      }
+
+      /**
+       * 读清晰度 / 档位用的 playurl 数据。
+       *
+       * **两个来源，必须都考虑**（踩过：这里原来只读 `targetVideo.playurl_result`，
+       * 而那个字段在 schema v2 就删掉了 —— 于是 `readVideoQuality(undefined)` 返回 null，
+       * 控制栏的清晰度档位和音质档位直接消失，而且 `typecheck` 抓不到：
+       * `CachedSearchItem` 有索引签名，读不存在的属性只会静默变成 undefined）：
+       *
+       *  1. `playData` —— 本次真的联网解析过（`resolvedFresh`）时的整包响应；
+       *  2. `cachedAddress.playurl` —— 走缓存命中时，由 `getVideoAddress()` 从结构化列
+       *     **拼回来的最小形状**。
+       *
+       * 不能只用一个：缓存命中时 `playData` 是 undefined，而重新解析时
+       * `cachedAddress` 可能压根没读（`skipCache` / 列表里没这一项）。
+       */
+      const playurlForRead = playData ?? cachedAddress?.playurl ?? null
+
       const quality = readVideoQuality(
-        targetVideo?.playurl_result,
+        playurlForRead,
         // dash 时传视频轨地址，让清晰度取到「实际在播的那条流」
         videoUrl ?? dash?.videoUrl ?? null,
       )
@@ -450,11 +626,11 @@ export const registerApiHandlers = (context: ApiContext): void => {
       /**
        * 这个视频当前可选的清晰度 / 音质（给播放器上的切换菜单用）
        *
-       * 注意它来自**缓存的 playurl 响应**：dash 响应里一次就带回所有可访问档位，
+       * 注意它来自 playurl 响应：dash 响应里一次就带回所有可访问档位，
        * 所以手动切换清晰度不需要重新请求接口，直接换一条流即可。
+       * 数据来源与上面 `quality` 同一份（见 `playurlForRead` 的注释）。
        */
-      const options = readQualityOptions(targetVideo?.playurl_result)
-
+      const options = readQualityOptions(playurlForRead)
 
       return {
         videoUrl,

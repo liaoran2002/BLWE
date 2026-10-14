@@ -35,8 +35,20 @@ const PORTABLE_DATA_DIR_NAME = 'blmvdata'
 /** 当前是否在用便携目录 */
 let portable = false
 
-/** 我们自己的数据文件名 / 目录名：任意一个存在就算「这里已经有数据」 */
-const DATA_MARKERS = ['setting.json', 'playlists.json', 'playlist.json', 'search-cache']
+/**
+ * 我们自己的数据文件名 / 目录名：任意一个存在就算「这里已经有数据」
+ *
+ * `blmv.db` 必须在列表里 —— 换成 SQLite 之后**真正承载用户数据的就是它**
+ * （歌单、收藏、选中视频）。漏掉的话，一个「只有库文件」的目录会被判成「没有数据」，
+ * 便携版就会去 exe 同级再建一个空库，用户看到的是「歌单全没了」。
+ */
+const DATA_MARKERS = [
+  'blmv.db',
+  'setting.json',
+  'playlists.json',
+  'playlist.json',
+  'search-cache',
+]
 
 const hasOwnData = (dir: string): boolean => {
   try {

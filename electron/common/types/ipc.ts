@@ -108,6 +108,29 @@ export interface IpcChannelMap {
   }
   /** 「添加视频」：解析 B 站链接 / BV 号，取回标题、封面、UP 主 */
   'api:parseVideo': { params: { input: string }; result: ParsedVideoInfo }
+  /**
+   * 收藏 / 取消收藏某个视频
+   *
+   * 返回**收藏后的完整 bvid 列表**（而不是 void）：收藏会重排顺序，
+   * 界面拿列表直接刷新就行，不用自己猜「它现在排第几」——
+   * 顺序由主进程的 `videos.ord` 决定，只有它知道权威结果。
+   */
+  'api:setFavorite': {
+    params: { searchKey: string; bvid: string; favorite: boolean }
+    result: { favorites: string[] }
+  }
+  /** 某首歌收藏的 bvid 列表（按收藏顺序，第一个排最前） */
+  'api:getFavoriteBvids': { params: { searchKey: string }; result: string[] }
+  /** 某首歌上次播的视频 bvid；没有记录返回 null（调用方回落到搜索结果第一条） */
+  'api:getSelectedBvid': { params: { searchKey: string }; result: string | null }
+  /*
+   * 注意这里**没有** `api:setSelectedBvid`。
+   *
+   * 写入完全由 `api:resolveVideo` 内部完成（每次真正切到某个视频时一行 upsert）。
+   * 曾经有过一个独立的 set 频道，是给「渲染层在切歌前 / 退出时集中写一次」用的 ——
+   * 那是 JSON 时代的省写盘手段（每写一次都要重写整个候选列表），
+   * 换 SQLite 之后按主键更新一行就够了，那个频道随之删掉（已无调用方）。
+   */
   'api:resolveVideo': {
     params: {
       bvid: string
@@ -167,13 +190,14 @@ export interface IpcChannelMap {
   // #endregion
 
   // #region cache
+  /** 清空全部缓存（videos + song_meta：收藏与播放地址一起清） */
   'cache:clearAll': { params: void; result: boolean }
-  /** 缓存统计（文件数 / 占用字节） */
+  /** 缓存统计（视频条数 / 近似占用字节） */
   'cache:getStats': {
     params: void
     result: import('./cache_stats').CacheStats
   }
-  /** 手动触发一次过期清理 + LRU 淘汰 */
+  /** 手动触发一次过期清理（**只清播放地址，不删行**） */
   'cache:prune': {
     params: void
     result: import('./cache_stats').CacheStats

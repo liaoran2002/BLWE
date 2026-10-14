@@ -210,7 +210,21 @@ const defaultSetting = {
 
   // #region cache
   'cache.enable': true,
+  /**
+   * 已废弃：改造前是「整个缓存条目的寿命」
+   *
+   * 保留默认值是为了不动用户已有配置的形状（删掉要连带改迁移与界面回显），
+   * 主进程现在**不再读它**。过期语义见下面的 `cache.searchResultExpireMs`。
+   */
   'cache.maxAge': 3 * 24 * 60 * 60 * 1000,
+  /**
+   * 搜索结果（播放直链）过期时间，默认 3 天
+   *
+   * 取 3 天是为了**和改造前的行为对齐**：改造前 `cache.maxAge` 就是 3 天，
+   * 老用户升级后不会觉得「怎么突然老在重新解析地址」。
+   * 注意它只管直链，元数据（标题/封面/收藏/顺序）永不过期。
+   */
+  'cache.searchResultExpireMs': 3 * 24 * 60 * 60 * 1000,
   // #endregion
 } satisfies AppSetting
 

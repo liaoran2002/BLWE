@@ -17,9 +17,14 @@ export const SETTING_VERSION = '1.0.0'
 /** 应用数据目录（userData）下的文件名 */
 export const STORE_NAMES = {
   APP_SETTINGS: 'setting',
-  /** 旧版单歌单文件（会被迁移） */
+  /**
+   * 旧版单歌单文件 / 歌单集合文件（本项目 ≤1.5.x / 迁移期用）
+   *
+   * **两者都已不再读写**：歌单现在存 SQLite（`electron/main/utils/db.ts`）。
+   * 按用户要求也不做旧文件迁移，这两个名字只是留着不删（删了要动 setting 之外的
+   * 引用面，而它们本身没有任何副作用）。
+   */
   PLAYLIST: 'playlist',
-  /** 新版歌单集合 */
   PLAYLISTS: 'playlists',
 } as const
 
@@ -123,7 +128,13 @@ export const DEFAULT_ASPECT_RATIO = '16:9'
 
 // #endregion
 
-/** 歌单集合数据的版本号（playlists.json 里的 version 字段） */
+/**
+ * 歌单数据的版本号
+ *
+ * 改造前它是 `playlists.json` 里的 `version` 字段，用来给迁移逻辑做闸门。
+ * 现在歌单存 SQLite，**这个常量只剩「写到内存快照里供渲染层回显」的作用**：
+ * 迁移相关的判断已按用户要求整段删除，别再用它去比较磁盘版本。
+ */
 export const PLAYLIST_DATA_VERSION = '1.0.0'
 
 /**
@@ -142,8 +153,26 @@ export const SYNC_INTERVAL_OPTIONS = [
   { label: '每周', value: 7 * 24 * 60 * 60 * 1000 },
 ] as const
 
-/** 默认音源显示名（与 musicSdk 的 MusicSource 对应，单独放一份避免循环依赖） */
-export const SOURCE_LABELS: Record<string, string> = {
+/**
+ * 搜索结果（播放直链）过期时间的取值范围与步进
+ *
+ * 界面上用「天」做单位（`el-input-number` + 左右加减按钮），存的是毫秒，
+ * 所以这里同时给出毫秒常量，换算在设置界面里只做一次。
+ *
+ * **0 = 永久**：表示永远不清理播放直链。它是有意义的选项而不是「关掉设置」——
+ * B 站直链本身带签名时效，真的过期了 `isUrlUsable` 照样会重新解析，
+ * 所以「永久」只是不再由我们的定时清理去删，不会导致播放死链。
+ *
+ * 上限取 365 天：再长就等于永久了，而输入框给一个没有上限的数字反而危险
+ * （用户敲一堆 9 进去，`cache.searchResultExpireMs` 溢出成 Infinity）。
+ */
+export const CACHE_EXPIRE_DAYS_MIN = 0
+export const CACHE_EXPIRE_DAYS_MAX = 365
+export const CACHE_EXPIRE_DAYS_STEP = 1
+/** 一天的毫秒数：界面的「天」与存储的毫秒之间的换算系数 */
+export const MS_PER_DAY = 24 * 60 * 60 * 1000
+
+/** 默认音源显示名（与 musicSdk 的 MusicSource 对应，单独放一份避免循环依赖） */export const SOURCE_LABELS: Record<string, string> = {
   wy: '网易云',
   tx: 'QQ音乐',
   kw: '酷我',

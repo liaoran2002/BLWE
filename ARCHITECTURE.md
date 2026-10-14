@@ -41,6 +41,7 @@
 │   │   └── utils/
 │   │       ├── migrateSetting.ts   #   配置版本迁移（版本闸门逐级抬升）
 │   │       ├── mergeSetting.ts     #   默认值 + 用户值合并，并算出变化的 key
+│   │       ├── videoRank.ts        #   ★ 候选视频打分排序（主进程写 ord 前调用）
 │   │       └── common.ts           #   compareVer / debounce
 │   ├── main/
 │   │   ├── index.ts                # 入口：便携模式 → 初始化配置/歌单 → 注册 IPC → 建窗口
@@ -65,7 +66,7 @@
 │   │   │   ├── store.ts            # 原子写入的 JSON 存储
 │   │   │   ├── atomicJson.ts       # 公共的「temp + rename」原子写
 │   │   │   ├── cache.ts            # 搜索缓存（文件名 = 关键词 md5）
-│   │   │   └── quality.ts          # 从 playurl 响应读出「实际在播」的档位（档位表在 @common/constants）
+│   │   │   └── quality.ts          # ★ 读出「实际在播」的档位（dash 靠 URL 比对、durl 从 URL 反推）ants）
 │   │   └── ipc/                    # 按领域拆分的 handler：app / auth / window / wallpaper /
 │   │                               #   tray / setting / playlist / cache / music / biliApi
 │   ├── preload/
@@ -215,8 +216,11 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 > **一次性升级（老用户能看到的行为变化）**：同步策略原有一半由全局设置
 > `playlist.syncOnStartup` 控制，改成「完全由每个歌单自己决定」时，那些「有分享链接但还是手动同步」
 > 的歌单会被自动改成「启动同步」（否则它们会突然完全不再自动同步）。
-> 这一步**只在从更老的数据版本升上来时执行一次**（用 `playlists.json` 里的 `version` 做闸门）——
+> 这一步**只在从更老的数据版本升上来时执行一次**（当时用 `playlists.json` 里的 `version` 做闸门）——
 > 不然你每次启动手动设的「手动同步」都会被无声推翻，还会顺手联网同步覆盖曲目。
+>
+> ⚠️ 改用 SQLite 之后这个闸门随 `playlists.json` 一起废弃了（且**不做迁移**），
+> 所以这个一次性升级现在**不会**再执行。见「数据存储（SQLite）」。
 
 底部的播放控制栏（播放、进度、音量、循环模式）由 `biliVideoControls` 负责，鼠标移上去才显现。
 信息区两行：上行是 B 站视频标题，下行是 `歌曲名 - 歌手 · 专辑`，
@@ -440,14 +444,17 @@ free  1097x617  ✅不超屏 ✅比例对
 `pickDashAudio` 优先 id 精确匹配、否则挑带宽不超过它且最大的那条
 （所以选了 64K 不会因为响应里没有 30216 就悄悄给成 192K）。
 
-菜单里档位的取值优先级：
+菜单里档位的取值：
+1. 用 `dash.video[]` / `dash.audio[]` 的 `id` —— 这才是实际能播的流；
+2. 展示名一律用 `@common/constants` 的内置档位表。
 
-1. 有 dash → 用 `dash.video[]` / `dash.audio[]` 的 `id`（这才是实际能播的流）；
-2. 没有 dash（durl 兜底）→ 才退回 `accept_quality`；
-3. 展示名一律取 `support_formats` 的 `display_desc` / `new_description`，取不到才用内置档位表兜底。
-
-> 菜单里为什么不铺静态全表：`accept_quality` 只说明**账号有权限**，不代表这条链路给得了
-> —— 实测它列出 1080P，durl 通道却只回 720P。列一堆选不了的档位只会误导。
+> **schema v4 之后这里不再读 `accept_quality` 与 `support_formats`**：
+> 前者只说明账号**有权限**（实测列出 1080P、durl 通道却只回 720P），
+> 而 `dash.video[].id` 更权威 —— **按 id 分 URL，没有 URL 就放不出来**；
+> 后者是静态映射，内置表已覆盖全部 12 档，每行存一份纯属冗余，所以两列都删了。
+>
+> 因此**没有 dash 时这个菜单就是空的**（durl 兜底通道只有一条流、没什么可切）——
+> 这是刻意的：宁可菜单空着，也不要列出切不过去的档位。
 
 实现上切换就是**带 `qn` / `audioId` 重新解析一次**（`skipCache: true`），
 解析前后把播放进度记到 `seekAfterLoad` 里，切完接着播。
@@ -458,12 +465,31 @@ free  1097x617  ✅不超屏 ✅比例对
 
 ### 清晰度角标：数据从哪来（踩坑记录）
 
-角标内容取自 **playurl 响应的 `quality` 字段**（`electron/main/utils/quality.ts`），
-再用 `support_formats` 里的 `display_desc` / `new_description` 取展示名 ——
-那正是 B 站自己播放器显示的文字，能区分「1080P 高清 / 1080P 60帧 / 1080P 高码率」这些同分辨率档位。
-dash 链路取「地址和实际播放地址一致」的那条流的 `id`，durl 链路取顶层 `data.quality`。
+角标内容出自 `electron/main/utils/quality.ts`，两条链路取法不同：
 
-**不要用请求参数里的 `qn`，但也不要用分辨率硬推。** 实测（`qn` 是请求参数）：
+| 链路 | 档位从哪来 |
+| --- | --- |
+| **dash** | 取「地址和实际播放地址一致」的那条流的 `id`（用 `baseUrl === videoUrl` 比对） |
+| **durl** | 从 `durl_url` **反推**：`URL 数字 - 128`（见下） |
+
+展示名一律走 `@common/constants` 的内置档位表（`1080P` / `1080P 高清` 这类）。
+
+**durl 档位为什么能从 URL 反推**（schema v4 删掉 `quality` 列的依据）：
+
+```
+...-1-192.mp4  ->  quality 64   (64 + 128)
+...-1-208.mp4  ->  quality 80   (80 + 128)
+```
+
+实测 **24/24 样本成立，且映射唯一**（`quality=64` 只对应 192、`80` 只对应 208）。
+所以 v4 去掉了 `videos.quality` 列 —— 从 `durl_url` 反推即可，不丢信息。
+
+> ⚠️ 这是 B 站的 **URL 命名约定，不是契约**：它可能变。所以反推失败时
+> `qualityFromDurlUrl()` 返回 `null`（角标空着），**绝不猜一个值** ——
+> 宁可没有档位，也不要显示一个错的清晰度。
+
+**不要用请求参数里的 `qn`，但也不要用分辨率硬推。** 实测（`qn` 是请求参数、
+`quality` 是响应）：
 
 | 请求 `qn` | 响应 `quality` | `accept_quality` | 实际解码 |
 | --- | --- | --- | --- |
@@ -661,10 +687,10 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 
 | 条件 | 判据 |
 | --- | --- |
-| 缓存数据不完整 | 缺 `view_result` 或 `playurl_result` |
+| 缓存数据不完整 | 这一行**没有解析过的地址**（`playurl` 为空，即 `durl_url` 和 `dash_video` 都为空） |
 | **地址过期** | `isUrlUsable()`：直链带签名时效（`deadline`），提前 5 分钟算过期 |
-| **登录态变了** | `playurl_result.loginState` **明确是 `false`**（当时确实未登录）+ 现在已登录 → 这地址是低清晰度时期取的，必须重取 |
-| **想要 dash 但缓存里没有** | `dashTried` 还是假 + 缓存里没有 dash 流 → 重取一次试试高清；试过之后写 `dashTried: true`，之后不再反复试 |
+| **登录态变了** | `playurl_login_state` **明确是 `0`**（当时确实未登录）+ 现在已登录 → 这地址是低清晰度时期取的，必须重取 |
+| **想要 dash 但缓存里没有** | `dash_tried` 还是假 + 没有 dash 流 → 重取一次试试高清；试过之后写 `dash_tried = 1`，之后不再反复试 |
 
 **「地址过期」有多常见**：直链签名寿命**实测中位正好 120 分钟**（最大也是 120，
 即同一批地址都是 2 小时），而搜索缓存默认保留 3 天。真实缓存统计过一次：
@@ -714,14 +740,15 @@ nav 明确回 `isLogin: false` 才抛 `未登录`；nav 请求本身失败（网
 
 这几条都是靠缓存里的两个标记工作的，各有各的坑：
 
-- **`loginState` 只在「明确为 false」时才算过期**。`ensureLoginState()` 现在返回
-  `boolean | null`（`null` = 这次 nav 没问到），写缓存时 `null` 就**不写这个字段**、
-  或者保留上一份快照 —— 以前把「没问到」写成 `false`，于是每次解析都判定
+- **`playurl_login_state` 只在「明确为 0」时才算过期**。`ensureLoginState()` 返回
+  `boolean | null`（`null` = 这次 nav 没问到），写库时 `null` 就**不覆盖已有值** ——
+  以前把「没问到」写成「未登录」，于是每次解析都判定
   「未登录时取的，现已登录」，白重取一遍（用户看到的日志是
   `缓存的地址是未登录时取的，现已登录，重新解析`，而且他并没有退出过登录）。
-- **`dashTried` 决定要不要「升级到 dash」**，所以它必须真的落盘：`dashTried: !noDash || prevDashTried`
-  （durl 兜底那次不算「试过」）。判断「要不要升级」时还要求**缓存里确实有播放数据**
-  （`hasValidData`），否则某首歌的首次解析也会走这条分支并打日志，
+- **`dash_tried` 决定要不要「升级到 dash」**，所以它必须真的落盘：
+  `(!noDash || 旧值) ? 1 : 0`（durl 兜底那次不算「试过」，但**也不会把已记的 1 清回 0**）。
+  判断「要不要升级」时还要求**缓存里确实有播放数据**（`hasValidData`），
+  否则某首歌的首次解析也会走这条分支并打日志，
   看起来就像「每切一首歌都在重新解析」。
 - 日志文案要跟事实一致：以前一律打印「缓存只有 720P 的 durl」，
   实际可能是「只有旧数据」甚至「根本没有数据」，误导排查。
@@ -1058,27 +1085,32 @@ this.videoName = ''            // 清掉上一首的视频标题
 targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
 ```
 
-搜索结果条目里的 `title` / `pic` / `author` 全被丢掉，而这个数组会被写回搜索缓存。
-后果是：
+搜索结果条目里的 `title` / `pic` / `author` / `duration` 全被丢掉，
+而这个数组会被写回搜索缓存。后果是：
 
 - 下次 `searchSong` 拿到的这一项没有标题和封面 → 播放器标题空白、视频封面回退不出来；
 - 由于 `selectedBvid` 指向的正是「你上次播的那个视频」，**切回同一首歌必然命中这条坏数据**；
-- 还会把 `title: ''` / `cover: null` 写进歌单的 `videoCache`，续播也一起坏掉。
+- 还会把 `title: ''` / `cover: null` 一路写进 `videos` 行，续播也一起坏掉。
 
-现在改成「合并」而不是替换，并且每次解析都做一次回填：
+现在改成「合并」而不是替换 —— 解析只**补上地址列**，展示字段一律保留：
 
 ```ts
-targetVideo = { ...targetVideo, bvid, view_result, play_result }  // 保留 title / pic
-targetVideo = backfillFromView(targetVideo)                       // 用 view_result 补齐
+// 展示字段（title / pic / author / duration）来自搜索结果，原样留着；
+// 地址列由 updateVideoResult 单独写。
 ```
 
-之所以要 `backfillFromView`：缓存**命中**时走的是「地址还能用」分支，
-根本不会碰条目，已经写坏的缓存不会自己好。回填后随 `results` 一起写回，坏数据随使用自愈。
+> 换 SQLite + 拆列之后这条更不容易踩了：地址和展示字段在**同一行的不同列**上，
+> 写地址的语句 `UPDATE ... SET durl_url = ?, dash_video = ? ...` 根本不碰 title / pic。
+> 而旧实现是「整包对象替换」，一不小心就把别的字段带没了。
 
-同时 `api:resolveVideo` 直接回传正在解析的那个视频的 `title` / `pic`，
+`api:resolveVideo` 仍然直接回传正在解析的那个视频的 `title` / `pic`，
 渲染层不必再依赖「`videoList` 里能不能找到这个 bvid」——
 `selectedBvid` 是历史选择，完全可能不在本次搜索结果里，那时列表查不到，
-标题和封面就只能空着。`videoCache` 的写入也改成「非空优先」，不再让空值覆盖已有记录。
+标题和封面就只能空着。
+
+> **标题与封面刻意来自不同来源**：标题取**搜索结果**里的（里面带
+> `<em class="keyword">` 关键词高亮，界面上用 `sanitizeTitleHtml` 净化后 `v-html` 渲染）；
+> 封面取 **view 响应**里的（尺寸比搜索结果里的大）。两者在 handler 里分开取。
 
 ### 续播：为什么每次都重新搜索、重新解析地址
 
@@ -1121,24 +1153,26 @@ targetVideo = backfillFromView(targetVideo)                       // 用 view_re
   关掉弹窗时同样清空。匹配规则和歌单管理里的过滤是同一套。
 - **爱心**（行尾，只有视频列表有）→ 收藏 / 取消收藏，空心得实心。
 
-**数据存在哪**：`playlists.json` 里每个歌单多一个
+**数据存在哪**：SQLite 的 `videos` 表一行一个候选，收藏就是这个行上的
+`favorites = 1` 标记（详见「数据存储（SQLite）」一节）。
 
-```ts
-favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author, duration, savedAt }
-```
-
-按**歌**存（key 和 `videoCache` 一样是搜索键），主进程 `normalizeFavorites` 做形状校验，
-歌单同步后会和 `videoCache` 一起清掉「已经不在歌单里的歌」的分组。
+- **没有这个字段就是 false** —— 只有收藏的条目才带这个标记，不浪费空间给每条都写
+  （库里落成 `0`/`1` 整数，IPC 出去是 `boolean`）。
+- 收藏一条 = `favorites` 置 1 **且 `ord` 挪到最小**（所以要排到第一位）；
+  **取消收藏只把 `favorites` 置 0、位置不动**。
+- 于是**列表顺序就是库里的 `ord` 顺序**，渲染层直接照用，不再自己排一遍
+  （旧实现在 `playlists.json` 里有 `favorites` / `videoCache` 两张表、
+  渲染层还有 `applyFavoriteOrder` 重排，两处各排一次必然对不上 —— 已全部删除）。
 
 踩过的坑，都是真踩过的：
 
 | 坑 | 现象 | 怎么修 |
 | --- | --- | --- |
 | **grid 三列塞了四个元素** | 加号跑到**左上角**（第二行第一列） | 左右各自包一层 `.lt-side`，正好三格：左按钮 / 中标题 / 右按钮 |
-| **时长的两种形状** | 点过「刷新」之后，视频列表的时长**整列消失** | 搜索接口的 `duration` 是 `"4:03"` **字符串**，view 接口是**秒数**。原来只认数字；现在 `durationText` 两种都收（数字/数字串格式化，`mm:ss` 直接用）。收藏里则统一 `durationToSeconds` 存秒 |
-| **重搜会冲掉已解析的地址** | 刷新后每首歌都要重新解析 dash | `api:searchSong` 支持 `skipCache`，并且重搜后**与旧缓存条目按 bvid 合并**：`{ ...old, ...fresh, view_result: old.view_result, playurl_result: old.playurl_result }` —— 展示字段用新的，解析结果留旧的 |
-| **收藏项在搜索结果里消失** | 下架 / 排序变化后收藏的视频就没了 | `applyFavoriteOrder` 里，搜索里找不到的收藏项用**收藏时存的快照**补齐（所以 `FavoriteVideo` 要连标题封面一起存） |
-| **搜索接口会给重复项** | 列表里出现同一个视频两遍 | 排序后统一按 bvid 去重（收藏优先，其余保持搜索顺序） |
+| **时长的两种形状** | 点过「刷新」之后，视频列表的时长**整列消失** | 搜索接口的 `duration` 是 `"4:03"` **字符串**，view 接口是**秒数**。原来只认数字；现在 `durationText` 两种都收（数字/数字串格式化，`mm:ss` 直接用）。库里统一 `durationToSeconds` 存秒 |
+| **重搜会冲掉已解析的地址** | 刷新后每首歌都要重新解析 dash | `api:searchSong` 重写 `videos` 时**不碰地址列**（`durl_url` / `dash_*` / `quality` / `support_formats` / `playurl_at` / `dash_tried` / `playurl_login_state`），它们从旧行读出来再写回去 —— 新搜索结果里根本没有地址，反而旧地址还有效 |
+| **收藏项在搜索结果里消失** | 下架 / 排序变化后收藏的视频就没了 | `api:searchSong` 合并时**保留 `favorites = 1` 的条目并置于最前**；新结果里没有的那些，再用 `parseVideoInput(bvid)` 回源刷新标题/封面（**必须在拼装完顺序之后**做，否则列表要等网络才定得下来） |
+| **搜索接口会给重复项** | 列表里出现同一个视频两遍 | 按 bvid 去重：新结果里同 bvid 的**覆盖**元数据但**保留 `favorites` 标记** |
 | **点爱心会顺带切视频** | 想取消收藏结果换了个视频 | 爱心上 `@click.stop` |
 | **连点刷新动画不重播** | 第二次点没有转圈 | 先把 `spinning` 置 false、`$nextTick` 再置 true（CSS 动画重加类名才会重播），500ms 后自动复位 |
 | **图标字体里没有这些图标** | 刷新/加号/爱心画不出来 | 这三个用**内联 SVG**（和 `np-cover-fallback` 一致，不引 @element-plus/icons-vue 这种传递依赖） |
@@ -1153,39 +1187,297 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
    从**最终 URL** 里再抠一次；
 3. 拿到 bvid 后请求 view 接口取标题 / 封面 / UP 主 / 时长，返回给弹窗预览。
 
-### 数据存储
+### 数据存储（SQLite）
 
-```ts
-// playlists.json —— 歌单集合
-{
-  version, currentId,
-  playlists: [{
-    id, name, source, sourceUrl,
-    songs: [{            // 结构化曲目：可直接展示封面/专辑
-      name, singer, album, cover, duration
-    }],
-    sync: { mode: 'off' | 'startup' | 'interval', intervalMs },
-    lastSyncAt, createdAt, updatedAt,
-    lastIndex,             // 该歌单上次播放到第几首
-    videoCache: {          // key = "歌名-歌手"，续播时精确还原同一个视频
-      '歌名-歌手': { bvid, title, cover, pickedAt }
-    },
-    favorites: {           // key 同上；这首歌收藏的视频（列表里固定排最前面）
-      '歌名-歌手': [{ bvid, title, cover, author, duration, savedAt }]
-    }
-  }]
-}
+> **⚠️ 字段仍在调整中** —— 这份 schema 是当前实现，用户（本人）后续还要再看一遍字段设计。
+> 改字段时记得同步这一节，并把 `db.ts` 的 `SCHEMA_VERSION` +1。
+
+数据层是 **SQLite 单库**（`better-sqlite3`），库文件在 `userData/blmv.db`，
+连接 / 建表 / 事务都在 `electron/main/utils/db.ts`。
+
+**为什么从 JSON 换成 SQLite**：原来的数据被拆在「一堆 `search-cache/*.json`」和
+`playlists.json` 两处，于是要用「文件级 TTL + LRU 淘汰」来模拟数据库的过期，
+还要靠「读-改-写整个文件」来做部分更新 —— 而这些正是 SQLite 一句话能解决的事。
+换掉之后最直接的收益是**过期语义能落到字段级**（只清播放地址，见下）。
+
+**四张表 + 一个视图**（`SCHEMA_VERSION = 4`，用 `PRAGMA user_version` 当闸门）：
+
+```sql
+-- 歌单
+CREATE TABLE playlists (
+  id               TEXT PRIMARY KEY,
+  name             TEXT    NOT NULL,
+  source           TEXT,              -- 音源（wy / tx / kw）
+  source_url       TEXT,              -- 歌单分享链接；自动同步靠它重新解析
+  sync_mode        TEXT    NOT NULL DEFAULT 'off',   -- off | startup | interval
+  sync_interval_ms INTEGER NOT NULL DEFAULT 0,
+  last_sync_at     INTEGER,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  last_index       INTEGER NOT NULL DEFAULT 0        -- 上次播到第几首
+);
+
+-- 歌单里的曲目（按 ord 排序）
+CREATE TABLE playlist_songs (
+  playlist_id TEXT    NOT NULL,
+  ord         INTEGER NOT NULL,
+  name        TEXT    NOT NULL,
+  singer      TEXT    NOT NULL DEFAULT '',
+  album       TEXT,
+  cover       TEXT,
+  duration    INTEGER,               -- ★ 秒（原为音乐平台原样给的 "4:03" 字符串）
+  PRIMARY KEY (playlist_id, ord)
+);
+
+-- 每首歌的候选视频 = 搜索结果 + 收藏 + 顺序 + 解析结果（★ v2 起合表）
+CREATE TABLE videos (
+  search_key     TEXT    NOT NULL,   -- "歌名-歌手"（toSearchKey）
+  bvid           TEXT    NOT NULL,
+  ord            INTEGER NOT NULL DEFAULT 0,  -- 顺序权威（0 起连续）
+  title          TEXT,               -- 来自【搜索结果】：含 <em class="keyword"> 高亮
+  pic            TEXT,               -- 来自【view 响应】：尺寸比搜索结果里的大
+  author         TEXT,
+  duration       INTEGER,            -- 秒
+  favorites      INTEGER NOT NULL DEFAULT 0,  -- 0/1；「没有这个字段就是 false」在此落成 0
+
+  -- ↓ 解析结果（v2 起拆成结构化列，原来是整包 JSON）
+  durl_url            TEXT,          -- 渐进式 mp4；走 dash 时为 NULL
+                                     -- ★ durl 的档位编码在这个 URL 里（URL 数字 - 128）
+  dash_video          TEXT,          -- 视频轨【完整数组】JSON（含 baseUrl + backupUrl）
+                                     -- ★ 同时是档位列表的来源（dash.video[].id）
+  dash_audio          TEXT,          -- 音频轨【完整数组】JSON
+  dash_duration       INTEGER,       -- dash 总时长（秒）
+  -- v4 删掉了 quality（durl 档位从 durl_url 反推）与 support_formats（静态映射，内置表已覆盖）
+  playurl_login_state INTEGER,       -- 这份【地址】取时的登录态：0/1/NULL(未知)
+  dash_tried          INTEGER NOT NULL DEFAULT 0,
+  playurl_at          INTEGER,       -- 上面那批地址的写入时刻（过期判定）
+  PRIMARY KEY (search_key, bvid)
+);
+
+-- 每首歌的元信息
+CREATE TABLE song_meta (
+  search_key         TEXT PRIMARY KEY,
+  selected_bvid      TEXT,           -- 这首歌上次播的是哪个视频
+  search_login_state INTEGER,        -- ★ 这份【搜索结果】取时的登录态：0/1/NULL(未知)
+  updated_at         INTEGER NOT NULL
+);
+
+CREATE INDEX idx_videos_key_ord ON videos(search_key, ord);
+CREATE INDEX idx_videos_playurl_at ON videos(playurl_at);
+
+-- ★ 元数据视图：不含任何地址列
+CREATE VIEW videos_meta AS
+  SELECT search_key, bvid, ord, title, pic, author, duration, favorites,
+         playurl_login_state, dash_tried, playurl_at
+    FROM videos;
 ```
 
-曲目从早期的 `"歌名-歌手"` 字符串数组升级为对象：旧数据会在启动时**自动解析迁移**
-（按第一个 `-` 切分歌名与歌手），不会丢数据。搜索/匹配链路仍统一用
-`toSearchKey(song)` 拼出与旧版完全一致的 `"歌名-歌手"`，所以匹配打分、
-搜索缓存 key、`videoCache` key 都不受影响。
+**为什么只有一个视图，而且它必须是「元数据」那个**
 
-> 旧歌单迁移后没有专辑/封面的元信息（原始字符串里本来就没有），
-> 对该歌单点一次「同步」即可从音乐平台补齐。
+一行候选的 `dash_video` + `dash_audio` 约 **27 KB**（10 档视频轨、每档 4 个 backupUrl，
+签名参数很长），300 行候选就是 **7.5 MB**。而绝大多数读（列候选、合并收藏项、
+给渲染层的整包）**只要元数据**。实测（300 行）：
 
-旧版单歌单 `playlist.json` 会在首次启动时**自动迁移**成集合里的第一条记录（迁移后旧文件改名为 `.migrated`，不会丢失）。
+| 读法 | 耗时 |
+| --- | --- |
+| 全列 `SELECT` | 9.6 ms |
+| **`SELECT * FROM videos_meta`** | **0.64 ms**（快 15 倍） |
+
+视图在 SQLite 里是**查询重写**而不是物化，所以它和手写列清单**一样快**
+（实测差 0.07 ms，噪声级），但调用方不用记列清单、加列时也不用改多处 SQL。
+另一个好处是**视图默认只读**（SQLite 拒绝 `UPDATE` 视图），写操作只能走明确的 `UPDATE`。
+
+> **⚠️ 为什么不再建第二个视图（`videos_playurl`）—— 实测过，不值得**
+>
+> 直觉上「地址也拆个视图」很对称，但那条读路径**本来就只取一行**
+> （`getVideoAddress(key, bvid)`，按主键查）。它必须读 27 KB 的 dash，
+> 而省掉的 4 个小列（title/pic/author/duration）加起来不到 200 字节 ——
+> **跳过 200 字节不影响 27 KB 的读取**。实测：单行 0.0363 ms → 0.0283 ms（省 0.008 ms），
+> 20 行 0.4813 → 0.4790（省 0.002 ms）。**都是噪声级。**
+>
+> **真正有效的优化不是视图，而是「按 bvid 取一行」本身** ——
+> 它把「读 300 行的地址」变成「读 1 行」。这已经由 `getVideoAddress()` 做了。
+>
+> 同理，`playlists` / `playlist_songs` / `song_meta` **都不需要视图**：
+> 行数少、读取低频、列都很小。唯一有点分量的是 `playlist_songs.cover`
+> （2000 首时占 0.42 ms），但**封面正是列表要显示的** ——
+> 去掉它还得再查一次，反而更慢。
+
+**v2 相对 v1 的四处改动**（都是「字段定稿」时定的）：
+
+| # | 改动 | 原因 |
+| --- | --- | --- |
+| 1 | **删 `video_details` 表**，解析结果合回 `videos` | 拆表只为省「同 bvid 多键重复」，而那个重复很少见；代价却是每次查询要 `LEFT JOIN`（还得是 LEFT，用内连接会丢掉未解析的候选）、`clearAll` 清三张表、补插记录写两张表 |
+| 2 | **删 `view_result`** | 它唯一的用途是取 `title` / `pic`，而这两列本来就有。**注意 view 接口仍然每次都要调** —— 因为 `playurl` 必须带 `cid`，而 `cid` 只能从 view 拿，只是拿完不用存 |
+| 3 | **`playurl_result` 拆成结构化列** | 体积大幅下降（原响应含全部 durl 段落、账号权限等一堆用不到的东西）；`playurl_at` / `login_state` 变成可查询的真列 |
+| 4 | **`playlist_songs.duration` 改秒** | 原来歌单侧是 `"4:03"` 字符串、候选视频侧是秒，两种形状在下游到处判断 |
+
+**v3 的改动**：
+
+| # | 改动 | 原因 |
+| --- | --- | --- |
+| 1 | 加 `videos_meta` 视图 | 元数据读取不再拖上 7.5 MB 的 dash JSON，实测快 15 倍（见下） |
+| 2 | `getVideoAddress(key, bvid)` | 解析前只读**一行**的地址，而不是从整份列表里翻 |
+| 3 | `song_meta.search_login_state` 真正被写入 | v2 只建了列，v3 才在 `api:searchSong` 里记录（未登录时 B 站只返回部分结果，靠它判断要不要重搜） |
+| 4 | 收藏置顶改成「前面 +1、自己置 0」 | 原来的 `MIN(ord) - 1` 会让 `ord` 变成负数且不连续（见下） |
+
+**v4 的改动**（用户对字段的最后一轮精简）：
+
+| # | 改动 | 原因 |
+| --- | --- | --- |
+| 1 | **删 `quality` 列** | durl 的档位编码在 `durl_url` 里：`URL 数字 = quality + 128`（实测 24/24 成立、映射唯一），所以能从 URL 反推，**不丢信息**。反推失败时返回 `null`（角标空着），绝不猜 |
+| 2 | **删 `support_formats` 列** | 那是**静态映射**（档位 id → 显示名），`@common/constants` 的内置档位表已覆盖全部 12 档。每行存一份 JSON 纯属冗余 |
+| 3 | **不加 `accept_quality`** | `dash.video[].id` 更权威 —— **按 id 分 URL，没有 URL 就放不出来**。而 `accept_quality` 只说明「账号有权限」（实测列出 1080P、durl 却只回 720P） |
+
+净效果：`videos` 从 17 列降到 **15 列**，每行少存约 0.7 KB 的 `support_formats` JSON。
+
+**`dash_video` / `dash_audio` 为什么仍然存 JSON，而且存完整数组**
+
+不能只存「正在播的那一条」，因为**渲染层切换清晰度时是拿缓存里这份全量重新挑一条**
+（`extractDashStreams(playurl, wantQn, wantAudioId)`）—— 只存播过的那条，每次切档位
+都得重新联网。保留全量还顺带把 **`backupUrl` 留了下来**：原来的提取逻辑
+（`dashUrlOf` → `pickNormalCdnUrl`）当场就把备用地址挑掉了，只留一个选中的 URL，
+于是某个 CDN 返回 403 时**没法换备用**（代码注释里记着 P2P 边缘节点会 403 的坑）。
+
+> 也就是说：这里的 JSON **不是**「懒得拆字段」，而是「形状由 B 站决定、
+> 且必须保全部档位」。能当查询条件或能反推的（登录态 / 时间 / 清晰度代码）
+> 都已经拎成了真列或从 URL 反推 —— 见 v4 的改动。
+
+**登录态为什么拆成两个字段**
+
+`search_login_state` 与 `playurl_login_state` 是**不同时刻、不同请求**的快照：
+搜索可能几小时前就做了，而播放地址是刚刚解析的。合并成一个字段必然互相覆盖。
+
+而它们各自都**必须用 NULL 表示「未知」**，不能和 `0`（未登录）混为一谈 ——
+`ensureLoginState()` 会因为网络抖动返回 `null`，此时把它当成「未登录」，
+下次登录后就会判定「这份缓存是未登录时取的」并**白重解析一遍**。
+这正是「没退出登录却老在重新解析」的来源之一。
+
+**`ord` 的语义是不变量：0 起、连续**
+
+收藏一条时用一个事务做「**原来排在它前面的依次 +1，自己置 0**」：
+
+```sql
+BEGIN;
+  UPDATE videos SET ord = ord + 1 WHERE search_key = ? AND ord < :原ord;
+  UPDATE videos SET favorites = 1, ord = 0 WHERE search_key = ? AND bvid = ?;
+COMMIT;
+```
+
+取消收藏**只把 `favorites` 置 0，`ord` 不动**（位置不跳回原处）。
+
+两条 UPDATE 必须在**同一个事务**里：中间态（前面的都 +1 了、自己还没置 0）如果被别处
+读到，会出现「有两个 `ord = 0`」的瞬时重复，排序结果不确定。
+
+> **踩过的坑（v2 的实现是错的）**：曾经用 `MIN(ord) - 1` 来置顶，那会让 `ord`
+> 变成**负数且不连续**（来回收藏几十次就到 `-50`），`SELECT` 出来根本看不出
+> 「哪个是第几」。更糟的是 `save()` 是**按数组下标从 0 重写**的，
+> 那些负数**活不过一次重新搜索** —— 等于说那种编码只在两次搜索之间有意义。
+> v3 改成上面的写法后，`ord` 恒为 `0..n-1`。
+>
+> 实测（真实 `cache.ts`）：收藏后 `BV9(ord=0,fav=1) | BV1(ord=1,fav=0)` ✅ 连续。
+
+**收藏与顺序都由 `videos` 承担**（不再是 `playlists.json` 里的 `favorites` / `videoCache`）：
+
+- 收藏一条 = 该行 `favorites = 1` 且 `ord` 挪到最小；
+- **取消收藏只把 `favorites` 置 0，位置不动**；
+- 于是**数组顺序本身就是用户顺序**，渲染层直接按返回顺序用，不再自己排一遍
+  （旧实现在渲染层还有个 `applyFavoriteOrder`，和主进程各排一次必然对不上）。
+
+**排序在写库之前做 —— `ord` 就是最终显示顺序**
+
+打分排序（`matchScore` / `nameBonus` / `tagBonus`）原来住在渲染层的
+`sortSearchedVideos()`，而主进程写 `ord` 时只按「收藏 + B 站返回顺序」，于是
+**界面顺序和库里顺序是两套**：
+
+| | 之前 | 现在 |
+| --- | --- | --- |
+| 库里的 `videos.ord` | 收藏 + 其余按**B 站顺序** | 收藏 + 其余按**打分排序** |
+| 界面显示 | 收藏 + 其余按**打分排序**（渲染层再排一次） | 直接照用 `ord`，**不再排序** |
+
+两套顺序的危害不只是「看着不一致」：任何**依赖持久化顺序**的用法都会在刷新后失效，
+因为库里的那份顺序根本没被排序影响过。
+
+修法是把打分抽到 **`electron/common/utils/videoRank.ts`**（主 / 渲染共用一份），
+由 `api:searchSong` 在 **`cacheManager.save()` 之前**调用：
+
+```ts
+const merged = await mergeWithFavorites(freshItems, oldRows)
+// ★ 必须在 save 之前：save 是按数组下标写 ord 的
+const ordered = sortByRelevance(merged, keyword, getSetting()['player.tagBonus'])
+if (cacheEnabled()) await cacheManager.save(keyword, { ...result, data: { ...result.data, result: ordered } })
+return { data: { ...result.data, result: ordered } }
+```
+
+- **为什么抽成共享模块而不是在主进程重写一份**：两处各写一份必然漂移，
+  而它的返回值直接决定用户看到什么。
+- **为什么渲染层保留一个恒等的 `sortSearchedVideos()` 而不是删掉**：
+  调用点分布在续播 / 预热 / 重试等 6 处，逐个删容易漏；恒等之后行为立刻正确。
+  （`matchScore` / `nameBonus` / `tagBonus` / `tagBonusConfig` 已从渲染层删除。）
+- **`Array.prototype.sort` 是稳定排序**，所以同分候选保持 B 站返回顺序，不会被随机打乱。
+
+实测（用真实源文件转译后跑）：
+
+```
+输入: A(某歌 翻唱) | B(某歌 Official MV) | C(不相干,收藏) | D(某歌 Live) | E(某歌-歌手 官方)
+输出: C → E → B → D → A
+      收藏置顶 ✅  最相关(E) 居首 ✅  官方MV 先于 Live ✅  被降权的翻唱垫底 ✅
+同分稳定性: X1 → X2 → X3 ✅（保持原顺序）
+```
+
+> **⚠️ 仍未解决的：「收藏再取消来提升顺序」过不了重新搜索**
+>
+> 这次改动**只统一了「显示顺序」与「库里顺序」**，并**没有**让「已取消收藏」的条目
+> 在重新搜索后保住位置。原因在 `save()`：`ord` 是**按传入数组的下标重写**的
+> （`insert.run(..., index, ...)`），而 `mergeWithFavorites` 只把 **`favorites = 1`**
+> 的条目提到数组前面 —— 取消收藏后它 `favorites` 变 0，就成了普通新结果，按下标重排。
+>
+> 也就是说：**收藏**能保住位置，**取消收藏**不能。想实现「手工排序」需要另加机制
+> （例如给 `videos` 加一个「用户指定过顺序」的标记，让 `save` 对这类行也保留 `ord`），
+> 这属于字段设计的事，等定稿时一起做。
+
+**「上次播的是哪个视频」= `song_meta.selected_bvid`**：
+由 `api:resolveVideo` 在**每次真正切到某个视频时**落库（一行 upsert）。
+换 SQLite 之前之所以要攒到「切歌 / 退出」才写，是因为旧实现是 JSON 文件 ——
+每写一次都要把整份候选列表 stringify 再 rename，切视频那么频繁根本受不了；
+现在按主键更新一行就够了，语义反而更准（不必担心「切了视频但没切歌就退出」会丢）。
+
+**过期语义（重要）**：只有**播放地址那一批列**会过期
+（`durl_url` / `dash_video` / `dash_audio` / `dash_duration` / `quality` /
+`support_formats` / `playurl_at`），标题 / 封面 / 收藏 / 顺序**永不过期**，
+所以清理**只把这些列置 NULL、绝不删行**。
+
+> **`dash_tried` 和 `playurl_login_state` 不在清理范围内** —— 它们不是「地址」。
+> `dash_tried` 尤其不能清：它的作用是「试过 dash 但没拿到，下次别反复重取」，
+> 清了就等于每轮过期都把「这个视频没有 dash」这件事忘掉，然后一直重试。
+
+时长取设置项 `cache.searchResultExpireMs`（**0 = 永久**，界面上显示成「永久」）。
+清理入口：启动后设置变化时、以及设置里那个「清理过期」按钮。
+
+> `cache.maxAge` 是**旧实现留下的死键**：主进程已完全不再读它。
+> 语义被 `cache.searchResultExpireMs` 取代（前者过期=删整个缓存文件，
+> 后者过期=只清播放地址）。保留键名只是为了不动 `AppSetting` 的形状。
+
+**「全部清除」= 两张表全清**（`videos` + `song_meta`）：
+收藏、选中视频、播放地址一起没了。界面上按钮的文案也是「全部清除」，两边必须一致。
+（v1 那张 `video_details` 已经合掉，所以现在是两张表；合表之前必须三张一起清 ——
+只清 `videos` 会留下一堆没人引用的解析结果，磁盘占用压根不降，
+而用户点这个按钮就是为了腾空间。）
+
+**不做旧数据迁移**：JSON 时代的 `setting.json` / `playlists.json` / `search-cache/`
+不再被读取，也不写任何导入代码。用户（只有一个）明确要求过不做迁移。
+
+**schema 升级也是「丢弃重建」，不做逐字段搬运**：
+`db.ts` 的 `migrateSchema()` 在发现 `user_version` 低于当前版本时，会把
+表（含 v1 遗留的 `video_details`）**和视图**全部 `DROP`，再按新结构重建。理由：
+
+- SQLite 数据层**从未发布过**（v1 只存在于开发期本机），所以「升级」实际只发生在
+  作者自己的机器上，重搜一次即可；
+- 逐字段搬运要处理「旧列可能不存在 / 类型变了 / JSON 要重新拆成列」三种情况，
+  代码量和出错面都远大于丢掉重来，而收益只是省几次重新解析。
+
+> **副作用要说清楚**：升级会清空**收藏、顺序、选中视频，以及歌单本身**
+> （都在同一个库里）。要保留就得自己先备份 `blmv.db`。
 
 续播相关的信息存在 `setting.json` 里：`player.resumeOnStart`（记住播放进度）、`player.resumeTime`
 （上次播放到第几秒）；**播到第几首由每个歌单自己的 `lastIndex` 决定**（`player.playIndex` 是历史遗留、
@@ -1193,8 +1485,16 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 界面相关的：`common.themeColor` / `common.fontColor`（hex）、`common.glassTransparency`（0-100）、`common.glassBlur`（0-20）、`common.glassShadow`（0-20）。
 记录时机：切歌、切视频、视频加载完成、播放进度变化（节流 5 秒）、关闭窗口前。
 
-`videoCache` 只存 `bvid` + 标题 + 封面，**不存播放直链**（B 站地址带签名时效，存下来很快就失效）；
-续播时按 bvid 重新解析，见上面的「续播：为什么每次都重新搜索、重新解析地址」。
+> `setting.json` 是**唯一还留在 JSON 上的数据**（约 2KB、整体替换语义，没有按行查询的需求）。
+> 歌单 / 视频 / 收藏 / 选中视频都已经在 SQLite 里。
+
+**「这首歌播哪个视频」的存储**：`song_meta.selected_bvid`（只存 bvid，
+标题封面在 `videos` 行上）。**它按「歌」（`search_key`）记，不按歌单** ——
+因为 `videos` 里那批候选就是按歌存的，同一首歌在哪个歌单里都是同一批候选，
+给每个歌单各挑一个是没意义的。
+
+> **不存播放直链** —— B 站地址带签名时效，存下来很快就失效；
+> 续播时按 bvid 重新解析，见上面的「续播：为什么每次都重新搜索、重新解析地址」。
 
 ### 歌单解析（对应 LX 的 musicSdk）
 
@@ -1244,8 +1544,13 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 | 没有数据，且当前是便携版（运行时带 `PORTABLE_EXECUTABLE_DIR`） | exe 同级的 **`blmvdata/`**（自动创建，数据跟着程序走） |
 | 没有数据，且是安装版（全新环境） | 默认的 `%APPDATA%/BiLiMusicVideo-desktop` |
 
-判断「已经有数据」看的是我们自己的文件（`setting.json` / `playlists.json` / `playlist.json` / `search-cache`），
-**不能只看目录存不存在** —— Electron 一启动就会把 userData 目录建出来，那样全新机器上永远走不到便携分支。
+判断「已经有数据」看的是我们自己的文件（`setting.json` / `playlists.json` / `playlist.json` /
+`search-cache` / **`blmv.db`**），**不能只看目录存不存在** —— Electron 一启动就会把 userData
+目录建出来，那样全新机器上永远走不到便携分支。
+
+> `blmv.db` 也在标记列表里，因为**现在真正承载用户数据的就是它**
+> （歌单、收藏、选中视频）。少了它，一个「只有 SQLite 数据」的目录会被判成「没有数据」，
+> 于是在便携版里又去 exe 同级建一个空库，用户会看到歌单全没了。
 
 **目录名是 `blmvdata` 而不是 `data`**：`data/` 太通用，绿色版常被丢在同一个文件夹里，容易和别的软件撞。
 
@@ -1282,30 +1587,56 @@ favorites: Record<搜索键, FavoriteVideo[]>   // { bvid, title, cover, author,
 > 现在 `loadIcon()` 在图标解不出来时会 `console.warn('[icon] 图标加载失败…')`，不再静默变空白。
 > 图标文件本身也要记得在 `build.extraResources` 里声明，只写 `files` 是打不进包的。
 
-### 关于存储：为什么用 JSON 而不是 SQLite
+### 关于存储：为什么最终换成了 SQLite
 
-`setting.json` 约 2KB、`playlists.json` 约 5KB（217 首），且写入是「整体替换」语义
-（先写临时文件再 rename 原子替换），没有部分更新、并发写、按行查询的需求 ——
-这些正是 SQLite 的强项而本项目一个都用不到。同时 SQLite 是原生模块，
-要额外处理 `asarUnpack` / ABI / 跨平台重编译，为一个 5KB 的文件不值得。
+> 这一节原来是「**为什么用 JSON 而不是 SQLite**」，结论已经完全反过来，保留标题
+> 是为了让「当初为什么不用」和「后来为什么必须用」都能查到 —— 免得下次又有人
+> 觉得「才几 KB 的数据用 SQLite 是过度设计」。
 
-**真正需要淘汰策略的是搜索缓存**，那是文件级 KV，天然适合 TTL + LRU，
-用「每键一文件 + 内存索引」实现即可，同样不需要 SQLite。见下。
+**当初不用 SQLite 的理由**（针对当时的形状，其实是成立的）：
+`setting.json` 约 2KB、`playlists.json` 约 5KB，写入是「整体替换」语义，
+没有部分更新 / 并发写 / 按行查询的需求；而 SQLite 是原生模块，要额外处理
+`asarUnpack` / ABI / 跨平台重编译。为一个 5KB 的文件引入这些，确实不划算。
 
-### 搜索缓存策略
+**为什么后来必须换**：数据形状变了，上面那些前提一条条都不成立了。
 
-缓存项存的是**整包 B 站搜索响应**（含各候选视频的播放地址），单文件可达数 MB，
-所以必须有过期与淘汰，否则只增不减（曾实测到 45MB / 107 文件，88% 已超 3 天）。
+| 需求 | JSON 时代 | SQLite |
+| --- | --- | --- |
+| 「收藏」「选中视频」「搜索结果」都要持久化 | 拆在两类文件里（`playlists.json` 与 `search-cache/*.json`） | 同一个库，按 `search_key` 关联 |
+| 过期语义要落到**字段级**（只清播放地址） | 做不到 —— 文件级 TTL 只能整份删 | `UPDATE videos SET durl_url = NULL, dash_video = NULL ...` |
+| 收藏要能改「列表顺序」 | 顺序只存在于渲染层，刷新就散 | `videos.ord` 是权威 |
+| 部分更新（改一行的一个字段） | 读-改-写整个文件（几 MB） | 一条 `UPDATE` |
+| 解析结果要能查询（登录态 / 过期时间） | 埋在 JSON 里，判断得先 `JSON.parse` | 真列，可直接 `WHERE` |
 
-- **过期**：`cache.maxAge`（默认 3 天）在**读取时**判定，过期按未命中处理并删除
-- **容量**：文件数上限 300，超出时按「最久未使用」淘汰到 80%（240）以下
-- **索引**：内存索引记录每个文件的使用时间，并在需要时与磁盘对齐
-  （应对外部删文件、上次未正常退出等情况）
+**原生模块这件事也解决了**：`better-sqlite3@13` 起是**预编译分发**
+（`gypfile: false`，`prebuilds/*.node` 直接带在包里），装的时候不编译、
+用的时候不需要 `electron-rebuild`（实测 Electron 42 / ABI 146 直接可用）。
+打包只需要在 `files` 里白名单保留 `prebuilds/win32-x64.node`（1.9MB）并
+`asarUnpack`，其余 7 个平台的 prebuild 和 `deps/`、`src/` 全部排除 ——
+这套做法参考了 LX Music（它的 `build-config/deps.js` 会把 prebuild
+拷到 `build/Release/`，并用 `beforePack` 把 `binding.gyp` 改名以阻止现场编译）。
+
+**`node:sqlite` 其实也能用**（实测 Electron 42 内置的 Node 24 里可用，
+零原生模块、零打包配置），但它标注为 experimental，API 可能变；
+`better-sqlite3` 只多 1.9MB 且行为稳定，所以最终选了后者。
+
+### 搜索缓存策略（SQLite 之后）
+
+缓存内容就是 `videos` + `song_meta` 两张表，**没有独立的缓存文件了**。
+旧实现「一个关键词一个 JSON 文件」的那套（文件级 TTL、文件数上限 300、
+内存 LRU 索引）已经整体删掉 —— 那些机制存在的唯一目的是模拟数据库能力。
+
+- **过期**：只清**地址那一批列**（`durl_url` / `dash_video` / `dash_audio` /
+  `dash_duration` / `quality` / `support_formats` / `playurl_at`），
+  时长取 `cache.searchResultExpireMs`（**0 = 永久**）。**不删任何行**
+- **容量**：不再有文件数上限 / LRU 淘汰。留着的行只有标题封面这类短文本，
+  体积由 `dash_video` / `dash_audio` 那两段 JSON 主导，而它们会被上面的过期清理收敛
 - **空结果不写缓存**（见下）
 - 设置里可查看占用、手动「清理过期」或「全部清除」
 
-> 说明：`cache.enable` 与 `cache.maxAge` 在早期版本里只是声明了却从未被读取，
-> 属于「死设置」；现已真正生效。
+> `cache.enable` 与旧 `cache.maxAge` 在早期版本里只是声明了却从未被读取，属于「死设置」。
+> 现在 `cache.searchResultExpireMs` 是唯一权威的过期设置（界面上叫「搜索结果过期时间」），
+> `cache.maxAge` 保留键名但**主进程完全不读**。
 
 **空搜索结果不写缓存（踩坑记录）**
 
@@ -1514,8 +1845,9 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
 | 「登录失效」被拍成「解析失败」 | `AUTH_FAILED` 原样回传，界面提示重新登录 |
 | 全屏 / 壁纸写死主屏，副屏会跳屏 | `screen.getDisplayMatching(window.getBounds())` |
 | 拖动还原窗口在副屏算错（少了 `bounds.x`） | 相对位置改成 `(cursor - bounds.origin) / size` |
-| 搜索缓存「读-改-写」丢更新 | 写回前重新读一次，按 bvid 合并 |
-| 缓存落盘非原子 / 文件名会撞（`A/B` vs `AB`） | 复用 `writeJsonAtomic`；文件名用关键词 md5，原文存进 entry 校验。**改命名不做旧文件迁移**：`search-cache/` 里全是搜索缓存，重搜一次的成本远低于维护一条兼容分支（想立刻干净就在设置里「全部清除」） |
+| 搜索缓存「读-改-写」丢更新 | 换成 SQLite 后按主键更新一行，整类问题消失 |
+| ~~缓存落盘非原子 / 文件名会撞（`A/B` vs `AB`）~~ | **已作废**：`search-cache/` 那套「每键一文件 + md5 命名 + 原子写」整体删掉了，现在过期的粒度是字段而不是文件 |
+| 同一个视频被两首歌引用时地址存两份 | v1 曾为此拆出 `video_details`（按 bvid 唯一），**v2 又合回 `videos`** —— 那个重复很少见，而拆表让每次查询都要 `LEFT JOIN`、`clearAll` 清三张表，不划算 |
 | 登录成功可能派发两次 | `finishLoginIfReady` 加 in-flight + finished 标记 |
 | 登录页每次导航都重复注入关闭按钮 / 倒计时 | 注入前先探测元素是否已存在 |
 | 酷我 `digest-5__123` 永远走不到 | `detectSource` 先特判这个前缀 |

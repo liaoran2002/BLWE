@@ -160,7 +160,8 @@ import { sanitizeTitleHtml, stripTags } from '../utils/title';
 /**
  * 视频列表项（B 站搜索结果）
  *
- * 后端缓存里可能还带 view_result / playurl_result，这里只声明用到的字段。
+ * 只声明界面真正用到的展示字段。解析结果（播放地址）由主进程单独给出，
+ * 不再整包回传到渲染层。
  */
 export interface VideoListItem {
   bvid: string;

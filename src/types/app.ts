@@ -44,9 +44,21 @@ export interface BiliVideo {
   author?: string | null
   /** 时长：搜索接口给字符串 "4:03"，view 接口给秒数，两种都可能是 */
   duration?: number | string | null
-  /** 后端缓存里可能带上这两个字段 */
-  view_result?: unknown
-  playurl_result?: unknown
+  /**
+   * 是否已收藏（由主进程写入）
+   *
+   * 收藏状态以主进程的 `videos.favorites` 为权威：列表里这一项就是它的回显，
+   * `favoriteBvids` 直接从这里读，不再需要单独维护一份收藏列表 ——
+   * 两份数据一定会漂移（收藏后重排了顺序，另一份却还是旧的）。
+   */
+  favorites?: boolean
+  /*
+   * 注意：这里**没有** `view_result` / `playurl_result`。
+   *
+   * 主进程不再把解析结果整包回传给渲染层了 —— 它现在拆成了 `videos` 表上的结构化列
+   * （`durl_url` / `dash_video` / …），渲染层要的播放地址由 `api:resolveVideo`
+   * 单独给出 `videoUrl` / `dash`，不需要看见缓存内部的形状。
+   */
 }
 
 export interface AppData {
@@ -203,6 +215,23 @@ export interface AppData {
   _warmed: { next: boolean; prev: boolean }
   /** 正在预热哪几个方向（避免同一方向并发重复请求） */
   _warming: { next: boolean; prev: boolean }
+  /**
+   * 某个方向的预热**失败了几次**
+   *
+   * 心跳每秒都会调 `warmApi`，而搜不到视频时 `_warm[dir]` 是空的、拦不住它 ——
+   * 没有这个计数就会每秒重试一次真网络请求（用户反馈过「日志刷几十行 + 界面卡」）。
+   * 到上限后由 `_warmFailed` 彻底停掉。
+   */
+  _warmTries: { next: number; prev: number }
+  /** 某个方向的预热是否已彻底失败（不再重试，等换歌时清掉） */
+  _warmFailed: { next: boolean; prev: boolean }
+  /**
+   * 上次预热失败的时刻
+   *
+   * 心跳是每秒一次，所以「间隔 3 秒再重试」必须靠时间戳判断 ——
+   * 光看 `_warmTries` 会让三次重试在 3 秒内全打完。
+   */
+  _warmRetryAt: { next: number; prev: number }
   /** 预热媒体用的隐藏 <video>（每个方向一个，长期复用） */
   _warmEl: { next: VideoElement | null; prev: VideoElement | null }
   /** 预热媒体的 dash 会话 */

@@ -85,6 +85,21 @@ export interface RendererAPI {
   searchSong: (keyword: string, skipCache?: boolean) => Promise<{ data: unknown }>
   /** 「添加视频」：解析 B 站链接 / BV 号 */
   parseVideo: (input: string) => Promise<ParsedVideoInfo>
+  /**
+   * 收藏 / 取消收藏；返回收藏后的完整 bvid 列表（顺序由主进程的 ord 决定）
+   *
+   * 收藏会把该条挪到第一位，取消收藏**位置不动**。
+   */
+  setFavorite: (
+    searchKey: string,
+    bvid: string,
+    favorite: boolean,
+  ) => Promise<{ favorites: string[] }>
+  /** 某首歌收藏的 bvid 列表 */
+  getFavoriteBvids: (searchKey: string) => Promise<string[]>
+  /** 某首歌上次播的视频 bvid；没有记录返回 null */
+  getSelectedBvid: (searchKey: string) => Promise<string | null>
+  /** 注意：没有 setSelectedBvid —— 写入由 resolveVideoUrl 内部完成 */
   resolveVideoUrl: (
     bvid: string,
     keyword?: string,
@@ -129,9 +144,9 @@ export interface RendererAPI {
   /** 同步指定歌单，返回每个歌单的结果 */
   syncPlaylists: (ids: string[]) => Promise<import('./playlist').SyncResult[]>
   clearCache: () => Promise<boolean>
-  /** 缓存统计（文件数 / 占用） */
+  /** 缓存统计（视频条数 / 近似占用字节） */
   getCacheStats: () => Promise<import('./cache_stats').CacheStats>
-  /** 手动触发一次「过期 + LRU」清理 */
+  /** 手动触发一次过期清理（只清播放地址，不删行） */
   pruneCache: () => Promise<import('./cache_stats').CacheStats>
   // #endregion
 
