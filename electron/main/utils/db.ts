@@ -24,12 +24,8 @@
  *    所以第一次真正用到库时才建连接；早了会写到错误的目录。
  */
 import { app } from 'electron'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
-
-/**
- * 当前 schema 版本（`PRAGMA user_version`）；**改表结构时必须 +1**
- */
-const SCHEMA_VERSION = 1
 
 /** 库文件名（放在 userData 下，和 setting.json 同级） */
 const DB_FILE_NAME = 'blmv.db'
@@ -150,6 +146,14 @@ CREATE TABLE IF NOT EXISTS playlist_songs (
   -- 而候选视频那边（videos.duration）一直是秒 —— 两种形状在下游到处判断。
   -- 展示时再格式化回 mm:ss，见渲染层的 durationText。
   duration    INTEGER,
+  -- 来源音源（wy / tx / kw），与 platform_id 配对使用
+  source      TEXT,
+  -- **平台侧歌曲 id**（QQ 的数字 id / 网易云 id / 酷我 rid）
+  --
+  -- 为什么要存它：**取歌词必须要这个 id**。不存就得拿「歌名 + 歌手」再去
+  -- 平台搜一次，而那是模糊搜索 —— 可能搜到别的版本（同名 live / 翻唱），
+  -- 于是显示错误的歌词。有它就精确对应「用户歌单里那一首」，也省一次搜索。
+  platform_id TEXT,
   PRIMARY KEY (playlist_id, ord)
 );
 
@@ -237,6 +241,27 @@ CREATE VIEW IF NOT EXISTS videos_meta AS
     FROM videos;
 `
 
+/**
+ * 自检：`CREATE_TABLES_SQL` 里**不能出现反引号**
+ *
+ * ## 为什么要有这条断言（我犯过三次这个错）
+ *
+ * 上面那段 SQL 是**模板字符串**，而我在 SQL 注释里写文档时习惯用反引号
+ * 包住标识符（比如 `` `bvid` ``）—— 那个反引号会**提前终止模板字符串**，
+ * 于是后面所有 SQL 都变成 JS 代码 → 一串 `TS1005` / `TS1443` 语法错误，
+ * 而报错行指向的是 SQL 中间，**完全看不出根因是"注释里多了个反引号"**。
+ *
+ * 犯三次之后决定用代码根治：这条断言在**模块求值阶段**就会跑，
+ * 直接告诉后来者「就是这里的问题」。代价是一次 `includes`，可忽略。
+ */
+if (CREATE_TABLES_SQL.includes('\u0060')) {
+  throw new Error(
+    'CREATE_TABLES_SQL 里出现了反引号 —— 它位于一个模板字符串中，' +
+      '会提前终止字符串并产生一堆莫名其妙的语法错误。' +
+      'SQL 注释里提到标识符时请用普通引号或直接写名字（不要用反引号）。',
+  )
+}
+
 let db: SqliteDatabase | null = null
 /** 退出关库的钩子只装一次（getDb 会被调用很多次） */
 let quitHookInstalled = false
@@ -245,71 +270,69 @@ let quitHookInstalled = false
 const getDbPath = (): string => path.join(app.getPath('userData'), DB_FILE_NAME)
 
 /**
- * 建表 / 抬升 schema 版本
+ * 建表 / schema 一致性检查
  *
- * 只在**库里还没有版本号**（全新库，user_version = 0）时才执行建表语句：
- * 建表语句本身是 `IF NOT EXISTS`，重复执行无害，但把它当成常规流程会掩盖
- * 「版本号被人为改小」这类异常，所以这里用版本号当闸门。
+ * ## 为什么改用「指纹」而不是版本号
+ *
+ * 原来靠一个手写的 `SCHEMA_VERSION` 常量当闸门：改表结构就得手动 +1，
+ * 忘了 +1 就会出现「旧库带着旧列结构跑起来、然后在某个查询上报错」——
+ * 而那是**运行时才炸**的错，最难查。
+ *
+ * 现在改成：把**建表语句本身**做一次哈希当 `user_version` 的值。
+ * 于是：
+ *  - 只要 `CREATE_TABLES_SQL` 有一个字符变了，指纹就变 → 自动重建；
+ *  - 忘了"升版本"这件事**不可能再发生**（因为根本没有版本号要维护）；
+ *  - 开发阶段反复改 schema 不用管版本，改完重启就生效。
+ *
+ * 代价：**每次改 schema 都会清库**（开发阶段无所谓，本来也没数据）。
+ * 真要保留数据，把 `CREATE_TABLES_SQL` 改成增量 `ALTER TABLE` 即可。
  */
+const schemaFingerprint = (): number => {
+  const hash = createHash('sha256').update(CREATE_TABLES_SQL, 'utf8').digest()
+  // `user_version` 是有符号 32 位整数，取前 4 字节并保证为正
+  return hash.readUInt32BE(0) & 0x7fffffff
+}
+
 const migrateSchema = (database: SqliteDatabase): void => {
-  const version = Number(database.pragma('user_version', { simple: true })) || 0
+  const stored = Number(database.pragma('user_version', { simple: true })) || 0
+  const wanted = schemaFingerprint()
 
-  if (version === SCHEMA_VERSION) return
+  if (stored === wanted) return
 
-  if (version > SCHEMA_VERSION) {
-    /**
-     * 库比代码新：用户可能降级过版本（装了旧包又换回来）。
-     * 这种情况**绝不能**动表结构，只能继续用 —— 报一行日志，让问题可见。
-     */
-    console.warn(
-      `[db] 库的 schema 版本(${version})高于当前程序(${SCHEMA_VERSION})，按原样使用（可能是降级运行）`,
-    )
-    return
-  }
-
-  if (version === 0) {
+  // 空库（user_version=0）：直接建表，不需要先 DROP
+  if (stored === 0) {
     database.exec(CREATE_TABLES_SQL)
-    database.pragma(`user_version = ${SCHEMA_VERSION}`)
-    console.log(`[db] 已初始化数据库，schema 版本 -> ${SCHEMA_VERSION}`)
+    database.pragma(`user_version = ${wanted}`)
+    console.log('[db] 已初始化数据库')
     return
   }
 
   /**
-   * 旧版本库：**直接丢弃重建**，不写逐字段搬运。
+   * 指纹对不上 = 建表语句变了（开发期改了 schema）。
    *
-   * 这是刻意的选择，不是偷懒：
-   *  - 本项目**只有一个用户**（作者本人），且 SQLite 数据层**从未发布过** ——
-   *    v1 只存在于开发期本机，所以「升级」实际只发生在自己的机器上，重搜一次即可；
-   *  - 逐字段搬运要处理「旧列可能不存在 / 类型不同 / 解析结果要重新拆」三种情况，
-   *    代码量和出错面都比「丢掉重来」大得多，而收益只是省几次重新解析。
+   * **直接丢弃重建**，不写逐字段搬运 —— 理由：
+   *  - 本项目**只有一个用户**（作者本人），且数据层**从未发布过**，
+   *    "升级"只发生在开发机上；
+   *  - 逐字段搬运要处理「旧列可能不存在 / 类型变了 / 要重新拆」三种情况，
+   *    出错面远比"丢掉重来"大，收益只是省几次重新解析。
    *
-   * 副作用要说清楚：**收藏、顺序、选中视频会一起没了**（歌单本身在
-   * `playlists` / `playlist_songs`，也在同一库里，同样会被清掉）。
-   * 真要保留数据请自己先备份 `blmv.db`。
-   *
-   * 表名和本次 schema 的差异见上面 SCHEMA_VERSION 的历史注释。
+   * 副作用：**收藏、顺序、选中视频、歌单会一起清掉**。要保留就先备份 `blmv.db`。
    */
-  if (version < SCHEMA_VERSION) {
-    console.warn(
-      `[db] 库的 schema 版本(${version})低于程序(${SCHEMA_VERSION})，按「不迁移」的约定重建库（数据会清空）`,
-    )
-    // 顺序无所谓（没有真外键），但要连旧版本留下的表一起清掉，否则残留表会一直在。
-    // **视图必须显式 DROP VIEW** —— `DROP TABLE` 管不到视图，留着旧视图会让
-    // 下面的 `CREATE VIEW IF NOT EXISTS` 变成空操作，于是视图停留在旧列结构上。
-    database.exec(`
-      DROP VIEW IF EXISTS videos_meta;
-      DROP TABLE IF EXISTS videos;
-      DROP TABLE IF EXISTS video_details;
-      DROP TABLE IF EXISTS song_meta;
-      DROP TABLE IF EXISTS playlist_songs;
-      DROP TABLE IF EXISTS playlists;
-    `)
-    database.exec(CREATE_TABLES_SQL)
-    database.pragma(`user_version = ${SCHEMA_VERSION}`)
-    console.log(`[db] 已重建数据库，schema 版本 -> ${SCHEMA_VERSION}`)
-    return
-  }
+  console.warn('[db] 表结构已变更（指纹不匹配），重建数据库（数据会清空）')
+  // 视图必须显式 DROP VIEW —— `DROP TABLE` 管不到它，而残留的旧视图会让
+  // 后面的 `CREATE VIEW IF NOT EXISTS` 变成空操作（视图停留在旧列结构上）。
+  database.exec(`
+    DROP VIEW IF EXISTS videos_meta;
+    DROP TABLE IF EXISTS videos;
+    DROP TABLE IF EXISTS song_meta;
+    DROP TABLE IF EXISTS playlist_songs;
+    DROP TABLE IF EXISTS playlists;
+  `)
+  database.exec(CREATE_TABLES_SQL)
+  database.pragma(`user_version = ${wanted}`)
+  console.log('[db] 已重建数据库')
 }
+
 
 /**
  * 取数据库连接（惰性初始化 + 建表）

@@ -282,7 +282,7 @@ const oldGetW_rid = (params: QueryParams): string => {
   return md5(paramStr + 'ea1db124af3c7062474693fa704f4ff8')
 }
 
-const buildSearchParams = (keyword: string): QueryParams => ({
+const buildSearchParams = (keyword: string, page = 1): QueryParams => ({
   __refresh__: 'true',
   _extra: '',
   ad_resource: '5654',
@@ -294,6 +294,8 @@ const buildSearchParams = (keyword: string): QueryParams => ({
   highlight: '1',
   keyword,
   order: '',
+  /** 页码（从 1 开始）—— 用户要求「结果太少就再查一页」 */
+  page: String(page),
   page_size: '42',
   platform: 'pc',
   qv_id: getQvId(),
@@ -380,11 +382,78 @@ export const isUrlUsable = (url: string | null | undefined): boolean => {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-export async function searchSong(keyword: string, retryCount = 0): Promise<BiliResponse> {
+/**
+ * 视频时长与歌曲时长的容差（秒）
+ *
+ * **用户定的规则**：搜索出来的 MV 时长和歌单里那首歌的时长差超过 ±90 秒就丢掉 ——
+ * 那多半不是同一首歌（可能是合集、live 全场、串烧）。
+ *
+ * 为什么是 90 秒：MV 常有前奏画面 / 片尾，比纯音频长十几秒很正常；
+ * 而「不是同一首歌」的差距通常是几分钟（合集更夸张）。
+ * 90 秒是这两者之间一个宽松但有效的分界。
+ */
+export const DURATION_TOLERANCE_SEC = 90
+
+/**
+ * 按「视频时长 vs 歌曲时长」过滤候选
+ *
+ * @param items 搜索结果里的视频条目
+ * @param songDurationSec 歌单里那首歌的时长（秒）；**未知时不过滤**
+ *        （宁可多留也不要因为拿不到时长而误杀）
+ * @returns 过滤后的条目；`songDurationSec` 未知时原样返回
+ */
+export const filterByDuration = <T extends { duration?: string | number | null }>(
+  items: T[],
+  songDurationSec: number | null | undefined,
+): T[] => {
+  /** 歌曲时长未知就不过滤 —— 没有参照物时任何过滤都是瞎猜 */
+  if (typeof songDurationSec !== 'number' || !Number.isFinite(songDurationSec) || songDurationSec <= 0) {
+    return items
+  }
+  return items.filter((item) => {
+    const sec = parseDurationToSeconds(item.duration)
+    /** 视频时长解析不出来时**保留**它（同上：不因缺数据而误杀） */
+    if (sec === null) return true
+    return Math.abs(sec - songDurationSec) <= DURATION_TOLERANCE_SEC
+  })
+}
+
+/**
+ * 把 B 站的时长字段解析成秒
+ *
+ * B 站的搜索结果里 `duration` 是 **`"4:03"` 这样的字符串**（或 `"1:02:03"`）。
+ * 这里独立实现一份（而不是复用 `@common/utils/duration`）是因为
+ * **main/biliApi.ts 不该依赖 common 的工具函数**（那是渲染层共享的），
+ * 而且这个解析只有十几行。
+ */
+export const parseDurationToSeconds = (
+  raw: string | number | null | undefined,
+): number | null => {
+  if (raw === null || raw === undefined) return null
+  if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? raw : null
+  const s = String(raw).trim()
+  if (!s) return null
+  /** 纯数字（秒） */
+  if (/^\d+$/.test(s)) {
+    const n = Number(s)
+    return n > 0 ? n : null
+  }
+  const parts = s.split(':').map((x) => Number(x))
+  if (parts.some((n) => !Number.isFinite(n))) return null
+  if (parts.length === 2) return parts[0] * 60 + parts[1]
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
+  return null
+}
+
+export async function searchSong(
+  keyword: string,
+  retryCount = 0,
+  page = 1,
+): Promise<BiliResponse> {
   const mixinKey = await getMixinKeyCached()
 
   if (mixinKey) {
-    const params = buildSearchParams(keyword)
+    const params = buildSearchParams(keyword, page)
     params.tids = '3'
     const query = encWbi(params, mixinKey)
     const url = `${SEARCH_API}?${query}`
@@ -394,13 +463,13 @@ export async function searchSong(keyword: string, retryCount = 0): Promise<BiliR
       clearMixinKey()
       if (retryCount < 2) {
         await sleep(1000)
-        return searchSong(keyword, retryCount + 1)
+        return searchSong(keyword, retryCount + 1, page)
       }
       throw innerErr
     }
   }
 
-  const params = buildSearchParams(keyword)
+  const params = buildSearchParams(keyword, page)
   /**
    * `tids` 必须**先**设好再算签名。
    *
@@ -420,9 +489,108 @@ export async function searchSong(keyword: string, retryCount = 0): Promise<BiliR
   } catch (err) {
     if (retryCount < 2) {
       await sleep(1000)
-      return searchSong(keyword, retryCount + 1)
+      return searchSong(keyword, retryCount + 1, page)
     }
     throw err
+  }
+}
+
+/**
+ * 搜索结果里的一个视频条目（**只声明用到的字段**）
+ *
+ * 刻意不引 `cache.ts` 里那个内部类型：`biliApi` 是「取数据」的层，
+ * 不该依赖缓存层的形状。搜索结果本来就带一堆额外字段，
+ * 用索引签名接住即可。
+ */
+export interface SearchVideoItem {
+  bvid?: string
+  title?: string
+  pic?: string
+  author?: string
+  duration?: number | string | null
+  [key: string]: unknown
+}
+
+/**
+ * 搜索结果最少要多少条才够用
+ *
+ * **用户定的规则**：过滤后**少于 30 条就再查一页**。
+ * 因为时长过滤会砍掉一批候选（尤其在歌单时长和 MV 对不上的时候），
+ * 只剩几条的话用户没得挑。
+ */
+export const MIN_SEARCH_RESULTS = 30
+
+/**
+ * 搜索 + 时长过滤 +「结果太少就再查一页」
+ *
+ * ## 流程（用户定的规则）
+ *
+ *  1. 搜第 1 页（B站每页 42 条）
+ *  2. 按「视频时长 vs 歌曲时长 ±90 秒」过滤
+ *  3. 过滤后**少于 30 条**就再查第 2 页，把两页合并（**去重后**）再过滤一次
+ *
+ * ## 为什么要「先过滤再判断够不够」
+ *
+ * 因为时长过滤是**真的会砍掉很多**的 —— 一首 4 分钟的歌，
+ * 搜索结果里常混着「合集（2 小时）」「live 全场（1 小时）」。
+ * 不滤的话看着有 42 条，实际能用的可能只有十来个。
+ *
+ * ## 关于「第二页」
+ *
+ * 只查一页追加（不循环到第 3 页）：B站的音乐搜索相关性排序，
+ * 第 3 页以后基本是无关结果，再翻下去等于用噪声凑数。
+ *
+ * @param keyword 搜索词
+ * @param songDurationSec 歌单里那首歌的时长（秒）；**未知则不过滤**
+ */
+export const searchSongFiltered = async (
+  keyword: string,
+  songDurationSec: number | null | undefined,
+): Promise<{ items: SearchVideoItem[]; filteredOut: number; pages: number }> => {
+  /** 从响应里取出视频条目（`result` 里可能混着番剧/专栏，只要 `type === 'video'`） */
+  const extract = (res: BiliResponse): SearchVideoItem[] => {
+    const list = res.data?.result
+    if (!Array.isArray(list)) return []
+    return (list as SearchVideoItem[]).filter(
+      (item) => (item as { type?: string }).type === 'video',
+    )
+  }
+
+  const first = await searchSong(keyword, 0, 1)
+  if (first.code !== 0) throw new Error(first.message ?? '搜索失败')
+  let all = extract(first)
+  const firstFiltered = filterByDuration(all, songDurationSec)
+  let filteredOut = all.length - firstFiltered.length
+  let pages = 1
+
+  if (firstFiltered.length < MIN_SEARCH_RESULTS) {
+    /**
+     * 结果偏少 → 再查一页。
+     *
+     * 第二页失败**不影响**已有结果（拿第 1 页的照样能用），
+     * 所以单独 try 起来。
+     */
+    try {
+      await sleep(600) // 稍微错开，避免触发风控
+      const second = await searchSong(keyword, 0, 2)
+      if (second.code === 0) {
+        const more = extract(second)
+        /** 按 bvid 去重：两页之间可能有重复条目 */
+        const seen = new Set(all.map((x) => String(x.bvid ?? '')))
+        const add = more.filter((x) => x.bvid && !seen.has(String(x.bvid)))
+        all = [...all, ...add]
+        pages = 2
+        filteredOut = all.length - filterByDuration(all, songDurationSec).length
+      }
+    } catch (err) {
+      console.warn('[search] 第 2 页失败（用第 1 页结果继续）:', err)
+    }
+  }
+
+  return {
+    items: filterByDuration(all, songDurationSec),
+    filteredOut,
+    pages,
   }
 }
 
@@ -511,6 +679,13 @@ export interface ResolveVideoResult {
   dash: DashStreams | null
   viewData: BiliResponse
   playData: BiliResponse
+  /**
+   * 视频的 `cid`
+   *
+   * 它**本来就要取**（拿 playurl 必须用），顺手带出来是为了让调用方
+   * 能拿它去取 **AI 字幕**（歌词自动对齐要用）—— 这样不增加任何额外请求。
+   */
+  cid: number
 }
 
 /**
@@ -829,7 +1004,7 @@ export async function resolveVideoUrl(
     })
     const dash = extractDashStreams(dashData, qn, audioId)
     if (dash && dashData) {
-      return { videoUrl: null, dash, viewData, playData: dashData }
+      return { videoUrl: null, dash, viewData, playData: dashData, cid }
     }
   }
 
@@ -842,8 +1017,16 @@ export async function resolveVideoUrl(
   })
   const durl = firstDurl(durlData)
   if (durl && durlData) {
-    return { videoUrl: durl, dash: null, viewData, playData: durlData }
+    return { videoUrl: durl, dash: null, viewData, playData: durlData, cid }
   }
 
   throw new Error('无法获取视频地址')
 }
+
+/**
+ * 当前是否已登录（**走缓存**，不额外打接口）
+ *
+ * `ensureLoginState` 自己会缓存登录态（`loginState` 变量），
+ * 所以这里只是给它一个更直白的名字给业务代码用。
+ */
+export const isLoggedIn = async (): Promise<boolean> => (await ensureLoginState()) === true

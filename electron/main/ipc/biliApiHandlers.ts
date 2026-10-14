@@ -18,6 +18,7 @@ import * as biliApi from '../biliApi'
 import { isUrlUsable, readQualityOptions } from '../biliApi'
 import type { DashStreams } from '../biliApi'
 import { getSetting } from '../utils/setting'
+import { findSongDuration } from '../utils/playlist'
 import { readVideoQuality } from '../utils/quality'
 import type * as cacheManager from '../utils/cache'
 
@@ -193,6 +194,52 @@ export const registerApiHandlers = (context: ApiContext): void => {
 
     if (result.code !== 0) {
       throw new Error(result.message ?? '搜索失败')
+    }
+
+    /**
+     * ★ 时长过滤 +「结果太少就再查一页」
+     *
+     * **用户定的规则**：搜索出来的视频时长和歌单里那首歌的时长差超过 ±90 秒
+     * 就丢掉（那多半不是同一首歌——合集、live 全场、串烧）；过滤后**少于 30 条**
+     * 就再查一页补齐。
+     *
+     * 为什么这件事放在主进程而不是渲染层：
+     *  - 翻页要再发一次搜索请求（渲染层不该直接打 B站接口）；
+     *  - 过滤后的结果要**写进缓存**，而缓存是主进程的事。
+     */
+    try {
+      const songSec = findSongDuration(keyword)
+      const picked = await biliApi.searchSongFiltered(keyword, songSec)
+      if (picked.items.length > 0) {
+        /**
+         * 用过滤后的列表替换响应的 `result`（后续合并/排序/写库全都基于它）。
+         *
+         * `filteredOut` 只记日志：它代表「因为时长差太多而丢掉的候选数」，
+         * 排查「为什么这首歌搜不到视频」时这一行很关键。
+         */
+        result.data = { ...(result.data ?? {}), result: picked.items }
+        if (picked.filteredOut > 0 || picked.pages > 1) {
+          console.log(
+            `[search] 《${keyword}》时长过滤 ${songSec ?? '未知'}s：` +
+              `保留 ${picked.items.length} 条，丢弃 ${picked.filteredOut} 条，用了 ${picked.pages} 页`,
+          )
+        }
+      } else if (picked.filteredOut > 0) {
+        /**
+         * 全被过滤掉了：**保留原样**（不返回空）。
+         *
+         * 理由：空结果会让渲染层走「重试 3 次」的逻辑，而这里根本不是搜索失败，
+         * 是「按时长判全都不是同一首歌」。返回原列表至少让用户有得挑，
+         * 界面还能自己判断。日志里说明过滤情况即可。
+         */
+        console.warn(
+          `[search] 《${keyword}》按时长过滤后为空（丢弃 ${picked.filteredOut} 条），` +
+            `回退为不过滤（避免被当成搜索失败去重试）`,
+        )
+      }
+    } catch (err) {
+      /** 过滤/翻页失败**不能**让搜索整体失败 —— 用原结果继续 */
+      console.warn('[search] 时长过滤/翻页失败（用原始结果继续）:', err)
     }
 
     /**

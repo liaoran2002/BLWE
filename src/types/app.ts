@@ -137,7 +137,6 @@ export interface AppData {
 
   // ---- 请求竞态令牌 ----
   _songToken: number
-
   // ---- 登录态 ----
   isLoggedIn: boolean
   userFace: string

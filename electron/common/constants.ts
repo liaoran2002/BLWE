@@ -44,6 +44,7 @@ export const COLOR_HEX_PATTERN = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/
  */
 export const DARK_TINT_LUMINANCE = 0.5
 
+
 /**
  * 透明度的取值范围与步进
  *

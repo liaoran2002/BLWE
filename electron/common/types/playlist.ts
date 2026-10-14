@@ -52,6 +52,16 @@ export interface PlaylistSong {
    * schema v2 起统一成秒，展示时用 `formatDuration()` 转回 `mm:ss`。
    */
   duration?: number | null
+  /**
+   * 平台侧歌曲 id（QQ 数字 id / 网易云 id / 酷我 rid）
+   *
+   * 歌单导入时从音源带过来，**取歌词时用它精确定位** ——
+   * 不用拿「歌名 + 歌手」重新搜（那是模糊搜索，可能搜到别的版本，
+   * 于是显示错误的歌词）。
+   */
+  platformId?: string | null
+  /** 来源音源（`wy` / `tx` / `kw`），与 `platformId` 配对 */
+  source?: string
 }
 
 /**

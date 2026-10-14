@@ -88,6 +88,8 @@ const toSong = (song: WySong): ParsedSong | null =>
     interval: getInterval(song),
     albumName: getAlbumName(song),
     cover: getCover(song),
+    /** 网易云的歌曲 id —— 取歌词（以及落月 API 的 `id` 参数）都要它 */
+    platformId: song.id ?? null,
   })
 
 const mapSongs = (songs: WySong[] | undefined): ParsedSong[] => {

@@ -78,6 +78,10 @@ interface SongDbRow {
   cover: string | null
   /** 秒（schema v2 起；原来是平台原样给的 "4:03" 字符串） */
   duration: number | null
+  /** 来源音源（wy / tx / kw） */
+  source: string | null
+  /** 平台侧歌曲 id —— 取歌词要用它精确定位 */
+  platform_id: string | null
 }
 
 /** `sync_mode` 列 -> `PlaylistSyncMode`（脏值一律当 off，别让界面拿到未定义的行为） */
@@ -112,6 +116,10 @@ const normalizeSong = (input: unknown): PlaylistSong | null => {
       album: typeof raw.album === 'string' && raw.album ? raw.album : undefined,
       cover: typeof raw.cover === 'string' && raw.cover ? raw.cover : null,
       duration: durationToSeconds(raw.duration),
+      /** 平台 id / 音源：取歌词用，可能没有（手动添加的歌就没有） */
+      platformId:
+        typeof raw.platformId === 'string' && raw.platformId ? raw.platformId : null,
+      source: typeof raw.source === 'string' && raw.source ? raw.source : undefined,
     }
   }
   return null
@@ -188,7 +196,7 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
    */
   const songRows = db
     .prepare(
-      `SELECT playlist_id, ord, name, singer, album, cover, duration
+      `SELECT playlist_id, ord, name, singer, album, cover, duration, source, platform_id
          FROM playlist_songs
         ORDER BY playlist_id ASC, ord ASC`,
     )
@@ -206,6 +214,8 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
       album: row.album ?? undefined,
       cover: row.cover,
       duration: row.duration,
+      platformId: row.platform_id,
+      source: row.source ?? undefined,
     })
   }
 
@@ -262,8 +272,8 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
     )
     const insertSong = db.prepare(
       `INSERT INTO playlist_songs
-         (playlist_id, ord, name, singer, album, cover, duration)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (playlist_id, ord, name, singer, album, cover, duration, source, platform_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
 
     for (const record of store.playlists) {
@@ -288,6 +298,8 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
           song.album ?? null,
           song.cover ?? null,
           song.duration ?? null,
+          song.source ?? null,
+          song.platformId ?? null,
         )
       })
     }
@@ -350,6 +362,35 @@ export const initPlaylists = (): void => {
 
 /** 取完整集合（深拷贝，避免调用方改到内存里那份） */
 export const getPlaylists = (): PlaylistStoreData => structuredClone(data)
+
+/**
+ * 按搜索键查一首歌的时长（秒）
+ *
+ * 用途：搜索 B站 MV 时按「视频时长 vs 歌曲时长 ±90 秒」过滤候选
+ * （见 `biliApi.searchSongFiltered`）—— 时长差太多的多半不是同一首歌。
+ *
+ * 遍历所有歌单里的所有曲目，取第一个匹配的。**遍历内存里的 data**
+ * （不是查库）：歌单是主进程内存里的权威副本，而且这里要的是「快」——
+ * 每次搜索都要调一次，走 SQLite 反而多一层开销。
+ *
+ * @returns 时长（秒）；找不到或时长为空返回 `null`（调用方据此**跳过过滤**）
+ */
+export const findSongDuration = (searchKey: string): number | null => {
+  const want = searchKey.trim().toLowerCase()
+  if (!want) return null
+  for (const record of data.playlists) {
+    for (const song of record.songs) {
+      /**
+       * 用 `toSearchKey` 生成键再比 —— 与渲染层、缓存用的是**同一个函数**，
+       * 这样三处的「这首歌是谁」判定完全一致（手工拼字符串早晚会漂移）。
+       */
+      if (toSearchKey(song).trim().toLowerCase() !== want) continue
+      const d = song.duration
+      return typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null
+    }
+  }
+  return null
+}
 
 /** 整体覆盖保存（渲染进程每次增删改后调用） */
 export const savePlaylists = (params: PlaylistSaveParams): PlaylistStoreData => {
@@ -437,6 +478,9 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
       album: song.albumName,
       cover: song.cover ?? null,
       duration: durationToSeconds(song.interval),
+      /** 顺手带上平台 id 与音源 —— 取歌词要用（见 PlaylistSong.platformId） */
+      platformId: song.platformId ?? null,
+      source: song.source,
     }))
     if (songs.length > MAX_SYNC_SONGS) songs = songs.slice(0, MAX_SYNC_SONGS)
 

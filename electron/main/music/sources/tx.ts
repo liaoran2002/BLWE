@@ -80,6 +80,13 @@ const toSong = (item: TxRawSong): ParsedSong | null =>
     interval: formatPlayTime(item.interval),
     albumName: item.album?.name,
     cover: getTxCover(item),
+    /**
+     * QQ 的数字 id —— 平台侧的唯一标识
+     *
+     * 优先用它（`mid` 作为兜底）：有了它就能精确定位「歌单里的是哪一首」，
+     * 不必依赖「歌名 + 歌手」这种模糊匹配（同名 live / 翻唱会撞车）。
+     */
+    platformId: item.id ?? item.mid ?? null,
   })
 
 const mapSongs = (songs: TxRawSong[] | undefined): ParsedSong[] => {

@@ -86,6 +86,7 @@ const api = {
     rendererOn('trayMenu:visibility', cb),
   // #endregion
 
+
   // #region 任务栏进度
   setProgress: (progress: number, paused: boolean): Promise<void> =>
     rendererInvoke('window:setProgress', { progress, paused }),

@@ -25,7 +25,8 @@ export const MUSIC_SOURCE_NAMES: Record<MusicSource, string> = {
 /**
  * 解析出来的一首歌（归一化后的精简结构）
  *
- * 只保留歌单导入需要的字段：歌名 + 歌手 + 时长。
+ * 只保留歌单导入需要的字段：歌名 + 歌手 + 时长，
+ * 外加**平台侧歌曲 id**（见下）。
  */
 export interface ParsedSong {
   /** 歌名 */
@@ -40,6 +41,16 @@ export interface ParsedSong {
   cover?: string | null
   /** 来源音源 */
   source: MusicSource
+  /**
+   * **平台侧歌曲 id**（QQ 的数字 id / 网易云的 id / 酷我的 rid…）
+   *
+   * 为什么要留它：**取歌词必须要这个 id**。不留的话，取歌词得拿
+   * 「歌名 + 歌手」再去平台搜一次 —— 而那是模糊搜索，可能搜到**别的版本**
+   * （同名不同编曲、live 版、翻唱），于是显示错误的歌词。
+   *
+   * 有这个 id 就能精确定位到**用户歌单里那一首**，也省一次搜索。
+   */
+  platformId?: string | null
 }
 
 /** 歌单元信息 */

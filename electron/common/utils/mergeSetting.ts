@@ -50,6 +50,26 @@ export const mergeSetting = (
 
     const originValue = originSetting[key]
 
+    /**
+     * ★ **类型校验**：类型和默认值不符就丢掉，用默认值
+     *
+     * 为什么必须在**这里**也做（`updateSetting` 里已经有一套）：
+     * 两处管的是**不同的入口** ——
+     *  - `updateSetting` 管「渲染进程写进来的」
+     *  - 这里管「**磁盘上读出来的**」
+     *
+     * 只做前者会留下一个隐蔽的坑（**我踩过**）：某个 key 的默认值从
+     * `null` 改成 `number` 之后，**老用户磁盘上那个 `null` 会被原样读回来**，
+     * 于是覆盖掉新默认值；而 `updateSetting` 的类型校验要求「与当前默认值同类型」，
+     * 结果**这个键从此再也写不进去**（每次写入都被判「类型不符」丢掉）。
+     * 表现就是「拖动没反应」——而且日志只报一行 warn，极难查。
+     *
+     * 修了这里，磁盘上的脏类型会被自动纠正成默认值，写入随即恢复正常。
+     */
+    if (typeof targetValue !== typeof originValue) {
+      continue
+    }
+
     // 数组做一次浅比较，避免每次 getSetting 都因数组引用不同而产生噪声广播
     if (Array.isArray(targetValue) && Array.isArray(originValue)) {
       const targetArr = targetValue as unknown[]

@@ -22,7 +22,8 @@
   "dependencies": {
     "better-sqlite3": "^13.0.3",
     "bytenode": "^1.7.0",
-    "koffi": "^3.3.3"
+    "koffi": "^3.3.3",
+    "opencc-js": "^1.4.2"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",

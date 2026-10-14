@@ -100,6 +100,8 @@ const mapSongs = (songs: KwRawSong[] | undefined): ParsedSong[] => {
       albumName: decodeName(item.album),
       // 酷我列表接口不返回封面，这里留空（播放时用视频封面兜底）
       cover: null,
+      /** 酷我的歌曲 rid —— 取歌词要用它 */
+      platformId: item.id ?? null,
     })
     if (song) result.push(song)
   }

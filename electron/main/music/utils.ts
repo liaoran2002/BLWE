@@ -157,6 +157,8 @@ export const toParsedSong = (
     interval?: unknown
     albumName?: unknown
     cover?: unknown
+    /** 平台侧歌曲 id —— 取歌词要用它精确定位（见 ParsedSong.platformId 的注释） */
+    platformId?: unknown
   },
 ): ParsedSong | null => {
   const name = decodeName(raw.name == null ? '' : String(raw.name)).trim()
@@ -170,6 +172,8 @@ export const toParsedSong = (
     albumName: raw.albumName == null ? undefined : decodeName(String(raw.albumName)),
     cover,
     source,
+    platformId:
+      raw.platformId == null || raw.platformId === '' ? null : String(raw.platformId),
   }
 }
 
