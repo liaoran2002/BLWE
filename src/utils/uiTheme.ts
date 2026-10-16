@@ -22,11 +22,14 @@ import {
   COLOR_HEX_PATTERN,
   DARK_TINT_LUMINANCE,
   DEFAULT_FONT_COLOR,
+  DEFAULT_IDLE_OPACITY,
   DEFAULT_THEME_COLOR,
   GLASS_BLUR_MAX,
   GLASS_BLUR_MIN,
   GLASS_SHADOW_MAX,
   GLASS_SHADOW_MIN,
+  IDLE_OPACITY_MAX,
+  IDLE_OPACITY_MIN,
 } from '@common/constants';
 
 /** 与 defaultSetting 里的 `common.glassTransparency` 对齐 */
@@ -75,6 +78,7 @@ export interface UiThemeInput {
   'common.themeColor'?: string;
   'common.fontColor'?: string;
   'common.glassTransparency'?: number;
+  'common.idleOpacity'?: number;
   'common.glassBlur'?: number;
   'common.glassShadow'?: number;
 }
@@ -94,6 +98,19 @@ export const applyUiTheme = (input: UiThemeInput): void => {
     (Number.isFinite(pct) ? Math.min(100, Math.max(0, pct)) : DEFAULT_TRANSPARENCY) / 100;
   root.style.setProperty('--glass-alpha', alpha.toFixed(2));
   root.style.setProperty('--glass-alpha-strong', Math.min(1, alpha + STRONG_DELTA).toFixed(2));
+
+  /**
+   * 闲置透明度：**存的是百分比（0-100），写进去的是 0-1 的小数**
+   *
+   * 和 `--glass-alpha` 一样要除 100（CSS 的 `opacity` 收小数）。
+   * 悬停时 CSS 直接写死 `opacity: 1`（见 biliVideoControls.vue），所以这里只管闲置态。
+   */
+  const idlePct = Number(input['common.idleOpacity']);
+  const idle =
+    (Number.isFinite(idlePct)
+      ? Math.min(IDLE_OPACITY_MAX, Math.max(IDLE_OPACITY_MIN, idlePct))
+      : DEFAULT_IDLE_OPACITY) / 100;
+  root.style.setProperty('--ui-idle-opacity', idle.toFixed(2));
 
   const px = Number(input['common.glassBlur']);
   const radius = Number.isFinite(px)

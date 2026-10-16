@@ -71,6 +71,29 @@ export const GLASS_TRANSPARENCY_MAX = 100
 export const GLASS_TRANSPARENCY_STEP = 5
 
 /**
+ * 控制栏**闲置透明度**的默认值与范围
+ *
+ * 这是「鼠标不悬停时整个控制栏淡到多透明」（0-100%，悬停时恢复完全不透明）。
+ *
+ * ⚠️ 和上面的「透明度」（`GLASS_TRANSPARENCY_*`）**不是一回事**：
+ *  - 透明度 → 玻璃**底色**有多透（`--glass-alpha`），悬停前后都一样；
+ *  - 闲置透明度 → 整个**控件**淡出到什么程度（`--ui-idle-opacity`），悬停会恢复。
+ *
+ * 默认 10 就是改造前写死的 `--ui-idle-opacity: 0.1`（老用户观感不变）。
+ */
+export const DEFAULT_IDLE_OPACITY = 10
+export const IDLE_OPACITY_MIN = 0
+export const IDLE_OPACITY_MAX = 100
+/**
+ * 一档 **10%** —— 0-100 的范围按十步一进
+ *
+ * 比「透明度」的 5% 一档粗：那个值直接影响玻璃底的可见度、需要细调；
+ * 而闲置透明度只是"淡出到多明显"，10% 一档已经够用，
+ * 而且**整十的数值更好记**（用户会说"我要 30%"）。
+ */
+export const IDLE_OPACITY_STEP = 10
+
+/**
  * 模糊强度
  *
  * 界面上的滑块是百分比（0-100%，5% 一档），**存的是 0-20 的像素值**：

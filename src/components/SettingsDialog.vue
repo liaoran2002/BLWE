@@ -148,6 +148,29 @@
             <span class="st-value">{{ setting['common.glassTransparency'] }}%</span>
           </div>
         </div>
+        <!--
+          控制栏闲置透明度
+
+          管的是「鼠标**不**悬停时整个控制栏淡到多透明」（移上去恢复完全不透明）。
+          和上面的「透明度」不是一回事：那个管玻璃**底色**，悬停前后都一样。
+        -->
+        <div class="st-row">
+          <div class="st-name">
+            控制栏闲置透明度
+            <span class="st-desc">不悬停时淡出的程度</span>
+          </div>
+          <div class="st-slider-box">
+            <el-slider
+              class="st-slider"
+              :model-value="setting['common.idleOpacity']"
+              :min="IDLE_OPACITY_MIN"
+              :max="IDLE_OPACITY_MAX"
+              :step="IDLE_OPACITY_STEP"
+              @update:model-value="(v: number | number[]) => setIdleOpacity(v)"
+            />
+            <span class="st-value">{{ setting['common.idleOpacity'] }}%</span>
+          </div>
+        </div>
         <div class="st-row">
           <div class="st-name">模糊强度</div>
           <div class="st-slider-box">
@@ -213,6 +236,23 @@
           <el-switch
             :model-value="setting['common.wallpaperMode']"
             @update:model-value="(v: string | number | boolean) => setBool('common.wallpaperMode', v)"
+          />
+        </div>
+        <!--
+          开机自动启动
+
+          写进系统启动项（Windows 注册表 Run 键），下次开机自动拉起。
+          ⚠️ 便携版会注册**当前 exe 的完整路径** —— 之后挪动文件夹的话，
+          启动项里还是旧路径，会静默失效（每次启动应用会重写一遍来纠正）。
+        -->
+        <div class="st-row">
+          <div class="st-name">
+            开机自动启动
+            <span class="st-desc">移动程序位置后需要重新开一次</span>
+          </div>
+          <el-switch
+            :model-value="setting['common.autoLaunch']"
+            @update:model-value="(v: string | number | boolean) => setBool('common.autoLaunch', v)"
           />
         </div>
         <div class="st-row">
@@ -474,6 +514,10 @@ import {
   GLASS_TRANSPARENCY_MAX,
   GLASS_TRANSPARENCY_MIN,
   GLASS_TRANSPARENCY_STEP,
+  /** 控制栏闲置透明度的范围与步进（0-100，**十步一进**） */
+  IDLE_OPACITY_MAX,
+  IDLE_OPACITY_MIN,
+  IDLE_OPACITY_STEP,
   MS_PER_DAY,
   MIN_SEARCH_RESULTS_MAX,
   VIDEO_QUALITY_OPTIONS,
@@ -537,6 +581,10 @@ export default defineComponent({
       GLASS_TRANSPARENCY_MIN,
       GLASS_TRANSPARENCY_MAX,
       GLASS_TRANSPARENCY_STEP,
+      /** 控制栏闲置透明度：0-100，**十步一进** */
+      IDLE_OPACITY_MIN,
+      IDLE_OPACITY_MAX,
+      IDLE_OPACITY_STEP,
       /** 模糊强度 / 阴影强度：滑块是百分比（0-100%，5% 一档），存的却是 0-20px */
       GLASS_BLUR_PERCENT_STEP,
       GLASS_SHADOW_PERCENT_STEP,
@@ -814,6 +862,7 @@ export default defineComponent({
         | 'player.pauseOnDeviceChange'
         | 'player.lockOnFullscreen'
         | 'common.wallpaperMode'
+        | 'common.autoLaunch'
         | 'common.closeToTray'
         | 'common.taskbarProgress',
       v: string | number | boolean,
@@ -843,6 +892,19 @@ export default defineComponent({
       this.set(
         'common.glassTransparency',
         snapSlider(v, GLASS_TRANSPARENCY_MIN, GLASS_TRANSPARENCY_MAX, GLASS_TRANSPARENCY_STEP),
+      );
+    },
+    /**
+     * 控制栏闲置透明度
+     *
+     * 与其它滑块一样过 `snapSlider`：`el-slider` 在某些交互下会给出
+     * 不在步进上的值（拖动 + 键盘微调），统一夹一次能保证存进去的总是整步。
+     * 这里步进是 **10**（0-100 十步一进），所以存进去的会是 0/10/20/…/100。
+     */
+    setIdleOpacity(v: number | number[]): void {
+      this.set(
+        'common.idleOpacity',
+        snapSlider(v, IDLE_OPACITY_MIN, IDLE_OPACITY_MAX, IDLE_OPACITY_STEP),
       );
     },
     /**

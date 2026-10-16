@@ -5,8 +5,8 @@
 > - 想看架构 / 数据流 / 踩坑记录 → [ARCHITECTURE.md](ARCHITECTURE.md)
 > - 想看怎么用 → [README.md](README.md)
 >
-> 阅读顺序建议：先看 [第一部分（文件职责）](#第一部分每个文件负责什么) 建立地图，
-> 再看 [第二部分（功能实现）](#第二部分每项功能怎么实现的) 把跨文件的链路串起来。
+> 阅读顺序建议：先看 [第一部分（文件职责）](#%E7%AC%AC%E4%B8%80%E9%83%A8%E5%88%86%E6%AF%8F%E4%B8%AA%E6%96%87%E4%BB%B6%E8%B4%9F%E8%B4%A3%E4%BB%80%E4%B9%88) 建立地图，
+> 再看 [第二部分（功能实现）](#%E7%AC%AC%E4%BA%8C%E9%83%A8%E5%88%86%E6%AF%8F%E9%A1%B9%E5%8A%9F%E8%83%BD%E6%80%8E%E4%B9%88%E5%AE%9E%E7%8E%B0%E7%9A%84) 把跨文件的链路串起来。
 
 ---
 
@@ -14,27 +14,27 @@
 
 **第一部分：每个文件负责什么**
 
-- [1. 主进程（electron/main/）](#1-主进程electronmain)
-- [2. 主进程与渲染层共用（electron/common/）](#2-主进程与渲染层共用electroncommon)
-- [3. 预加载（electron/preload/）](#3-预加载electronpreload)
-- [4. 渲染层（src/）](#4-渲染层src)
-- [5. 构建与打包](#5-构建与打包)
+- [1. 主进程（electron/main/）](#1-%E4%B8%BB%E8%BF%9B%E7%A8%8Belectronmain)
+- [2. 主进程与渲染层共用（electron/common/）](#2-%E4%B8%BB%E8%BF%9B%E7%A8%8B%E4%B8%8E%E6%B8%B2%E6%9F%93%E5%B1%82%E5%85%B1%E7%94%A8electroncommon)
+- [3. 预加载（electron/preload/）](#3-%E9%A2%84%E5%8A%A0%E8%BD%BDelectronpreload)
+- [4. 渲染层（src/）](#4-%E6%B8%B2%E6%9F%93%E5%B1%82src)
+- [5. 构建与打包](#5-%E6%9E%84%E5%BB%BA%E4%B8%8E%E6%89%93%E5%8C%85)
 
 **第二部分：每项功能怎么实现的**
 
-- [1. 歌单导入与解析](#1-歌单导入与解析)
-- [2. 搜索：从歌名到候选视频列表](#2-搜索从歌名到候选视频列表)
-- [3. 搜索结果排序（硬过滤 + 打分）](#3-搜索结果排序硬过滤--打分)
-- [4. 播放地址解析（dash / durl 两条路）](#4-播放地址解析dash--durl-两条路)
-- [5. dash + MSE 播放](#5-dash--mse-播放)
-- [6. 切歌预热（为什么切歌几乎无感）](#6-切歌预热为什么切歌几乎无感)
-- [7. 收藏与「添加视频」](#7-收藏与添加视频)
-- [8. 续播](#8-续播)
-- [9. 桌面壁纸模式](#9-桌面壁纸模式)
-- [10. 系统托盘（含自绘菜单）](#10-系统托盘含自绘菜单)
-- [11. 配置（setting）的读写与广播](#11-配置setting的读写与广播)
-- [12. 缓存与过期](#12-缓存与过期)
-- [13. 打包与代码保护](#13-打包与代码保护)
+- [1. 歌单导入与解析](#1-%E6%AD%8C%E5%8D%95%E5%AF%BC%E5%85%A5%E4%B8%8E%E8%A7%A3%E6%9E%90)
+- [2. 搜索：从歌名到候选视频列表](#2-%E6%90%9C%E7%B4%A2%E4%BB%8E%E6%AD%8C%E5%90%8D%E5%88%B0%E5%80%99%E9%80%89%E8%A7%86%E9%A2%91%E5%88%97%E8%A1%A8)
+- [3. 搜索结果排序（硬过滤 + 打分）](#3-%E6%90%9C%E7%B4%A2%E7%BB%93%E6%9E%9C%E6%8E%92%E5%BA%8F%E7%A1%AC%E8%BF%87%E6%BB%A4--%E6%89%93%E5%88%86)
+- [4. 播放地址解析（dash / durl 两条路）](#4-%E6%92%AD%E6%94%BE%E5%9C%B0%E5%9D%80%E8%A7%A3%E6%9E%90dash--durl-%E4%B8%A4%E6%9D%A1%E8%B7%AF)
+- [5. dash + MSE 播放](#5-dash--mse-%E6%92%AD%E6%94%BE)
+- [6. 切歌预热（为什么切歌几乎无感）](#6-%E5%88%87%E6%AD%8C%E9%A2%84%E7%83%AD%E4%B8%BA%E4%BB%80%E4%B9%88%E5%88%87%E6%AD%8C%E5%87%A0%E4%B9%8E%E6%97%A0%E6%84%9F)
+- [7. 收藏与「添加视频」](#7-%E6%94%B6%E8%97%8F%E4%B8%8E%E6%B7%BB%E5%8A%A0%E8%A7%86%E9%A2%91)
+- [8. 续播](#8-%E7%BB%AD%E6%92%AD)
+- [9. 桌面壁纸模式](#9-%E6%A1%8C%E9%9D%A2%E5%A3%81%E7%BA%B8%E6%A8%A1%E5%BC%8F)
+- [10. 系统托盘（含自绘菜单）](#10-%E7%B3%BB%E7%BB%9F%E6%89%98%E7%9B%98%E5%90%AB%E8%87%AA%E7%BB%98%E8%8F%9C%E5%8D%95)
+- [11. 配置（setting）的读写与广播](#11-%E9%85%8D%E7%BD%AEsetting%E7%9A%84%E8%AF%BB%E5%86%99%E4%B8%8E%E5%B9%BF%E6%92%AD)
+- [12. 缓存与过期](#12-%E7%BC%93%E5%AD%98%E4%B8%8E%E8%BF%87%E6%9C%9F)
+- [13. 打包与代码保护](#13-%E6%89%93%E5%8C%85%E4%B8%8E%E4%BB%A3%E7%A0%81%E4%BF%9D%E6%8A%A4)
 
 ---
 
@@ -46,7 +46,7 @@
 
 **职责**：编排启动顺序，持有主窗口 / 登录窗口 / 自绘托盘菜单窗口的生命周期，
 维护「应用层模拟全屏」与「桌面壁纸模式」两套状态机，管理托盘，
-响应显示器变化，退出前 flush 配置与歌单。
+响应显示器变化，响应配置变化（宽高比 / 过期清理 / 开机启动），退出前 flush 配置与歌单。
 
 **启动顺序即契约**（顺序错了会出真问题）：
 
@@ -54,10 +54,11 @@
 ① setupUserDataPath()          ← 必须最早期，改 userData
 ② registerProtectedScheme()    ← 必须在 whenReady 之前，privileges 才生效
 ③ whenReady → initSetting() + initPlaylists()
-④ installProtectedProtocol()   ← 必须在建窗之前
-⑤ registerIpcHandlers({...20 个能力})
-⑥ createMainWindow() + createTray()
-⑦ watchDisplayChanges() + grabCookiesSilently()
+④ applyAutoLaunch()            ← 按设置写系统启动项（每次启动都重写，见下）
+⑤ installProtectedProtocol()   ← 必须在建窗之前
+⑥ registerIpcHandlers({...20 个能力})
+⑦ createMainWindow() + createTray()
+⑧ watchDisplayChanges() + grabCookiesSilently()
 ```
 
 整条链末尾挂了 `.catch()` → `dialog.showErrorBox` + `app.exit(1)`，
@@ -80,11 +81,20 @@
   每次弹出都**重装 120ms 兜底定时器**，因为页面「高度没变就不回报」。
 - **两个 `webRequest` 钩子**：注入 `Referer`（跳过登录窗口自己的请求）、
   媒体域 CORS 统一覆写（**必须大小写不敏感地先删再加**）。
+- **开机自动启动 `applyAutoLaunch()`**（设置 `common.autoLaunch`，默认关）：
+  用 Electron 内建的 `app.setLoginItemSettings({ openAtLogin, path: process.execPath, args: [] })`，
+  **不需要额外原生依赖**。三个刻意决定：
+  ① **每次启动都重写**（不是只写一次）—— 便携版注册的是当前 exe 路径，
+     用户挪动文件夹后旧路径会**静默失效**（Windows 找不到就跳过，无提示），重写能自动纠正；
+  ② **开发模式一律关掉**（`isDev` 时主动写 `false`）—— 免得把 `electron.exe` 注册进启动项；
+  ③ **`args` 传空**—— 不传 `--wallpaper-mode`（那是「这次直接进壁纸」，由
+     `common.wallpaperMode` 自己决定，传参数会让两个开关打架）。
+  改设置时由 `onSettingChange` 立刻应用（否则要等下次启动才生效，用户会以为没用）。
 
 **踩过的坑（举几个最重的）**：
 
 | 坑 | 后果 |
-| --- | --- |
+| :--- | :--- |
 | 透明窗口 + 无 GPU 加速 → `WS_EX_LAYERED` | 挂到 WorkerW 后**声音还在、画面没了** |
 | attach 失败时回滚没 `SetParent` 回来 | 窗口永久留在桌面层且不可见，托盘也救不回来 |
 | `grabCookiesSilently` 没有硬超时 | 该隐藏窗口在世则 `window-all-closed` 不触发，**用户再也无法关窗退出** |
@@ -149,10 +159,12 @@ return { info, songs, total, page, limit, source, id }
 - **WBI 签名**：`getMixinKey(imgKey, subKey)` 按 64 项重排表取前 32 位；
   `encWbi` 先设 `wts` → 按 key **字典序排序** → `w_rid = md5(query + mixinKey)`。
   mixinKey 缓存 6 小时。
+
   > ⚠️ **`tids` 必须在签名之前设好** —— 原来顺序反了，请求串里带了 tids
   > 但 `w_rid` 没覆盖它，服务端重算对不上 =「拿不到 mixin key 时搜索全挂」。
 - **登录态三态**：`loginState: boolean | null`，**`null` = 「还不知道」**，与 `false` 严格区分。
   nav 请求失败时**不动**登录态（「宁可保留上一次的结论，也不要被网络抖动带偏」）。
+
   > 只看 `data.isLogin` 的写法会把风控响应（HTTP 200 但 `code` 为 -352/-412）
   > 判成「明确未登录」，于是 `loginState: false` 被写进缓存条目，
   > 之后每次解析都判「未登录时取的，现已登录」而成片重解析。
@@ -160,30 +172,35 @@ return { info, songs, total, page, limit, source, id }
 - **`resolveVideoUrl`**：view 拿 cid → **优先 dash**（`fnval:16`）→ 失败退 durl（`fnval:1`）。
   dash 失败**不致命**（除 `AUTH_FAILED` 外都吞掉并 warn）。
 - **CDN 挑选**：`pickNormalCdnUrl` 优先常规域，排除 P2P / 边缘节点。
+
   > 实测见过 `*.mountaintoys.cn`、`*.szbdyd.com` 这类 P2P 地址，
   > 只对官方客户端有效，普通 HTTP 请求会被 **403** 拒掉 ——
   > 现象是「别的视频都能放，只有这一个怎么也放不出来」，而且不报任何错。
 - **地址有效性**：`isUrlUsable` 查 `deadline`，留 5 分钟余量；
   **拿不到 deadline 时返回 true**（无法判断就按「未知」处理，不当作过期）。
 - **`searchSongFiltered`**：搜索 + 补齐 + **降级重搜**（**四级**，见
-  [功能实现 §2](#2-搜索从歌名到候选视频列表)）。入参是
+  [功能实现 §2](#2-%E6%90%9C%E7%B4%A2%E4%BB%8E%E6%AD%8C%E5%90%8D%E5%88%B0%E5%80%99%E9%80%89%E8%A7%86%E9%A2%91%E5%88%97%E8%A1%A8)）。入参是
   `(song, singer, songDurationSec, minResults, toleranceSec, filterKeywords, tagBonus, firstPage?)`
   —— **歌名与歌手分开传**，不是一个 `歌名-歌手` 拼串。
+
   > 拼串再拆是**有歧义**的：歌名本身可能含 `-`（`下坠Falling` / `R.` / `若是明仔载`），
   > 按 `-` 切会切错。而且两者本来就是两个独立字段，只有拼搜索词那一刻才需要同时在场。
 - **降级是「累加合并」不是「替换」**：每一轮的结果按 `bvid` 去重后**追加**到结果池。
+
   > 用户原话：「降级的意思是降级搜索，**不是要把之前的结果不要啊**」。
   > 原来的实现是「哪一轮过滤后更多就用哪一轮」，于是第 1 轮的 10 条会被降级轮的
   > 36 条**整个顶掉**。
 - **`countPassing` 必须先把 B站返回的 `favorites` 置 false**：B站搜索接口返回的每条里
   本来就有个 `favorites`（「这条视频被多少人收藏了」，一个数字、几乎总是 truthy），
   而 `rankVideos` 用 `v.favorites` 判断「是不是**用户在我们这儿**收藏的」并**豁免过滤**。
+
   > 不清掉的后果（实测）：39 条搜索结果里 38 条被当成"收藏" → 全部豁免 →
   > `countPassing = 39` → 判定「够了，不降级」→ 而真过滤后只剩 24 条。
   > 表现就是日志里两个数字对不上，且**降级永远不触发**。
 - **日志一行说清两端**：`关键词 取回N → 过滤M（P页/R轮，挡掉K）`。
   取回是**原始条数**（含被规则挡掉的），过滤是写进库的条数 ——
   两者摆在一起才解释得清「取回 80 条怎么列表里只有 40 项」。
+
   > 措辞注意：`R轮 = 1` 时走的是**主搜索词**，不是降级词。早先一律写
   > 「降级词「X」」会让人以为走了降级（用户直接指出过）。
 
@@ -194,7 +211,7 @@ return { info, songs, total, page, limit, source, id }
 **五表一视图三索引**：
 
 | 表 / 视图 | 内容 |
-| --- | --- |
+| :--- | :--- |
 | `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at / last_index） |
 | `songs` | **歌曲实体，全局唯一**（id / name / singer / album / cover / duration）；**duration 存秒** |
 | `playlist_songs` | 歌单 ⨯ 歌曲的**成员关系 + 顺序**，PK `(playlist_id, ord)`，只有 `song_id` |
@@ -207,8 +224,8 @@ return { info, songs, total, page, limit, source, id }
 **`songs` 与 `playlist_songs` 为什么要分开**（参考 lx-music 的
 `my_list_music_info` + `my_list_music_info_order`，但做得更彻底）：
 
-| | 旧做法（曲目信息塞在关系表里） | 现在 |
-| --- | --- | --- |
+|  | 旧做法（曲目信息塞在关系表里） | 现在 |
+| :--- | :--- | :--- |
 | 同一首歌在 2 个歌单 | **存 2 行**，歌名/歌手/专辑/封面/时长全重复 | `songs` 表 **1 行**，`playlist_songs` 2 行 |
 | 改一次歌名的后果 | 两个歌单里可能一个新名一个旧名 | 一处改、处处一致 |
 
@@ -218,7 +235,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 **id 的形态（两张表都不是随机 id）**：
 
 | 表 | id 形态 | 例 |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | `playlists` | `平台_平台歌单id` | `tx_8153225605` |
 | `playlists`（手动新建） | `pl_<uuid>` | `pl_7f3a…`（没有平台链接可拼） |
 | `songs` | `平台_平台歌曲id` | `tx_1828354` |
@@ -227,10 +244,11 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 > **为什么歌单 id 不用随机 UUID**：同一个歌单**重复导入会命中同一行**，
 > 而不是攒出一堆副本；重启 / 换机器后靠 `sourceUrl` 也能推出同一个 id。
 > `pl_` 前缀是刻意加的 —— 一眼能看出「这不是平台 id」。
-> 拼装统一由主进程做（`playlistKey()`），见 [功能实现 §1](#1-歌单导入与解析)。
+> 拼装统一由主进程做（`playlistKey()`），见 [功能实现 §1](#1-%E6%AD%8C%E5%8D%95%E5%AF%BC%E5%85%A5%E4%B8%8E%E8%A7%A3%E6%9E%90)。
 
 **`source` 不再单独存列**：它已经编码在 `id` 前缀里（`tx_`），
 用 `sourceOfSongId()` 反推即可 —— 少一列就少一处可能不一致的地方。
+
 > ⚠️ 反推**只认 `wy/tx/kw/kg`**：否则兜底的 `pl_xxx` 会被解析成音源 `pl`，
 > 那是个不存在的平台，下游拿去用会**静默出错**。
 
@@ -240,6 +258,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
    （以最新那份为准：同步刚拉回来的元数据更可信）；
 2. `keepIds` 集合 —— 记下本次保存里出现过的所有 song id；
 3. `DELETE FROM songs WHERE id NOT IN (...)` —— **只删没人再引用的**。
+
    > ⚠️ `songs` 是**全局共享**的曲目实体表，绝不能无脑 `DELETE FROM songs`：
    > 那会把别的歌单正在引用的曲目一起删掉，关系表虽然还有记录，
    > 但实体没了 → 读的时候**全是悬空引用 → 曲目整片消失**。
@@ -261,21 +280,24 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   附带好处：视图**默认只读**（SQLite 拒绝 UPDATE 视图），写操作只能走明确的 UPDATE。
 - **`schemaFingerprint()` 替代手写 `SCHEMA_VERSION`**：
   `sha256(CREATE_TABLES_SQL)` 前 4 字节 `& 0x7fffffff` 写进 `PRAGMA user_version`。
+
   > 手写常量当闸门时，改表忘了 +1 就会出现「旧库带旧列结构跑起来、
   > 在某个查询上报错」—— 运行时才炸，最难查。改哈希后「忘了升版本」不可能再发生。
 - **不做迁移**：本项目只有一个用户、数据层从未发布过。指纹不匹配就
   **把库里所有表 / 视图都 DROP 掉再重建**（数据清空，**从不写迁移代码**）。
+
   > ⚠️ **DROP 清单是动态取的，不是手写的**：早先手写一份
   > 「`DROP VIEW videos_meta; DROP TABLE videos; DROP TABLE song_meta; …`」，
   > 结果删歌词功能时**建表语句删了、DROP 清单忘了删** ——
   > `lyrics` / `subtitles` 两张表从此**每次重建都清不掉**，永远留在库里当垃圾。
   >
   > 现在改成查 `sqlite_master` 拿全部表名再逐个 drop，不可能再漏：
-  >  - **视图必须先于表 drop**（表被删后视图就悬空了，SQLite 不会自动清），
-  >    所以按 `type` 排序把 `view` 排前面；
-  >  - `sqlite_%` 开头的（`sqlite_sequence` / `sqlite_stat1`）是 SQLite 自己维护的，
-  >    **绝不能被 drop**。
+  > - **视图必须先于表 drop**（表被删后视图就悬空了，SQLite 不会自动清），
+  >   所以按 `type` 排序把 `view` 排前面；
+  > - `sqlite_%` 开头的（`sqlite_sequence` / `sqlite_stat1`）是 SQLite 自己维护的，
+  >   **绝不能被 drop**。
   - **模块求值阶段的反引号断言**：`CREATE_TABLES_SQL` 里出现反引号就抛错。
+
   > 建表 SQL 是模板字符串，在 SQL 注释里用反引号包标识符会**提前终止字符串**，
   > 后面所有 SQL 变成 JS → 一串 `TS1005`/`TS1443`，报错行指向 SQL 中间，
   > **完全看不出根因**。这个错犯过三次，所以用断言根治。
@@ -323,7 +345,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 **对外导出**（几个跟本轮改造相关的）：
 
 | 导出 | 作用 |
-| --- | --- |
+| :--- | :--- |
 | `toPlaylistSongs(songs)` | ★ **音源 `ParsedSong[]` → `PlaylistSong[]`** 的唯一转换入口 |
 | `findSongByCacheKey(cacheKey)` | 按 `songId` 查歌曲完整信息（拼搜索词要歌名+歌手） |
 | `findSongDuration(cacheKey)` | 查歌曲时长；内部改为调 `findSongByCacheKey` |
@@ -335,7 +357,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 音源给的字段名/单位跟库里**不一样**：
 
 | 音源给的 | 库里要的 |
-| --- | --- |
+| :--- | :--- |
 | `interval: "4:03"` | `duration: 243`（**秒**） |
 | `albumName` | `album` |
 | `platformId` | `platformId`（**拼 `songs.id` 要用**） |
@@ -354,32 +376,42 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 - **内存权威 + 落库**：内存里常驻一整份 `data`。同步要跑好几秒网络请求，
   期间渲染层会发若干次 `playlists:save`；如果每次读写都直接打数据库，
   `syncingIds` 那套「正在同步的歌单以主进程内存为准」的保护就无从谈起。
+
 - **`syncingIds` 为什么存在**：同步期间渲染层任何一次 persist
   （切歌单、编辑歌单）都会拿它手里的**旧曲目列表**把同步结果盖掉，
   随后界面还照样提示「同步完成 +N/-M」—— 用户看到的是「同步了个寂寞」。
+
 - **先删后插而不是逐条 upsert**：渲染层发来的是**全量快照**，
   被删掉的歌单/曲目必须真的消失；upsert 表达不了「这一条没了」。
+
   > ⚠️ 但 `songs` 表**不能无脑全清**（它是全局共享的实体表）——
   > 只删「本次没人再引用」的那些，见 `db.ts` 那节。
+
 - **不删 `song_meta` / `videos`**：那两张表按搜索键记收藏与播放地址，
   删歌单不该顺手把用户收藏的视频全清了（重新加回同一个歌单，收藏还在）。
+
 - **「哪个歌单是当前」不落库**：每切一次就变，真值只在内存，启动时取第一条。
+
 - **`readPlaylistsFromDb` 是「两次全表读 + 内存拼装」**：曲目实体从 `songs`
   读成 `id → PlaylistSong` 字典，关系表按 `(playlist_id, ord)` 读出来直接就是
   各歌单的顺序（排序在 SQL 里做，JS 里 `push` 的顺序天然正确）。
   不是「每条歌单查一次」的 N+1 写法。
+
   > **悬空引用**（关系表有、实体表没有）会**跳过并告警**，而不是补一条空壳 ——
   > 补空壳会在界面上留一个点不动的空行。正常不会发生（写库在同一事务里）。
+
 - **`syncPlaylist` 用 `toPlaylistSongs` 归一**（与 IPC 出口同一个函数）；
   去重、`added` / `removed` 的计算**都按 `songId`**，不是「歌名-歌手」——
+
   > 后者会把「同名但不同版本」（live 版、翻唱版）**误判成重复**。
+
 - **★ 同步时按歌重算 `last_index`**（这是「下标能当定位用」的前提）：
 
   下标本身是脆弱的 —— 曲目增删后第 N 个位置可能已经是另一首歌。
   同步时**旧列表和新列表都在手上**，正是重算的时机：
 
   | 情况 | 处理 |
-  | --- | --- |
+  | :--- | :--- |
   | 那首歌还在 | 用它的**新下标**（按 `songId` `findIndex`，不能用歌名 —— 同步可能改名） |
   | **那首歌被删了** | 保留原下标并夹进范围 → 效果是「下一首顶上来」（播放器的标准行为） |
   | 旧列表本来就是空的 | `0` |
@@ -392,6 +424,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 **关键设计**：
 
 - **两处类型校验管的是不同入口，缺一不可**：
+
   - `updateSetting` 管「渲染进程写进来的」
   - `mergeSetting` 管「**磁盘上读出来的**」
 
@@ -401,9 +434,11 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   > 「与当前默认值同类型」，结果**这个键从此再也写不进去**
   > （每次写入都被判「类型不符」丢掉）。表现就是**「拖动没反应」**，
   > 而且日志只报一行 warn，极难查。
+
 - **必须先深拷贝再合并**：否则 `updateSetting({...})` 只改引用相同的嵌套对象
   （如 `player.tagBonus`），`mergeSetting` 会因为引用相等而判定「没有变化」，
   导致更新**静默丢失**。
+
 - **嵌套对象 / 数组必须显式深拷贝**（`tagBonus` / `filterKeywords` /
   `customAspectRatios`）：`{...defaultSetting}` 只做浅拷贝，
   成员和模块级 `defaultSetting` 是**同一个引用**。用户加一个过滤词
@@ -431,6 +466,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 
 - **`SetParent` 之后回读「真实父窗口」验证**：用 `GetAncestor(GA_PARENT)`
   （**不是 `GetParent`**）。不靠「有没有抛异常」猜，而是问系统。
+
   > ⚠️ **`GetParent` 不能用来验证**（实测踩过）：它的语义是
   > 「子窗口返回 parent，带 `WS_POPUP` 的顶层窗口返回 owner」，
   > 而 `SetParent` **不会**把窗口样式改成 `WS_CHILD` —— 所以窗口挂到 WorkerW 之后
@@ -454,7 +490,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 **三条优先级规则**：
 
 | 情况 | 用哪个目录 |
-| --- | --- |
+| :--- | :--- |
 | `%APPDATA%/BiLiMusicVideo` 里**已经有数据** | 就用它（安装版 / 便携版共用一份） |
 | 没有数据，且当前是便携版 | exe 同级的 **`blmvdata/`**（`PORTABLE_DATA_DIR_NAME`） |
 | 没有数据，且是安装版 | 默认的 `%APPDATA%/BiLiMusicVideo` |
@@ -518,16 +554,20 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   > 不是随机 UUID。同一个歌单重复导入要**命中同一行**，而不是攒出一堆副本。
   > 不带出来的话 `playlistKey()` 拿不到参数，只能退回随机 id ——
   > 「重复导入生成新歌单」这个坑就会一直存在。
+
 - **`http.ts` 为什么不用 Electron 的 `net.request`**：实测请求腾讯的
   `c.y.qq.com` / `u.y.qq.com` 时会稳定返回 **`net::ERR_BLOCKED_BY_CLIENT`**；
   而同一时刻同样的 URL、同样的请求头，用 Node 的 `https` 却能正常拿到 100KB+ 数据。
   额外好处：Node 的 http/https **默认不跟随重定向**，响应里能直接读到 `location` 头 ——
   之前用 `fetch`/`net.request` 时拿不到 `Location`，**正是这个坑导致 QQ 接口被误判失败**。
+
 - **`detectSource` 为什么不能只看 `id=` 参数**：网易云和酷我的链接都带 `id=`，
   QQ 的移动端分享链接也带 —— 所以**必须以 host 为准**。
   还要**特判 `digest-<n>__<id>`**（酷我的压缩形式），否则那条分支永远走不到。
+
 - **`decodeName` 为什么手写**：LX 用的是渲染进程的 `DOMParser`，
   **主进程没有 DOM**，所以改用一份手写的 HTML 实体解码，不引入第三方依赖。
+
 - **网易云为什么有两条通道**：新版 `/weapi/v6/playlist/detail` 返回**全量** `tracks`，
   而 **linuxapi 的 `/api/v3/playlist/detail` 在未登录时经常只给 10 首**，
   会把 200 首的歌单静默截断成 10 首 —— 所以数量对不上时按 `trackIds` 补全，
@@ -538,7 +578,8 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 ### `types/ipc.ts` —— IPC 契约
 
 **职责**：`IpcChannelMap`（invoke 通道的入参/返回值）+ `IpcEventMap`（推送事件）
-+ `TrayMenuState` 等共享形状。
+
+- `TrayMenuState` 等共享形状。
 
 **关键设计**：所有 handler 经 `mainHandle(channel, payload => ...)` 注册，
 channel → `{params, result}` 的契约集中在这里，
@@ -548,7 +589,7 @@ channel → `{params, result}` 的契约集中在这里，
 **两处本轮改过契约的通道**：
 
 | 通道 | 变化 |
-| --- | --- |
+| :--- | :--- |
 | `api:searchSong` | 入参从 `{ keyword }` 改成 **`{ song, singer }`**（分开传，理由见 §2） |
 | `music:getPlaylistDetail` | `result` 改成 **`Omit<PlaylistDetail,'songs'\|'listId'> & { songs: PlaylistSong[]; id: string \| null }`** —— 曲目是归一化后的形态，`id` 是**主进程拼好的歌单主键**，且**不透出 `listId`** |
 
@@ -572,16 +613,19 @@ channel → `{params, result}` 的契约集中在这里，
 - **扁平点号键的唯一目的**：让 `mergeSetting` 只需要做一层浅合并即可完成
   「默认值 + 用户值」的合并，并且能**精确算出哪些 key 被改动**，
   便于向渲染进程精确广播（避免整包配置来回传）。
+
 - **`satisfies AppSetting` 而不是 `as`**：既能强校验（少写 key / 写错类型都报错），
   又不丢字面量类型。
+
 - **`cache.maxAge` 是兼容占位**：注释写明「这个键在本次数据层改造后已经不再是权威设置了」。
   改造前语义是「整个缓存条目的寿命」，但缓存里混着两种寿命完全不同的数据
   （直链约 2 小时、元数据永不过期），用一个值同时管两者，
   结果就是「地址还没过期、元数据先被删了」。
+
 - **`tagBonus` 与 `filterKeywords` 的区别**（注释里用表格写死了）：
 
-  | | tagBonus | filterKeywords |
-  | --- | --- | --- |
+  |  | tagBonus | filterKeywords |
+  | :--- | :--- | :--- |
   | 作用阶段 | **打分**（歌手命中分之后） | **硬过滤** |
   | 命中后 | 加 / 减分 | **直接丢弃** |
   | 用户场景 | 微调排序偏好 | 绝对不想要的内容 |
@@ -605,7 +649,7 @@ channel → `{params, result}` 的契约集中在这里，
 **几个关键导出**：
 
 | 导出 | 作用 |
-| --- | --- |
+| :--- | :--- |
 | `rankVideos(videos, options)` | 一站式入口：过滤 + 打分 + 排序 |
 | `passHardFilter(...)` | 单条硬过滤判定 |
 | `scoreVideo(video, singer, tagBonus)` | 打分（歌手命中 +100；关键词累加**无上限**） |
@@ -619,7 +663,7 @@ channel → `{params, result}` 的契约集中在这里，
 `TRAILING_FORM_WORDS`（形式词表）、`flattenWithMap`（去空格比对但保留索引映射）、
 `toSimplified`（opencc 简繁归一）。
 
-详见 [功能实现 §3](#3-搜索结果排序硬过滤--打分)。
+详见 [功能实现 §3](#3-%E6%90%9C%E7%B4%A2%E7%BB%93%E6%9E%9C%E6%8E%92%E5%BA%8F%E7%A1%AC%E8%BF%87%E6%BB%A4--%E6%89%93%E5%88%86)。
 
 ### `utils/mergeSetting.ts` / `migrateSetting.ts`
 
@@ -632,6 +676,7 @@ channel → `{params, result}` 的契约集中在这里，
 - **类型校验必须在这里也做一遍**（见 `setting.ts` 那条「拖动没反应」）。
 - `migrateSetting` 的入参是 `unknown`（老数据不可信）；
   每段代码只负责把 version 从 A 抬到 B，**天然幂等**。
+
   > 注意：本项目配置此前从未落盘，所以那段 v1.0.0 迁移是**骨架 + 示例**，
   > 不是真实发生过的升级。
 
@@ -669,10 +714,6 @@ channel → `{params, result}` 的契约集中在这里，
 
 ## 4. 渲染层（src/）
 
-> 每个文件的详细笔记（含「为什么」与踩坑）见
-> [docs/渲染层-文件职责与实现要点.md](docs/渲染层-文件职责与实现要点.md)。
-> 下面是索引。
-
 ### `App.vue` —— ★ 界面中枢
 
 **职责**：模板 + **全部播放业务**。是最大的文件，也是所有状态的权威。
@@ -680,7 +721,7 @@ channel → `{params, result}` 的契约集中在这里，
 **按功能域分段**：
 
 | 域 | 关键内容 |
-| --- | --- |
+| :--- | :--- |
 | 播放状态 | `videoUrl` + `dashSource` 二选一；`videoUpDate`（timeupdate）做 6 件事 |
 | 切歌流程 | `changeSong` → `changeVideo`，两个竞态令牌 |
 | 搜索与重试 | 空结果最多重试 3 次；`filtered: true` 时**跳过重试** |
@@ -698,21 +739,26 @@ channel → `{params, result}` 的契约集中在这里，
 
 - **`changeSong` 先就地切本地信息**（`currentIndex`/`songName`），
   注释直说原来排在 `await searchSong()` 后面导致「切了歌，图片和名称还是上一首的」。
+
 - **`videoListKeyword` 不能提前跟成新歌**：否则 `videoError` 会把上一首的报错
   算到新歌头上。
+
 - **`_endStallHandled = true`**：空窗期防片尾看门狗抢跑，
   否则点一次下一首**跳过两首**。
+
 - **`_warmTries` 为什么存在**：心跳每秒调 `warmApi`，而搜不到视频时
   `_warm[dir]` 是空的、拦不住它 —— 注释写「**每秒发一次真网络请求，永不停止**」，
   症状是「控制台同一个关键词刷几十行、界面变卡」。
   因为心跳是 1 秒一次，光靠计数做不到「间隔 3 秒」，所以必须同时看时间戳。
+
 - **`sortSearchedVideos` 现在是恒等函数**：打分排序搬到主进程且在**写库之前**执行，
   `videos.ord` 直接等于显示顺序。保留成恒等而不是删掉，
   是因为调用点在续播/预热/重试好几处，「逐个删容易漏」。
+
 - **★ `getSongName` 与 `getSongParts` 是两个不同的东西，别混用**：
 
   | 方法 | 返回 | 用作 |
-  | --- | --- | --- |
+  | :--- | :--- | :--- |
   | `getSongName(index)` | `歌名-歌手`（`toSearchKey`） | **缓存键 / 标识**：传给 `getSelectedBvid` / `resolveVideoUrl` / `setFavorite`，以及 `videoListKeyword` |
   | `getSongParts(index)` | `{ song, singer }` | **搜索入参**：`searchSong(parts.song, parts.singer)` |
 
@@ -737,17 +783,22 @@ channel → `{params, result}` 的契约集中在这里，
 - **左栏是「目录」不是 Tab**：注释给了理由「切换会让人找不到刚看过的那一项」
   （设置项要对照着调，如「时长容差」与「降级阈值」）+
   **用户原话「不要点一下就像换了个页面一样」**。
+
 - **`scrollToSection` 刻意不用 `scrollIntoView`**：它会把**所有可滚祖先**都滚一遍，
   包括弹窗外面那层，整个对话框跟着动。改成手算 `scrollTop` 只动一个容器。
+
 - **`watchScrollSettle` 为什么存在**（注释里写了两版失败尝试）：
+
   - ① 固定定时器 —— 平滑滚动时长取决于距离，定太短（420ms）长距离没滚完就解锁，
     高亮一路扫过去；定太长则用户自己滚时高亮不响应。
   - ② 只看「连续 3 帧没变」—— 平滑滚动**起步前有几帧 `scrollTop` 不动**，
     被误判成已停下（实测点「界面」只滚 24px 就解锁，高亮被改回「播放」）。
   - ③ 最终：rAF 循环，判据 = **连续 3 帧没变 且（已经动过 或 等够 15 帧）**。
+
 - **`tagBonus` 落盘必须整体换引用**：`updateSetting` 对嵌套对象是**整体替换**语义，
   原地改不会触发写入（引用没变，主进程深比较也看不出差异），
   表现就是「改了没反应」。
+
 - **★ 分值档每行加了 `←` / `→` 按钮**（`shiftTagBonusScore(score, ±1)`），
   分值数字本身可聚焦、**键盘左右箭头也能调**。
 
@@ -762,7 +813,9 @@ channel → `{params, result}` 的契约集中在这里，
 
 - **★ 分值上限已去掉**（`addTier` 不再校验 ±10，`TAG_BONUS_SCORE_MIN/MAX` 常量已删）：
   关键词加权不再被 clamp，用户想给「伴奏」配 `-50` 是完全合理的。
+
   > `addTier` 现在只校验「是整数」和「不重复」。
+
 - **分值那一块的文案**是「歌手名命中 +100，之后按这里的分值累加」
   （旧的「层内 ±10 内微调」已改）。
 
@@ -776,7 +829,7 @@ presetId = detail.id                                // 已经是 tx_8153225605
 ```
 
 | 它**不碰** | 原因 |
-| --- | --- |
+| :--- | :--- |
 | `platformId` | 拼 `songs.id` 用的，主进程在 IPC 出口已经归一化好 |
 | `listId` | 拼 `playlists.id` 用的，主进程已经拼成 `detail.id` |
 | `interval` → 秒 | 主进程 `toPlaylistSongs` 已转 |
@@ -827,7 +880,7 @@ const addPlaylist = async (input: {
 | 文件 | 职责 |
 | :--- | :--- |
 | `dashPlayer.ts` | ★ MSE（dash）分片调度 |
-| `uiTheme.ts` | 主题令牌（CSS 变量） |
+| `uiTheme.ts` | 主题令牌（CSS 变量）：颜色 / 毛玻璃 / **闲置透明度** / 深浅判定 |
 | `image.ts` | 图片地址规整 |
 | `plain.ts` | 深度解包（去响应式，写盘前） |
 | `title.ts` | 标题净化（只留 `<em>`） |
@@ -901,7 +954,7 @@ electron-builder 把它装进 `app.asar`。
 两个关键点：
 
 | 点 | 说明 |
-| --- | --- |
+| :--- | :--- |
 | **只引子路径 `opencc-js/t2cn`** | 主入口（`require('opencc-js')`）是 **1.1 MB** 全量包（含简→繁、日文新字体、台湾/香港变体 —— 我们一个都不用）；`t2cn` 子路径只有 **106 KB**，正是「繁→简」这一件事。**体积差 10 倍** |
 | **不需要 `asarUnpack`** | `dist/umd/t2cn.js` 是**自包含**的（字典全内联、文件内**零 `require`**），所以直接从 asar 里加载即可 |
 
@@ -961,7 +1014,7 @@ SOURCES[source].getListDetail(input, page)
 **两级 id 的由来**
 
 | 主键 | 怎么来的 | 为什么 |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | `playlists.id` = `平台_平台歌单id` | `playlistKey(source, listId)`，参数取自音源 | 同一歌单**重复导入命中同一行**，而不是攒副本 |
 | `songs.id` = `平台_平台歌曲id` | `songId(song)`，用 `platformId` + `source` | 同上；且**平台改名不断链** |
 
@@ -973,6 +1026,7 @@ SOURCES[source].getListDetail(input, page)
 
 **未接入的音源显式挡掉**：酷狗（`kg`）在类型里合法但尚未移植解析实现，
 `isSupported()` 会挡掉并报「尚未接入」，避免抛 `undefined is not a function` 这种莫名错误。
+
 > 注意区分：**音源识别**会挡掉 `kg`（没实现解析），
 > 但 `sourceOfSongId()` 的反推**认 `kg`**（它是合法前缀，只是当前没有这种数据）。
 
@@ -1111,7 +1165,7 @@ SOURCES[source].getListDetail(input, page)
 **① 硬过滤**（三条，任一命中直接丢）
 
 | 规则 | 说明 |
-| --- | --- |
+| :--- | :--- |
 | **歌名没独立出现** | 见下面「歌名怎么算命中」—— 这是本文件改动最大的地方 |
 | 时长超出容差 | 下限 `max(时长−容差, 时长×0.5)`、上限 `时长+容差`。标题含 `MV/官方/Live/现场` 时上限放宽 **×1.7**。**歌曲时长未知、或视频时长解析不出 → 不过滤**（不因缺数据误杀） |
 | 命中过滤关键词 | 默认是一组谱类/演奏类词（吉他谱、钢琴谱、指弹、口琴……），命中即丢 |
@@ -1147,7 +1201,7 @@ SOURCES[source].getListDetail(input, page)
 **四个必须一起看的实现细节**：
 
 | 细节 | 为什么 |
-| --- | --- |
+| :--- | :--- |
 | **形式词豁免**（`TRAILING_FORM_WORDS`：歌词排版 / 字幕 / 伴奏 / 完整版 / mv / live…） | 歌名右边紧跟这些词时**算独立** —— 它们说的是「这个视频是什么形式」，不是歌名的一部分。<br>`刘惜君 - 聊表心意歌词排版透明通道` 该**留**；而 `童话镇` 里的「镇」不在表里，照样**丢** |
 | **在保留空格的原串上判边界**（`flattenWithMap` 记「去空格后索引 → 原串下标」的映射） | 比对要去空格（`Shape of You` ↔ `shapeofyou`），但判边界必须回**原串**。<br>踩过：先 `normalize`（去空格）再判边界，于是「童话 光良」变成「童话光良」、右邻成了「光」→ **被误杀**（其实中间明明有空格） |
 | **`丨` `・` `｜` 当分隔符**（`SEPARATOR_CHARS`） | 它们在标题里的实际作用等于竖线，但码位落在汉字区，不特判会被当成汉字 |
@@ -1166,6 +1220,7 @@ Take Me Hand (吉他版) → Take Me Hand
 
 括号里是「版本词」（`版/live/现场/remix/cover/伴奏/纯享/吉他/dj/无损…`）时剥掉，
 因为 B站标题里**往往不写它** —— 带着 `(吉他版)` 去比对或搜索会匹配不上。
+
 > ⚠️ 只剥「像版本标记」的括号：括号里是歌名正文时**保留**
 > （`(Don't) Stop` / `(Everything I Do)` 这些括号属于歌名本身）。
 
@@ -1241,10 +1296,12 @@ if (finalList.length === 0) {
 = 把「按当前规则不该显示」的行从库里**永久删除**。
 
 > 实测（`cache.save` 真跑）：
+>
 > ```
 > 初始:               D1, D2
 > 回写过滤后的列表后:  D1          ← D2 从库里消失了
 > ```
+>
 > 后果：用户把容差从 30 调回 90（或删掉一个过滤词）想找回那些结果时，
 > **它们已经不在库里了**，必须重新联网搜索才回得来。
 
@@ -1498,6 +1555,29 @@ apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 120ms 延�
 
 **`resetSetting` 要显式深拷贝三个嵌套结构**（`tagBonus` / `filterKeywords` /
 `customAspectRatios`）—— 见 `setting.ts` 那条踩坑。
+新增的两个设置项都是**标量**（布尔 / 数字），`{...defaultSetting}` 浅拷贝即可，不用额外处理。
+
+### 两类「设置改了要立刻做点什么」的键
+
+大部分设置项是**读的时候才用**（比如清晰度上限），所以只需要存下来。
+但有两个**必须在改动的当下就执行动作**，否则用户会以为没生效 ——
+它们都在 `electron/main/index.ts` 的 `onSettingChange` 里处理：
+
+| 设置项 | 改动的当下要做什么 | 不做的后果 |
+| :--- | :--- | :--- |
+| `cache.searchResultExpireMs` | 立刻跑一次 `clearExpiredPlayurl(maxAge)` | 把 365 天改成 0 天，**看不到任何变化**（既没地址被清、也没日志） |
+| `common.windowAspectRatio` | 立刻 `applyAspectRatio()` | 要重启才看到新比例（全屏 / 壁纸模式下跳过，那两种状态另有几何管理） |
+| `common.autoLaunch` | 立刻 `applyAutoLaunch()`（写系统启动项） | 打开开关后要等下次重启才生效 |
+
+> `common.wallpaperMode` 是**反例**：它**故意什么都不做** —— 它是「下次开机进不进壁纸」的开关，
+> 不该在打开/关闭的瞬间改变当前状态（用户明确要求）。当前状态只由按钮/托盘切换。
+
+### 两个新增设置项的实现要点
+
+| 设置项 | 存什么 | 落到哪 | 要点 |
+| :--- | :--- | :--- | :--- |
+| `common.idleOpacity`（控制栏闲置透明度） | **百分比 0-100**（步进 **10**） | `src/utils/uiTheme.ts` → `--ui-idle-opacity`（**除 100**，`opacity` 收小数） | 只管**闲置态**；悬停时 CSS 写死 `opacity: 1`（`biliVideoControls.vue`）。与 `glassTransparency` 是两回事：那个管玻璃**底色**、悬停前后都一样 |
+| `common.autoLaunch`（开机自动启动） | 布尔，默认 `false` | 系统启动项（`app.setLoginItemSettings`） | **不落 CSS**；每次启动重写一遍（便携版挪位置后能自动纠正）；开发模式强制关 |
 
 ## 12. 缓存与过期
 
@@ -1506,7 +1586,7 @@ apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 120ms 延�
 **★ `search_key` 存的是「歌名-歌手」，不是 `songs.id`**（这点容易搞混）：
 
 | 表 | 键 | 值 | 为什么 |
-| --- | --- | --- | --- |
+| :--- | :--- | :--- | :--- |
 | `videos` / `song_meta` | `search_key` | `歌名-歌手` | 这两张表要拿键**去搜 B站** —— 用 `tx_1828354` 那种 id 搜不出任何东西 |
 | `songs` / `playlist_songs` | `id` / `song_id` | `平台_平台id` | 只用于「标识同一首歌」，让多歌单共用一行 |
 
@@ -1597,13 +1677,15 @@ electron-builder（asar）→ 打包 out/
 **两级 id 是数据的骨架**（都由主进程拼，渲染层只做透传）：
 
 | 主键 | 形态 | 谁拼 | 用在哪 |
-| --- | --- | --- | --- |
+| :--- | :--- | :--- | :--- |
 | `playlists.id` | `平台_平台歌单id`（`tx_8153225605`）；手动建的是 `pl_<uuid>` | `playlistKey()`（`ipc/music.ts`） | 歌单身份；重复导入命中同一行 |
 | `songs.id` | `平台_平台歌曲id`（`tx_1828354`）；手动歌是 `歌名-歌手` | `songId()`（`writePlaylistsToDb`） | `playlist_songs.song_id`；同一首歌多歌单只占一行 |
 
 **另一条数据纽带是 `search_key`**（`toSearchKey(song)` = `"歌名-歌手"`）：
 它是 `videos` 复合主键的前半段、`song_meta` 的主键。
+
 > ⚠️ **它跟上面两个 id 是两回事**：`videos` / `song_meta` 要拿键去**搜 B站**，
 > 用 `tx_1828354` 那种 id 搜不出任何东西 —— 所以那两张表存的是**歌名**。
 > 渲染层、缓存、`findSongDuration` 共用同一个 `toSearchKey`，
 > 所以「这首歌是谁」的判定完全一致。
+

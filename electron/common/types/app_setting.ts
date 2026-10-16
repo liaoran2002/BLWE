@@ -15,6 +15,19 @@ export interface AppSetting {
   // #region common
   /** 是否以桌面壁纸模式启动（等价于命令行 --wallpaper-mode） */
   'common.wallpaperMode': boolean
+  /**
+   * 开机自动启动
+   *
+   * 用 Electron 的 `app.setLoginItemSettings()` 写进系统的启动项
+   * （Windows 是注册表 `Run` 键 / 启动文件夹，不需要额外的原生依赖）。
+   *
+   * ⚠️ **便携版也能生效**：`setLoginItemSettings` 的 `path` 传的是
+   * 当前 exe 的实际路径（`process.execPath`），所以绿色版放在哪就注册哪。
+   * 但如果用户之后**挪动了那个文件夹**，注册项里还留着旧路径 ——
+   * 那时开机启动会静默失败。所以打开这个开关时**每次都重写一遍**，
+   * 而不是只在第一次写。
+   */
+  'common.autoLaunch': boolean
   /** 点关闭按钮时不退出，最小化到系统托盘 */
   'common.closeToTray': boolean
   /** 在任务栏图标上显示当前视频播放进度 */
@@ -30,10 +43,27 @@ export interface AppSetting {
    * 30 -> `rgba(255,255,255,0.3)`。
    * 控制栏、歌单按钮、设置 / 歌单管理弹窗、歌单下拉全用这一份。
    *
-   * 别和浮层的淡出行为搞混：那是固定的「未悬停 0.1 / 悬停 1」，
-   * 由 CSS 变量 `--ui-idle-opacity` 控制，跟这个设置无关。
+   * 别和浮层的淡出行为搞混：那是 `--ui-idle-opacity`（**设置项
+   * `common.idleOpacity`**），管的是「鼠标不悬停时整个控件淡到多透明」。
    */
   'common.glassTransparency': number
+  /**
+   * 控制栏闲置透明度（0-100）
+   *
+   * 鼠标**不悬停**时整个控制栏的不透明度；移上去会变成完全不透明（1）。
+   *
+   * 为什么和「透明度」分开：
+   *  - **透明度**（上面的 `glassTransparency`）管**玻璃底有多透**，
+   *    是"底色"的属性，悬停前后都那样；
+   *  - **这个**管**整个控件淡出到什么程度**，是"整块内容"的属性，
+   *    鼠标移上去会恢复。
+   *
+   * 默认 10（= `0.1`），与改造前写死的 `--ui-idle-opacity: 0.1` 一致，
+   * 所以老用户升级后观感不变。
+   *
+   * 设成 100 等于「不淡出」（控制栏一直实心）。
+   */
+  'common.idleOpacity': number
   /**
    * 模糊强度：`backdrop-filter: blur(Npx)` 的 N（0-20）
    *

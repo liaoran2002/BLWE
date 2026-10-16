@@ -12,6 +12,7 @@ import {
   DEFAULT_ASPECT_RATIO,
   DEFAULT_AUDIO_ID,
   DEFAULT_FONT_COLOR,
+  DEFAULT_IDLE_OPACITY,
   DEFAULT_THEME_COLOR,
   DEFAULT_VIDEO_QN,
   SETTING_VERSION,
@@ -23,6 +24,13 @@ const defaultSetting = {
 
   // #region common
   'common.wallpaperMode': false,
+  /**
+   * 开机自动启动，默认**关**
+   *
+   * 默认关是有意的：改开机启动项属于「动系统」的行为，
+   * 应该由用户明确打开，而不是装完就悄悄给自己注册一项。
+   */
+  'common.autoLaunch': false,
   /** 点关闭按钮时最小化到系统托盘（不退出），默认关：保持「点 X 就退出」的习惯 */
   'common.closeToTray': false,
   /** 任务栏图标上显示播放进度，默认开 */
@@ -36,6 +44,13 @@ const defaultSetting = {
    * 30 = `rgba(255,255,255,0.3)`，和加这个设置之前的观感一致
    */
   'common.glassTransparency': 30,
+  /**
+   * 控制栏闲置透明度（0-100），默认 10
+   *
+   * 10% = 改造前写死的 `--ui-idle-opacity: 0.1`，所以老用户观感不变。
+   * 鼠标悬停时会变成完全不透明，这个值只管「闲着的时候淡到多透明」。
+   */
+  'common.idleOpacity': DEFAULT_IDLE_OPACITY,
   /**
    * 模糊强度：`backdrop-filter: blur(Npx)` 的 N（0-20）
    * 界面上显示成百分比（50% = 10px），存的是这个 px 值

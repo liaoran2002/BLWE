@@ -297,7 +297,8 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 ```css
 --glass-rgb: 255, 255, 255;   /* 主题色，uiTheme 写入 */
 --text-rgb: 255, 255, 255;    /* 字体颜色，uiTheme 写入 */
---glass-alpha: 0.3;           /* 「透明度」设置，uiTheme 写入 */
+--glass-alpha: 0.3;           /* 「透明度」设置，uiTheme 写入（存百分比，除 100） */
+--ui-idle-opacity: 0.1;       /* 「控制栏闲置透明度」设置，uiTheme 写入（同样除 100） */
 --glass-bg: rgba(var(--glass-rgb), var(--glass-alpha));
 --panel-bg: rgba(var(--glass-rgb), var(--glass-alpha));
 --glass-text: rgb(var(--text-rgb));
@@ -319,15 +320,18 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 这样用户把主题色拖到任意颜色，都不会出现「白底白字看不出字」；
 文字颜色是用户自己选的，阴影只跟**底色**走，所以「浅底配黑阴影、深底配白阴影」这一条永远成立。
 
-**三个毛玻璃 / 阴影参数也是全局的**：
+**几个毛玻璃 / 阴影参数也是全局的**：
 
 | 设置项 | 界面 | 存的值 | 落到 CSS |
 | --- | --- | --- | --- |
 | 透明度 | 0-100%，步进 5 | 百分比本身 | `--glass-alpha = 透明度 / 100`（就是底色里的 alpha） |
+| 控制栏闲置透明度 | 0-100%，**步进 10** | 百分比本身 | `--ui-idle-opacity = 闲置 / 100`（`opacity` 收小数） |
 | 模糊强度 | 0-100%，步进 5 | **0-20 的 px**（百分比 ÷ 5） | `--glass-blur: Npx`，即 `backdrop-filter: blur(Npx)` |
 | 阴影强度 | 0-100%，步进 5 | **0-20 的 px**（百分比 ÷ 5） | `--glass-shadow-size: Npx`，文字阴影的模糊半径 |
 
 后两个都是「显示百分比、实际 0-20」：50% = 10px，100% = 20px（阴影默认 8px = 40%）。
+**闲置透明度的步进是 10**（不是 5）—— 它只有「淡出到多明显」这一个含义，10% 一档够用，
+而且**整十的数字更好记**。
 `--glass-shadow` 用 `calc()` 从 `--glass-shadow-size` 派生出「近影 + 远影」两段：
 
 ```css
@@ -352,8 +356,15 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 
 | | 是什么 | 谁控制 |
 | --- | --- | --- |
-| 透明度 | 玻璃**底色**有多透（文字始终清晰） | 设置里的滑块 |
-| 未悬停淡出 | 整个控件（含文字）淡到 0.1，鼠标移上去变 1 | 固定的 `--ui-idle-opacity: 0.1`，不开放给用户 |
+| 透明度 | 玻璃**底色**有多透（文字始终清晰） | 设置项 `common.glassTransparency` → `--glass-alpha` |
+| 闲置透明度 | 鼠标**不悬停**时整个控件（含文字）淡到多透明；移上去变 1 | 设置项 `common.idleOpacity` → `--ui-idle-opacity`（**0-100%，十步一进**） |
+
+> 这两项**曾经**是「一个可调、一个写死」的：`--ui-idle-opacity` 原来硬编码 `0.1`
+> （注释还写着"固定行为"），后来按用户要求开放成设置项 `common.idleOpacity`，
+> 默认仍是 `10`（= 原来的 `0.1`），所以老用户观感不变。
+>
+> 存的是**百分比**，写进 CSS 时除 100（`opacity` 收小数）；悬停时 CSS 直接写死
+> `opacity: 1`（见 `biliVideoControls.vue`），所以这个设置只管闲置态。
 
 唯一不受淡出影响的是**左上角歌单按钮**：它常显（`opacity: 1`），悬停只让玻璃底实一点，
 不做透明度变化 —— 那个位置忽明忽暗很烦人。
@@ -2155,7 +2166,7 @@ wy: `song.id`，kw: `item.id`）。它是 `songs.id` 的来源，**不能丢**�
 > 失败路径（改名失败、跨盘、部分成功）比「让用户手动拷一次」麻烦得多，
 > 而且一旦出错就是数据事故。
 
-### 关闭到托盘 / 任务栏进度 / 输出设备变化
+### 关闭到托盘 / 任务栏进度 / 输出设备变化 / 开机自动启动
 
 - **关闭到托盘**（`common.closeToTray`）：`mainWindow.on('close')` 里 `preventDefault()` + `hide()`。
   关键是 `isQuitting` 标志 —— `before-quit` 里置位，否则「退出应用」菜单项和系统关机也会被拦下来，
@@ -2168,6 +2179,25 @@ wy: `song.id`，kw: `item.id`）。它是 `songs.id` 的来源，**不能丢**�
 - **输出设备变化暂停**（设置：`player.pauseOnDeviceChange`，默认开）：渲染层听 `navigator.mediaDevices`
   的 `devicechange`，正在播就先暂停（插拔耳机 / 切默认扬声器时，声音可能跑到别的设备上）。
   注意这个事件不区分输入输出设备，这是渲染进程能拿到的唯一信号。
+- **开机自动启动**（设置：`common.autoLaunch`，默认**关**）：用 Electron 内建的
+  `app.setLoginItemSettings({ openAtLogin, path: process.execPath, args: [] })` ——
+  **不需要额外的原生依赖**（对比托盘 / 壁纸那些都得自己调 Win32）。
+  它在 Windows 上写注册表 `Run` 键，macOS 用 `LaunchAgents`。
+
+  三个刻意决定：
+
+  | 决定 | 为什么 |
+  | --- | --- |
+  | **默认关** | 改系统启动项属于「动系统」的行为，应该由用户明确打开，而不是装完就悄悄注册一项 |
+  | **每次启动重写一遍**（`whenReady` 里调 `applyAutoLaunch`） | 便携版注册的是**当前 exe 的完整路径**，用户把文件夹挪走后启动项里还是旧路径、开机时**静默失效**（Windows 找不到 exe 就跳过，没有任何提示）。重写一次能自动纠正 |
+  | **开发模式一律关掉**（`isDev` 时主动写 `false`） | 开发时 `execPath` 是 `node_modules/electron/dist/electron.exe`，注册它没意义，还会污染用户的启动项（顺便把之前调试留下的残留清掉） |
+
+  **改了要立刻生效**：`onSettingChange` 里判断 `keys.includes('common.autoLaunch')` 就调 `applyAutoLaunch()`
+  —— 否则那个值只在下次启动时被读，用户打开开关后看不到任何变化，会以为没用。
+
+  **`args` 传空数组是刻意的**：不传 `--wallpaper-mode`。那是「这次启动直接进壁纸」的意思，
+  而壁纸模式要不要进由 `common.wallpaperMode` 自己决定（见 `createMainWindow`）——
+  在这里再传一个参数会让两个开关打架。
 
 ### 图标（窗口 / 托盘）放在哪
 

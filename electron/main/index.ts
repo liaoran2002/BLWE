@@ -60,6 +60,67 @@ import {
 
 const isDev = !app.isPackaged
 
+/**
+ * 应用「开机自动启动」这个开关
+ *
+ * ## 为什么用 `app.setLoginItemSettings()` 而不是自己写注册表
+ *
+ * Electron 内建了这个能力，跨平台都支持（Windows 写注册表 `Run` 键 /
+ * 启动文件夹；macOS 用 `LaunchAgents`）——
+ * **不需要额外的原生依赖**（对比：托盘/壁纸那些都得自己调 Win32）。
+ *
+ * ## ⚠️ 每次启动都重写一遍（这是刻意的）
+ *
+ * `setLoginItemSettings` 会把**当前 exe 的完整路径**写进系统启动项。
+ * 而本项目有**便携版**（绿色版），用户可能把它挪到别的文件夹 ——
+ * 那之后启动项里还是旧路径，开机时会**静默失败**（Windows 找不到那个 exe 就跳过，
+ * 不会有任何提示）。
+ *
+ * 所以在启动时按设置重写一次：路径变了就自动纠正。
+ * 代价是一次注册表写入（可忽略）。
+ *
+ * ## 为什么用 `execPath` 而不是 `app.getPath('exe')`
+ *
+ * 两者一样，但 `process.execPath` 在开发模式下指向 `electron.exe` ——
+ * 那种情况我们**不注册**（见下面的 `isDev` 判断），否则会把开发环境注册成开机启动，
+ * 每次开机弹一个 Electron 空窗口。
+ */
+const applyAutoLaunch = (): void => {
+  const enabled = Boolean(getSetting()['common.autoLaunch'])
+  /**
+   * 开发模式（`app.isPackaged === false`）一律**关掉**开机启动
+   *
+   * 原因：开发时 `execPath` 是 `node_modules/electron/dist/electron.exe`，
+   * 注册它没有意义（开机弹个空壳），而且会**污染用户的启动项**。
+   * 这里主动写一个 `false` 把它清掉 —— 免得之前调试时留下的残留一直在。
+   */
+  const shouldEnable = enabled && !isDev
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: shouldEnable,
+      /** 便携版 / 安装版都用真实 exe 路径（见上面那段说明） */
+      path: process.execPath,
+      /**
+       * 开机启动**不带额外参数**：走的是「正常窗口」这条路。
+       *
+       * ⚠️ 不传 `--wallpaper-mode` —— 那是「这次启动直接进壁纸」的意思，
+       * 而壁纸模式要不要进是 `common.wallpaperMode` 自己决定的（见 createMainWindow）。
+       * 在这里再传一个参数会让两个开关打架。
+       */
+      args: [],
+    })
+    if (enabled && isDev) {
+      console.log('[launch] 开发模式下不注册开机启动（已确保是关闭状态）')
+    }
+  } catch (err) {
+    /**
+     * 注册失败**不能影响启动** —— 只是开机不自启而已，
+     * 记一行日志让用户知道（而不是静默吞掉、让他以为设置没用）。
+     */
+    console.warn('[launch] 设置开机启动失败（忽略）：', err)
+  }
+}
+
 let mainWindow: BrowserWindow | null = null
 let loginWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -1438,6 +1499,14 @@ void app.whenReady().then(async () => {
   initSetting()
   initPlaylists()
 
+  /**
+   * 第 2.2 步：按设置把「开机自动启动」写进系统启动项
+   *
+   * **每次启动都重写**（不是只在第一次）—— 见 `applyAutoLaunch` 的说明：
+   * 便携版被挪动后旧路径会失效，重写一次能自动纠正。
+   */
+  applyAutoLaunch()
+
   // 第 2.5 步：装上加密资源的请求处理器（要在创建窗口之前）
   installProtectedProtocol()
 
@@ -1477,6 +1546,15 @@ void app.whenReady().then(async () => {
        */
       const maxAge = Number(_updated['cache.searchResultExpireMs']) || 0
       cacheManager.clearExpiredPlayurl(maxAge)
+    }
+    /**
+     * 「开机自动启动」改了要**立刻写进系统启动项**
+     *
+     * 不能只存设置 —— 那个值只在启动时被读（`applyAutoLaunch`），
+     * 用户打开开关后要等下次重启才生效，会以为没起作用。
+     */
+    if (keys.includes('common.autoLaunch')) {
+      applyAutoLaunch()
     }
     refreshTray()
   })
