@@ -783,10 +783,11 @@ export default defineComponent({
         const res = await electronApi.searchSong(parts.song, parts.singer);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         /**
-         * 顺序已经是最终顺序：主进程合并时就按「收藏在前、其余保持搜索顺序」
-         * 排好了，这里只做打分排序（`sortSearchedVideos` 会把收藏那一段原样保留）。
+         * 顺序已经是最终顺序 —— 主进程 `rankVideos` **在写库之前**排好的
+         * （收藏整段置顶，其余按「歌手名命中 +100」再叠关键词加权）。
+         * 渲染层**不再排序**，直接用返回的顺序。
          */
-        this.videoList = this.sortSearchedVideos(videos);
+        this.videoList = videos;
         this.videoListKeyword = songName;
       } catch (err) {
         // 搜索失败不致命：至少还能把记住的那个视频播起来
@@ -1468,7 +1469,7 @@ export default defineComponent({
       try {
         const res = await electronApi.searchSong(parts.song, parts.singer);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-        const list = this.sortSearchedVideos(videos);
+        const list = videos;
         /**
          * 与 `changeSong` 的挑选规则**逐字一致**，保证预热的就是待会儿真正要播的那个。
          *
@@ -2067,24 +2068,23 @@ export default defineComponent({
       }
     },
     /**
-     * 把搜索结果按「像不像这首原曲」排序
+     * （原来这里有个 `sortSearchedVideos()` —— **已删除**）
      *
-     * ⚠️ **已废弃，保留仅为兼容调用点** —— 打分排序搬到主进程了
-     * （`@common/utils/videoRank` 的 `sortByRelevance`），并且**在写库之前**执行，
-     * 所以 `videos.ord` 直接等于最终显示顺序，搜索返回的列表**已经是排好的**。
+     * 它曾是渲染层的第二套打分排序，后来被打分排序搬到主进程
+     * （`@common/utils/videoRank` 的 `rankVideos`）之后就退化成了恒等函数
+     * （`return videos`），只是留着兼容 5 个调用点。现在直接在每个调用点写
+     * `videos` 本身，这个空壳一并删掉。
      *
-     * 为什么必须搬走：原来主进程按「收藏 + B 站顺序」写 `ord`，渲染层拿到后又按打分
-     * 重排一遍，于是界面顺序和库里顺序是两套 ——「收藏再取消来提升顺序」这种
-     * 依赖持久化顺序的用法一重新搜索就散（取消后 `favorites` 变 0，
-     * 合并时不再保留它的位置，它就回到 B 站顺序了）。
+     * ## 为什么必须搬去主进程
      *
-     * 这里保留成恒等函数（而不是删掉），是因为调用点分布在续播 / 预热 / 重试等
-     * 好几处，逐个删容易漏；恒等之后行为立刻正确，且渲染层不再有第二套顺序。
-     * 两处各写一份打分早晚会漂移，这也是它被抽成共享模块的原因。
+     * 原来主进程按「收藏 + B 站顺序」写 `ord`，渲染层拿到后又按打分重排一遍 ——
+     * 于是**界面顺序和库里顺序是两套**。「收藏再取消来提升顺序」这种依赖持久化
+     * 顺序的用法一重新搜索就散（取消后 `favorites` 变 0、合并时不再保留位置，
+     * 它就回到 B 站顺序了）。
+     *
+     * 现在 `rankVideos` 在**写库之前**执行，`videos.ord` 直接等于最终显示顺序，
+     * 搜索返回的列表**已经是排好的** —— 渲染层不再有任何排序逻辑。
      */
-    sortSearchedVideos(videos: BiliVideo[]): BiliVideo[] {
-      return videos;
-    },
     async changeSong(index: number): Promise<void> {
       const songName = this.getSongName(index);
       /** 歌名与歌手分开（搜索接口收两个字段，不是一个拼串） */
@@ -2172,11 +2172,14 @@ export default defineComponent({
          */
         const filteredEmpty = Boolean((res.data as { filtered?: boolean } | null)?.filtered);
         /**
-         * 顺序已经是最终顺序：主进程合并时就按「收藏在前、其余保持搜索顺序」排好了，
-         * 这里只做打分排序（`sortSearchedVideos` 会把收藏那一段原样保留在最前面）。
-         * 原来那层 `applyFavoriteOrder` 已经删掉 —— 它和主进程各排一次，必然对不上。
+         * 顺序已经是最终顺序 —— 主进程 `rankVideos` **在写库之前**排好的
+         * （收藏整段置顶，其余按「歌手名命中 +100」再叠关键词加权）。
+         * 渲染层**不再排序**，直接用它给的顺序。
+         *
+         * 历史上这里有过两套二次排序（`applyFavoriteOrder` / `sortSearchedVideos`），
+         * 都已删除 —— 它们和主进程各排一次，必然对不上。
          */
-        let list = this.sortSearchedVideos(videos);
+        let list = videos;
 
         /**
          * 一首都没搜到 -> 重试几次（最多 3 次）
@@ -2199,7 +2202,7 @@ export default defineComponent({
             const retry = await electronApi.searchSong(parts.song, parts.singer, true);
             if (token !== this._songToken) return;
             const retryVideos = (retry.data as { result?: BiliVideo[] } | null)?.result ?? [];
-            list = this.sortSearchedVideos(retryVideos);
+            list = retryVideos;
             if (list.length > 0) {
               console.log(`[search] 《${songName}》第 ${attempt} 次重试成功，找到 ${list.length} 个视频`);
               res.data = retry.data as never;
@@ -2643,7 +2646,7 @@ export default defineComponent({
         const res = await electronApi.searchSong(parts.song, parts.singer, true);
         if (token !== this._songToken) return;
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-        this.videoList = this.sortSearchedVideos(videos);
+        this.videoList = videos;
         this.videoListKeyword = songName;
         // 当前播放的视频可能还在列表里（下标要跟着更新），也可能被搜没了
         this.currentVideoIndex = this.videoList.findIndex((v) => v.bvid === this.currentBvid);
