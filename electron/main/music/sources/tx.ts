@@ -161,6 +161,8 @@ const getListDetailNew = async (id: string): Promise<PlaylistDetail> => {
     total: data.total_song_num ?? songs.length,
     page: 1,
     limit: LIMIT_SONG,
+    /** 平台歌单 id —— 拼 playlists.id 用（见 PlaylistDetail.listId） */
+    listId: id,
     source: SOURCE,
   }
 }
@@ -199,6 +201,8 @@ const getListDetailOld = async (id: string): Promise<PlaylistDetail> => {
     total: songs.length,
     page: 1,
     limit: LIMIT_SONG,
+    /** 平台歌单 id —— 拼 playlists.id 用（见 PlaylistDetail.listId） */
+    listId: id,
     source: SOURCE,
   }
 }

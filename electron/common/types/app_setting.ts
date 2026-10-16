@@ -90,10 +90,45 @@ export interface AppSetting {
   /**
    * 标题关键词加权配置：score -> 关键词列表
    *
-   * 正分关键词命中则加分（越优先），负分关键词命中则降权（如翻唱、伴奏、教学）。
+   * **只用于「层内细分」**（见 `@common/utils/videoRank`）：先按
+   * 「**歌手名是否命中**」分层（命中 `+100`），同层内再用它细分。
+   *
+   * 命中后**逐条累加，没有上限** —— 用户给 `-50` 就是 `-50`。
+   * （早先会 clamp 到 ±10，已取消：那样 `-20` 档的「伴奏」和 `-4` 档的
+   * 「乐器演奏」只差 6 分，压不出轻重。）
+   *
    * 该字段是一个整体替换的配置对象，不做逐项深合并。
    */
   'player.tagBonus': Record<string, string[]>
+  /**
+   * 命中即**丢弃**的关键词
+   *
+   * 和 `player.tagBonus` 的区别（规格里特意分开的两套）：
+   *
+   * | | tagBonus | filterKeywords |
+   * | --- | --- | --- |
+   * | 作用阶段 | 层内细分 | **硬过滤** |
+   * | 命中后 | 加/减分 | **直接丢弃** |
+   * | 用户场景 | 微调排序偏好 | 绝对不想要的内容 |
+   *
+   * 默认给一组**谱类 / 演奏类**词（吉他谱、钢琴谱、指弹、口琴……）——
+   * 那些搜出来很多、但用户要的是「能跟着唱的原曲」而不是教学。
+   */
+  'player.filterKeywords': string[]
+  /**
+   * 时长容差（秒，默认 90）
+   *
+   * 视频时长与歌单时长的允许差值。规则里 MV / Live 会自动放宽上限
+   * （`×1.7`），用户不用管这个细节，只调一个整体宽严。
+   */
+  'player.durationToleranceSec': number
+  /**
+   * 过滤后结果**少于多少条就降级重搜**（默认 30）
+   *
+   * 「降级」= 换更宽松的搜索词再搜一遍（见 `searchSongFiltered`）。
+   * 设成 `0` 表示**从不降级**（搜一次就算）。
+   */
+  'player.minSearchResults': number
   // #endregion
 
   // #region cache
@@ -116,10 +151,15 @@ export interface AppSetting {
    * 搜索结果（播放直链）过期时间（毫秒）
    *
    * 过期只清**地址那一批列**（`durl_url` / `dash_video` / `dash_audio` /
-   * `dash_duration` / `quality` / `support_formats` / `playurl_at`），**绝不删行**：
+   * `dash_duration` / `playurl_at`），**绝不删行**：
    * 标题、封面、收藏、顺序永不过期。所以这是「直链多久后重新解析」，
    * 不是「缓存留多久」。直链实测寿命约 2 小时，默认给 3 天是为了和改造前的
    * 行为对齐（用户不会觉得「升级完怎么老在重新解析」）。
+   *
+   * ⚠️ `quality` / `support_formats` 两列已在 schema v4 删除，
+   * 不在清理清单里（durl 的清晰度从 URL 反推，档位表内置在 constants）。
+   * 另：`dash_tried` 与 `playurl_login_state` **刻意不清** —— 它们不是地址，
+   * 详见 `cache.ts` 的 `clearExpiredPlayurl`。
    *
    * **0 = 永久**（永远不清理直链，一直用到 `isUrlUsable` 判定它过期为止）。
    */

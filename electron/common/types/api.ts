@@ -82,7 +82,7 @@ export interface RendererAPI {
   // #region B 站接口
   getUserInfo: () => Promise<UserInfo>
   /** skipCache=true 用于视频列表的刷新按钮（真的重搜，同时保住已解析的播放地址） */
-  searchSong: (keyword: string, skipCache?: boolean) => Promise<{ data: unknown }>
+  searchSong: (song: string, singer: string, skipCache?: boolean) => Promise<{ data: unknown }>
   /** 「添加视频」：解析 B 站链接 / BV 号 */
   parseVideo: (input: string) => Promise<ParsedVideoInfo>
   /**
@@ -131,7 +131,7 @@ export interface RendererAPI {
   /** 解析各大音乐平台的歌单分享链接（移植自 LX 的 musicSdk） */
   getPlaylistDetail: (
     params: import('./musicSdk').GetPlaylistDetailParams,
-  ) => Promise<import('./musicSdk').PlaylistDetail>
+  ) => Promise<import('./ipc').IpcChannelMap['music:getPlaylistDetail']['result']>
   // #endregion
 
   // #region 歌单 / 缓存

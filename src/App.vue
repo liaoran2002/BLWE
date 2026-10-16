@@ -219,8 +219,8 @@ import AboutDialog from './components/AboutDialog.vue';
 import electronApi from './api/electron';
 import { useSettingStore } from './stores/setting';
 import { usePlaylistStore } from './stores/playlists';
-import type { SyncResult, PlaylistSong as StructuredSong } from '@common/types/playlist';
 import { toSearchKey } from '@common/types/playlist';
+import type { PlaylistSong as StructuredSong, SyncResult } from '@common/types/playlist';
 import { normalizeImageUrl } from './utils/image';
 import { qualityLabelOf } from './utils/videoQuality';
 import { DashSession } from './utils/dashPlayer';
@@ -708,6 +708,13 @@ export default defineComponent({
       const record = this.playlistsStore.current;
       if (!record || record.songs.length === 0) return false;
 
+      /**
+       * 回到该歌单上次播放的位置
+       *
+       * ⚠️ 下标本身会**被同步改变含义**（曲目增删后第 N 个位置可能是别的歌），
+       * 所以主进程在 `syncPlaylist` 里会把它**重算**成新列表里的位置 ——
+       * 这里只需要夹进范围。
+       */
       const index = Math.min(Math.max(0, record.lastIndex), record.songs.length - 1);
       this.songs = [...record.songs];
       this.listName = record.name;
@@ -720,7 +727,7 @@ export default defineComponent({
 
       try {
         // 「记住播放进度」一个开关管到底：歌 + 进度一起回来
-        if (await this.restoreSongVideo(songName, resumeTime)) {
+        if (await this.restoreSongVideo(index, resumeTime)) {
           this.$message.success(
             `已续播《${this.listName}》第 ${index + 1} 首` +
               (resumeTime > 3 ? `（${this.formatTime(resumeTime)}）` : ''),
@@ -743,10 +750,14 @@ export default defineComponent({
      * 播哪个视频以主进程记的 `selectedBvid`（`song_meta` 表）为准，
      * 而且直链一律交给 `api:resolveVideo` 现取：缓存里的地址可能早就过了签名时效。
      *
+     * @param index  要恢复的那首歌的下标（歌名/歌手/缓存键都由它推出来）
      * @param seekTo 播放起点（秒），0 表示从头
      * @returns 是否成功
      */
-    async restoreSongVideo(songName: string, seekTo = 0): Promise<boolean> {
+    async restoreSongVideo(index: number, seekTo = 0): Promise<boolean> {
+      const songName = this.getSongName(index);
+      const parts = this.getSongParts(index);
+      if (!songName || !parts) return false;
       /**
        * 没有「上次播的视频」记录 -> 交给默认流程
        *
@@ -769,7 +780,7 @@ export default defineComponent({
       this.songName = songName;
 
       try {
-        const res = await electronApi.searchSong(songName);
+        const res = await electronApi.searchSong(parts.song, parts.singer);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         /**
          * 顺序已经是最终顺序：主进程合并时就按「收藏在前、其余保持搜索顺序」
@@ -900,10 +911,8 @@ export default defineComponent({
       if (record && record.songs.length > 0) {
         this.listName = record.name;
         this.songs = [...record.songs];
-        // 回到该歌单上次播放的位置
-        const savedIndex = record.lastIndex;
-        this.currentIndex =
-          savedIndex >= 0 && savedIndex < this.songs.length ? savedIndex : 0;
+        /** 回到该歌单上次播放的位置（下标由主进程在同步时重算，这里夹进范围） */
+        this.currentIndex = Math.min(Math.max(0, record.lastIndex), this.songs.length - 1);
         // 兼顾「播放进度」：走这条兜底路径时（没有已缓存的视频可精确还原）
         // 也要把上次的秒数带上，否则换歌单/首启场景会丢掉进度
         const cfg = this.settingStore.setting;
@@ -960,8 +969,7 @@ export default defineComponent({
       // 换歌单时把进度重置，避免把上一个歌单的秒数带到新歌单
       this.songs = [...record.songs];
       this.listName = record.name;
-      this.currentIndex =
-        record.lastIndex >= 0 && record.lastIndex < this.songs.length ? record.lastIndex : 0;
+      this.currentIndex = Math.min(Math.max(0, record.lastIndex), Math.max(0, record.songs.length - 1));
       this.videoList = [];
       this.videoListKeyword = '';
       this.currentVideoIndex = 0;
@@ -1373,6 +1381,12 @@ export default defineComponent({
       }
 
       this._stallRecoveries = 0;
+      /**
+       * ⚠️ 提示里要用**显示名**（`歌名-歌手`），不能用 `this.songName`
+       *
+       * `songName` 现在是**缓存键**（形如 `tx_002dNLgZ2dk7sy`），
+       * 直接贴进提示会变成「《tx_002dNLgZ2dk7sy》这条视频拉不动」。
+       */
       const label = `《${this.songName || '当前歌曲'}》`;
       if (this.songs.length > 1) {
         this.$message.warning(`${label}这条视频拉不动，已跳过`);
@@ -1447,11 +1461,12 @@ export default defineComponent({
       const idx = this.indexForDir(dir);
       if (idx < 0) return;
       const songName = this.getSongName(idx);
-      if (!songName || songName === this.songName) return;
+      const parts = this.getSongParts(idx);
+      if (!songName || !parts || songName === this.songName) return;
       if (this._warm[dir]?.song === songName) return; // 已经是热的
       this._warming[dir] = true;
       try {
-        const res = await electronApi.searchSong(songName);
+        const res = await electronApi.searchSong(parts.song, parts.singer);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         const list = this.sortSearchedVideos(videos);
         /**
@@ -1757,7 +1772,10 @@ export default defineComponent({
         return;
       }
       this._videoErrorCount = 0;
-      this.$message.warning(`《${this.songName || '当前歌曲'}》视频加载失败，已跳过`);
+      /** 用显示名（`songName` 现在是缓存键，形如 `tx_xxx`，不能贴进提示） */
+      this.$message.warning(
+        `《${this.songName || '当前歌曲'}》视频加载失败，已跳过`,
+      );
       if (this.songs.length > 1) this.next();
     },
     onVideoLoaded(): void {
@@ -2069,7 +2087,9 @@ export default defineComponent({
     },
     async changeSong(index: number): Promise<void> {
       const songName = this.getSongName(index);
-      if (!songName) return;
+      /** 歌名与歌手分开（搜索接口收两个字段，不是一个拼串） */
+      const parts = this.getSongParts(index);
+      if (!songName || !parts) return;
       const token = ++this._songToken;
       /**
        * 换歌 = 上一次「手动挑的清晰度 / 音质」作废
@@ -2139,10 +2159,18 @@ export default defineComponent({
        */
 
       try {
-        const res = await electronApi.searchSong(songName);
+        const res = await electronApi.searchSong(parts.song, parts.singer);
         if (token !== this._songToken) return;
         // searchSong 的 data 形状由搜索接口决定，这里收敛成 BiliVideo
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
+        /**
+         * 主进程在「过滤后一条不剩」时会带 `filtered: true`
+         *
+         * 那表示**搜索本身成功了**，只是所有结果都被过滤规则（标题不含歌名 /
+         * 时长对不上 / 命中屏蔽词）挡掉了 —— 这时**不能重试**：
+         * 重试只会拿到同样的一批、再被同样地挡掉，白打 3 次请求、白等两秒。
+         */
+        const filteredEmpty = Boolean((res.data as { filtered?: boolean } | null)?.filtered);
         /**
          * 顺序已经是最终顺序：主进程合并时就按「收藏在前、其余保持搜索顺序」排好了，
          * 这里只做打分排序（`sortSearchedVideos` 会把收藏那一段原样保留在最前面）。
@@ -2158,15 +2186,17 @@ export default defineComponent({
          * B 站搜索本身很稳，连着 3 次都搜不到才值得怀疑是环境问题。
          *
          * 每次都用 `skipCache`，避免上一次的空结果又被读出来。
+         *
+         * ⚠️ `filteredEmpty` 时**跳过重试**（见上面的说明）—— 那是合法结果，不是失败。
          */
-        if (list.length === 0) {
+        if (list.length === 0 && !filteredEmpty) {
           const MAX_RETRY = 3;
           for (let attempt = 1; attempt <= MAX_RETRY && list.length === 0; attempt++) {
             if (token !== this._songToken) return;
             console.warn(
               `[search] 《${songName}》搜索结果为空，第 ${attempt}/${MAX_RETRY} 次重试`,
             );
-            const retry = await electronApi.searchSong(songName, true);
+            const retry = await electronApi.searchSong(parts.song, parts.singer, true);
             if (token !== this._songToken) return;
             const retryVideos = (retry.data as { result?: BiliVideo[] } | null)?.result ?? [];
             list = this.sortSearchedVideos(retryVideos);
@@ -2204,9 +2234,17 @@ export default defineComponent({
             this.videoList[0].bvid;
           await this.changeVideo(selectedBvid, songName);
         } else {
-          // 重试完还是没有：把上一首的播放状态彻底停掉，别出现「新歌名 + 旧视频在播」
+          // 还是没有：把上一首的播放状态彻底停掉，别出现「新歌名 + 旧视频在播」
           this.clearNowPlaying();
-          this.notifySearchEmpty(songName);
+          /**
+           * 提示要分两种情况说 —— 它们**解决办法完全不同**：
+           *  - `filteredEmpty`：搜索成功了，只是被**过滤规则**全挡掉了。
+           *    解决办法是去设置里放宽规则（过滤词、时长容差），
+           *    说「网络有问题」会把用户引到完全错误的方向。
+           *  - 否则：搜索真的没结果，才谈网络 / 登录。
+           */
+          if (filteredEmpty) this.notifyFilteredEmpty(songName);
+          else this.notifySearchEmpty(songName);
         }
       } catch (err) {
         if (token !== this._songToken) return;
@@ -2216,6 +2254,23 @@ export default defineComponent({
         this.clearNowPlaying();
         this.$message.error(`《${songName}》${this.errMsg(err)}`);
       }
+    },
+    /**
+     * **结果被过滤规则全部挡掉**时的提示
+     *
+     * 和 `notifySearchEmpty`（搜索真失败）是两件事，所以提示也要分开：
+     * 这里搜索是成功的，问题出在**过滤规则太严**，解决办法是去设置里放宽。
+     * 说成「网络有问题」会让用户白折腾半天。
+     */
+    notifyFilteredEmpty(songName: string): void {
+      this.$notify({
+        title: `《${songName}》的结果都被过滤掉了`,
+        message:
+          '搜索是成功的，但结果都不符合当前的过滤规则（标题不含歌名 / 时长差太多 / 命中过滤关键词）。' +
+          '可以去「设置 → 搜索」里放宽时长容差或删掉一些过滤关键词。',
+        type: 'warning',
+        duration: 9000,
+      });
     },
     /**
      * 搜索彻底失败（重试 3 次仍没有结果）时的提示
@@ -2579,11 +2634,13 @@ export default defineComponent({
      * 不重播当前视频，只是把列表换了 —— 用户要的是「刷新列表」。
      */
     async refreshVideoList(): Promise<void> {
+      const parts = this.getSongParts(this.currentIndex);
+      /** 缓存键（`歌名-歌手`）—— 只用于给 `videoListKeyword` 打标识，不参与搜索 */
       const songName = this.songName;
-      if (!songName) return;
+      if (!parts || !songName) return;
       const token = this._songToken;
       try {
-        const res = await electronApi.searchSong(songName, true);
+        const res = await electronApi.searchSong(parts.song, parts.singer, true);
         if (token !== this._songToken) return;
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         this.videoList = this.sortSearchedVideos(videos);
@@ -2690,8 +2747,19 @@ export default defineComponent({
       const ms = navigator.mediaSession;
       if (!ms) return;
       const song = this.getSong(this.currentIndex);
+      /**
+       * ⚠️ 兜底**不能**用 `this.songName`（那是缓存键 `tx_7062415`）——
+       * 它会被 Windows 音量弹窗 / 锁屏界面显示出来，用户看到一串 ID。
+       * 用显示名兜底。
+       */
       const title = song?.name || this.videoName || this.songName || 'B站音乐视频';
-      const artist = song?.singer || this.userName || '未知歌手';
+      /**
+       * 变量按项目惯例叫 `singer`
+       *
+       *（MediaMetadata 那个字段叫 `artist`，是**它的** API 名字 ——
+       * 下面构造时才写成 `artist: singer`，不让它污染我们的变量名）
+       */
+      const singer = song?.singer || this.userName || '未知歌手';
       const album = song?.album || this.listName || '';
 
       // 封面：平台专辑图 -> 视频缩略图，两个尺寸都给，系统会挑合适的
@@ -2706,7 +2774,8 @@ export default defineComponent({
       try {
         ms.metadata = new MediaMetadata({
           title,
-          artist,
+          /** `artist` 是 MediaMetadata 的字段名 —— 值取我们的 `singer` */
+          artist: singer,
           album,
           artwork,
         });
@@ -2764,7 +2833,7 @@ export default defineComponent({
         'player.resumeTime': Math.floor(this.currentTime || 0),
       };
       void this.settingStore.update(patch);
-      // 歌单自己的下标（切歌单时用于回到各自的位置）
+      // 歌单自己播到第几首（切歌单时用于回到各自的位置）
       void this.playlistsStore.setLastIndex(this.currentIndex);
     },
     /** 节流记录进度，避免 timeupdate 每秒写多次 */
@@ -2839,10 +2908,27 @@ export default defineComponent({
        */
     },
     /**
-     * 取第 index 首歌的「搜索键」（`"歌名-歌手"`）
+     * 取第 index 首歌的**歌名 + 歌手**（分开给，供搜索用）
      *
-     * 匹配打分、搜索缓存 key、收藏/选中视频的 key 全部沿用这个格式，
-     * 所以曲目改成结构化对象后，这里统一用 toSearchKey 兼容旧链路。
+     * ⚠️ 搜索接口收的是**两个字段**（`song` / `singer`），不是一个拼串 ——
+     * 歌名本身可能含 `-`（`下坠Falling` / `R.` / `若是明仔载`），
+     * 拼成 `歌名-歌手` 再拆会切错。歌单里本来就是分开存的，直接拿。
+     *
+     * @returns 歌名与歌手；**歌名为空时为 null**（不用空歌名去搜）
+     */
+    getSongParts(index: number): { song: string; singer: string } | null {
+      const s = this.songs[index];
+      if (!s || !s.name) return null;
+      return { song: s.name, singer: s.singer ?? '' };
+    },
+    /**
+     * 取第 index 首歌的**缓存键**（`"歌名-歌手"`）
+     *
+     * ⚠️ 这是**缓存键**（`videos.search_key` / `song_meta.search_key` 的值），
+     * 也是判断「这份视频列表属于哪首歌」的标识 —— **不能用于搜索**
+     * （搜索走 `getSongParts`，要分开的歌名/歌手）。
+     *
+     * 名字里的 `Name` 是历史遗留（早先只有歌名），它装的是「歌名 + 歌手」。
      */
     getSongName(index: number): string | null {
       if (!this.songs || this.songs.length === 0) return null;
@@ -2880,11 +2966,15 @@ export default defineComponent({
     syncTrayState(): void {
       // 托盘显示的是「歌曲名 - 歌手名」，不是视频标题（视频标题太长了）
       const song = this.getSong(this.currentIndex);
+      /**
+       * ⚠️ 兜底用 `songLabel`（显示名），**不是** `songName`（缓存键 `tx_xxx`）——
+       * 后者会出现在托盘悬浮提示上，用户看到一串 ID。
+       */
       const title = song
         ? song.singer
           ? `${song.name} - ${song.singer}`
           : song.name
-        : this.songName || '';
+        : this.songName;
       electronApi.trayUpdateState({
         paused: this.paused,
         // 托盘契约用字符串枚举的循环模式（与持久化的 player.loopMode 一致）

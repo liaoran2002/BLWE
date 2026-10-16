@@ -65,10 +65,126 @@ export interface PlaylistSong {
 }
 
 /**
- * 搜索键：拼成 `"歌名-歌手"`，与旧版字符串格式保持一致
+ * 合法的音源前缀（`songs.id` / `playlists.id` 的前缀部分）
+ *
+ * 只认这几个 —— 否则 `pl_xxx`（随机兜底 id）会被解析成音源 `pl`，
+ * 那是个不存在的平台，下游拿去用会静默出错。
+ */
+const KNOWN_SOURCES = new Set(['wy', 'tx', 'kw', 'kg'])
+
+/**
+ * 从 `songId` / `playlistId` 反推音源（`tx` / `wy` / `kw`）
+ *
+ * 为什么需要：`songs` 表**没有 `source` 列**了 —— `id` 的前缀（`tx_`）已经
+ * 表达了它。反推比再存一列更省，也不可能出现「id 是 tx_ 但 source 写了 wy」
+ * 这种自相矛盾。
+ *
+ * @returns 音源；**前缀不是已知平台时返回 null**
+ *          （手动添加的歌是 `歌名-歌手`，兜底歌单是 `pl_xxx`）
+ */
+export const sourceOfSongId = (id: string): string | null => {
+  const m = /^([a-z]+)_/.exec(String(id ?? ''))
+  if (!m) return null
+  return KNOWN_SOURCES.has(m[1]) ? m[1] : null
+}
+
+/**
+ * 一首歌的**稳定唯一标识**（`songs.id` / `playlist_songs.song_id`）
+ *
+ * ## 形态：`音源_平台id`
+ *
+ * 形如 `tx_002dNLgZ2dk7sy` / `wy_1234567`。带音源前缀是**必须的** ——
+ * 各平台的 id 空间独立，QQ 的 `123` 和酷我的 `123` 是两首完全不同的歌，
+ * 不带前缀会静默撞在一起。
+ *
+ * ## ⚠️ 它**只用于 `songs` 表**
+ *
+ * `videos.search_key` / `song_meta.search_key` 存的是**歌名**
+ * （见 `toSearchKey`）—— 那些表要拿键去**搜 B站**，用 id 搜不出任何东西。
+ *
+ * 这个 id 的唯一用途是让「同一首歌」在两个歌单里只占 songs 表**一行**。
+ *
+ * ## 没有平台 id 时兜底
+ *
+ * 手动按「歌名-歌手」添加的歌没有平台 id，退化成 `toSearchKey(song)`。
+ */
+export const songId = (song: PlaylistSong): string => {
+  const pid = typeof song.platformId === 'string' ? song.platformId.trim() : ''
+  if (!pid) return toSearchKey(song)
+  const src = typeof song.source === 'string' ? song.source.trim() : ''
+  return src ? `${src}_${pid}` : pid
+}
+
+/** `songId` 的别名（语义更直白：它就是「这首歌的键」） */
+export const songKeyOf = songId
+
+/**
+ * ★ 歌单主键：`平台_平台歌单id`（如 `tx_8153225605`）
+ *
+ * ## 为什么不用随机 UUID
+ *
+ *  - 同一个歌单**重复导入**会命中同一行，而不是攒出一堆副本；
+ *  - 重启 / 换机器后靠 `sourceUrl` 能推出同一个 id，不会被认成新歌单。
+ *
+ * ## 什么时候退化成随机 id
+ *
+ * **手动新建的歌单**（用户手填歌曲、没有平台链接）没有平台 id ——
+ * 那时只能随机生成一个（这部分由主进程处理，见 `newId()`）。
+ *
+ * @param source 音源（`tx` / `wy` / `kw`）
+ * @param listId 平台侧歌单 id
+ * @returns 形如 `tx_8153225605`；**参数不全时返回 null**（调用方应退化成随机 id）
+ */
+export const playlistKey = (
+  source: string | undefined | null,
+  listId: string | undefined | null,
+): string | null => {
+  const s = typeof source === 'string' ? source.trim() : ''
+  const i = typeof listId === 'string' ? listId.trim() : ''
+  if (!s || !i) return null
+  return `${s}_${i}`
+}
+
+/**
+ * 从 `songId` 反推**平台侧歌曲 id**（去掉 `tx_` 前缀）
+ *
+ * 与 `sourceOfSongId` 配对使用：`songs` 表没有 `source` / `platform_id` 两列，
+ * 它们都在 `id` 里。
+ *
+ * @returns 平台 id；`id` 没有平台前缀时（手动添加的歌）返回 null
+ */
+export const platformIdOfSongId = (id: string): string | null => {
+  const m = /^([a-z]+)_(.+)$/.exec(String(id ?? ''))
+  return m ? m[2] : null
+}
+
+/**
+ * 把「歌名 + 歌手」拼成缓存键 `"歌名-歌手"`
+ *
+ * ⚠️ 参数名统一叫 `singer`（**不是 `artist`**）—— 项目里所有其它地方
+ * （`PlaylistSong.singer` / `RankOptions.singer` / `scoreVideo` 的参数）
+ * 都是 `singer`，用 `artist` 会让读代码的人以为是另一个概念。
+ * （唯一叫 `artist` 的地方是 `MediaMetadata` 的**字段名**，那是它的 API。）
+ */
+export const joinSearchKey = (song: string, singer: string): string => {
+  const s = String(song ?? '').trim()
+  const a = String(singer ?? '').trim()
+  return a ? `${s}-${a}` : s
+}
+
+/**
+ * 搜索键 / 缓存键：`"歌名-歌手"`
+ *
+ * ⚠️ 它**不是歌名**，是「歌名 + 歌手」拼起来的。两处用到它：
+ *  1. `videos.search_key` / `song_meta.search_key` —— 缓存主键；
+ *  2. 传给 IPC 的歌曲标识。
+ *
+ * 但**界面显示不要用它**，也**不要为了拿歌名/歌手去拆它** ——
+ * `PlaylistSong` 上本来就有 `.name` / `.singer` 两个独立字段，直接取即可
+ * （歌名本身还可能含 `-`，拆串是有歧义的）。
  */
 export const toSearchKey = (song: PlaylistSong): string =>
-  song.singer ? `${song.name}-${song.singer}` : song.name
+  joinSearchKey(song.name, song.singer ?? '')
 
 /** 把旧的 `"歌名-歌手"` 字符串解析成结构化歌曲 */
 export const parseSearchKey = (text: string): PlaylistSong => {
@@ -98,7 +214,15 @@ export interface PlaylistRecord {
   lastSyncAt: number | null
   createdAt: number
   updatedAt: number
-  /** 该歌单上一次播放到第几首 */
+  /**
+   * 该歌单上次播放到**第几首**（下标，0 起）
+   *
+   * ⚠️ 下标会被**重新同步**改变含义（曲目增删后第 N 个位置可能是别的歌）。
+   * 所以主进程在 `syncPlaylist` 里**必须重算**这个下标（按歌找新位置），
+   * 见那边的注释 —— 那才是这个字段能用的前提。
+   *
+   * 这首歌被删掉时保留原下标（夹进范围），效果是「下一首顶上来」。
+   */
   lastIndex: number
 }
 

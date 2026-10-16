@@ -310,6 +310,8 @@ export const getListDetail = async (
         total: trackIds.length || songs.length,
         page,
         limit: LIMIT_SONG,
+        /** 平台歌单 id —— 拼 `playlists.id` 用（见 `PlaylistDetail.listId`） */
+        listId: id,
         source: SOURCE,
       }
     },

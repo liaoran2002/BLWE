@@ -12,7 +12,8 @@
  */
 import { mainHandle } from '@common/mainIpc'
 import { AUDIO_QUALITY_OPTIONS, findQualityOption, qualityLabelOf } from '@common/constants'
-import { sortByRelevance } from '@common/utils/videoRank'
+import { rankVideos } from '@common/utils/videoRank'
+import { joinSearchKey } from '@common/types/playlist'
 import { durationToSeconds } from '@common/utils/duration'
 import * as biliApi from '../biliApi'
 import { isUrlUsable, readQualityOptions } from '../biliApi'
@@ -171,75 +172,198 @@ export const registerApiHandlers = (context: ApiContext): void => {
 
   mainHandle('api:getUserInfo', () => biliApi.getUserInfo())
 
-  mainHandle('api:searchSong', async ({ keyword, skipCache }) => {
-    if (!keyword || !keyword.trim()) {
-      throw new Error('关键词不能为空')
+  mainHandle('api:searchSong', async ({ song, singer, skipCache }) => {
+    const songName = String(song ?? '').trim()
+    const singerName = String(singer ?? '').trim()
+    if (!songName) {
+      throw new Error('歌名不能为空')
     }
+
+    /**
+     * 歌名与歌手**分开收**（渲染层也是分开传的）
+     *
+     * 为什么要分开，而不是收一个 `"歌名-歌手"` 再拆：
+     *  - 歌名、歌手本来就是两个独立字段（歌单、界面都分开存）；
+     *  - 拼成串再拆是**有歧义**的 —— 歌名本身可能含 `-`
+     *    （`下坠Falling` / `R.` / `若是明仔载`），按 `-` 切会切错；
+     *  - 只有**拼搜索词**那一刻才需要两者同时在场，而那不需要拼串。
+     *
+     * `searchKey` 是**缓存键**（`videos.search_key` / `song_meta.search_key`），
+     * 格式仍是 `"歌名-歌手"`（与历史数据一致），只在这里拼一次。
+     */
+    const searchKey = joinSearchKey(songName, singerName)
 
     /**
      * 缓存命中直接返回（`skipCache` 是视频列表的刷新按钮，会真的重搜）。
      *
-     * 缓存的整包内容已经由 `cacheManager.get` 按 `videos.ord` 拼好，
-     * 也就是「收藏在前、其余按上次搜索顺序」—— 与下面重新搜索后的合并结果同构，
-     * 所以这里不需要再做任何排序。
+     * ## 为什么读缓存时还要过一次 `rankVideos`
+     *
+     * 缓存里存的**本来就是过滤好的列表**（写进去的是 `finalList`），
+     * 所以正常路径下这次过滤什么都不会改 —— 它不是"补做过滤"。
+     *
+     * 它只解决**一个**场景：**用户改了过滤设置**。
+     *
+     * ```
+     * 缓存是 3 天前写的（按当时的规则过滤过）
+     * 用户今天新加了过滤词「吉他谱」
+     * → 缓存不会因为设置变了就失效，读出来还是 3 天前那批（含吉他谱）
+     * → 这里用**当前**规则再过一遍，设置立刻生效
+     * ```
+     *
+     * 代价是几十条的内存过滤，可以忽略。
+     *
+     * ## ⚠️ 但**不把结果回写缓存**（这里改过一次）
+     *
+     * 我原来写过「过滤后条数变了就把缓存也修好」，传的是过滤后的 `refiltered`。
+     * 那是错的，原因只有一个但足够：
+     *
+     * **`save` 是 DELETE + INSERT**（`cache.ts` 里 `DELETE FROM videos WHERE
+     * search_key = ?` 然后整批重插）。把过滤后的列表写回去，等于**把被过滤掉的
+     * 那些行从库里永久删掉** —— 而它们只是"按**当前**规则不该显示"，
+     * 并不是脏数据。
+     *
+     * 后果：用户把容差从 30 调回 90（或删掉一个过滤词）想找回那些结果时，
+     * 它们**已经不在库里了**，必须重新联网搜索才回得来。
+     *
+     * 所以：读路径**只读不写**。规则错了最多是这次显示不对，缓存本身还是完整的。
      */
-    const cached = cacheEnabled() ? await cacheManager.get<SearchPayload>(keyword) : null
+    const cached = cacheEnabled() ? await cacheManager.get<SearchPayload>(searchKey) : null
     if (cached && cached.data && !skipCache) {
-      // 缓存里存的是上一次的完整返回体，这里还原成调用方期望的 { data }
       const payload = cached.data as unknown as SearchPayload
-      return { data: payload.data ?? cached.data }
+      const cachedList = (payload.data?.result ?? []) as CachedSearchItem[]
+      const refiltered = rankVideos(cachedList, {
+        song: songName,
+        singer: singerName,
+        songDurationSec: findSongDuration(searchKey),
+        tagBonus: getSetting()['player.tagBonus'],
+        filterKeywords: getSetting()['player.filterKeywords'],
+        durationToleranceSec: getSetting()['player.durationToleranceSec'],
+        /**
+         * ⚠️ 缓存路径**一律放宽**时长上限
+         *
+         * 缓存里存的是**已经取回来并过滤过的**结果，而它当初是用哪一档容差、
+         * 有没有走降级轮（降级轮会放宽 ×1.7）取的 —— 这里无从得知
+         * （那份信息没落库）。
+         *
+         * 两种选择里必须挑一个：
+         *  - 用**严格**上限重过滤 → 可能把当初按放宽规则合法取回的结果**藏起来**，
+         *    用户看到「我什么都没改，列表怎么少了」；
+         *  - 用**放宽**上限重过滤 → 最多是多留几条，用户不会觉得东西丢了。
+         *
+         * 取后者：**宁可多留，不可误藏**。注意这只影响时长这一条 ——
+         * 歌名 / 屏蔽词那两条**照常严格**（它们是「是不是同一首歌」的判据，
+         * 不存在「当初放宽过」这回事）。
+         */
+        relaxUpperBound: true,
+      })
+      if (refiltered.length !== cachedList.length) {
+        console.log(
+          `[search] ${searchKey} 缓存命中，按当前规则剔除${cachedList.length - refiltered.length}条`,
+        )
+      }
+      /**
+       * 过滤后为空 → **这份缓存对当前规则已经没用了**，当作没命中往下真实搜索。
+       *
+       * 不能返回空数组 + `filtered` 标记：那个标记的语义是
+       * 「刚搜过、结果被规则挡掉了」，而这里根本没搜 —— 用户看到
+       * 「结果都被过滤掉了」的提示，但其实一次网络请求都没发，
+       * 点了刷新可能就有结果了。真实搜索一次才是对的。
+       */
+      if (refiltered.length > 0) {
+        return { data: { ...(payload.data ?? {}), result: refiltered } }
+      }
+      console.warn(`[search] ${searchKey} 缓存全不符合当前规则，忽略缓存重新搜索`)
     }
 
-    const result = await biliApi.searchSong(keyword)
+    /**
+     * 第一级搜索词：`《歌名》歌曲 歌手`
+     *
+     * ⚠️ **不用 `-`**：B站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 排除 B），
+     * 写成 `《歌名》歌曲 - 歌手` 会变成「搜歌、**排除**这个歌手」，正好反了。
+     */
+    const primaryKeyword = biliApi.buildPrimaryKeyword(song, singer)
+
+    const result = await biliApi.searchSong(primaryKeyword)
 
     if (result.code !== 0) {
       throw new Error(result.message ?? '搜索失败')
     }
 
     /**
-     * ★ 时长过滤 +「结果太少就再查一页」
+     * ★ 搜索 + 补齐 + **降级重搜**
      *
-     * **用户定的规则**：搜索出来的视频时长和歌单里那首歌的时长差超过 ±90 秒
-     * 就丢掉（那多半不是同一首歌——合集、live 全场、串烧）；过滤后**少于 30 条**
-     * 就再查一页补齐。
+     * **用户定的规则**：
+     *  - 时长差超过容差（默认 ±90 秒）的丢掉（那多半不是同一首歌 —— 合集、live 全场、串烧）；
+     *  - 过滤后**少于 `player.minSearchResults` 条**（默认 30）就再查一页；
+     *  - 还不够就换降级词重搜（`歌名 MV` → `歌名 可视化`）。
      *
      * 为什么这件事放在主进程而不是渲染层：
-     *  - 翻页要再发一次搜索请求（渲染层不该直接打 B站接口）；
-     *  - 过滤后的结果要**写进缓存**，而缓存是主进程的事。
+     *  - 翻页/降级都要再发搜索请求（渲染层不该直接打 B站接口）；
+     *  - 结果要**写进缓存**，而缓存是主进程的事。
+     *
+     * ⚠️ 这里**只做网络部分**（搜、补齐、降级）。过滤与排序的**判据**统一在
+     * 下面的 `rankVideos` 里执行 —— 两处各写一份必然漂移。
      */
+    /**
+     * 这份结果是否**按放宽后的时长上限**取的（降级轮会放宽）
+     *
+     * 初值 `false` = 走的是第一轮（严格上限）。降级成功采用时才置 `true`，
+     * 然后传给下面的 `rankVideos` —— 两处必须用同一套上限，
+     * 否则「按放宽的规则数出 40 条、按严格规则只剩 5 条」，白降级一场。
+     */
+    let relaxedBound = false
+    /**
+     * 取数阶段的统计，等 `rankVideos` 算完过滤后再**合成一行**打出去
+     *
+     * 为什么攒着不打：原来「取回 N」和「过滤后 M」是**两行**日志，
+     * 而它们说的其实是同一次搜索的两端 —— 分两行看反而要自己对照。
+     * 合成 `取回 80 → 过滤 40` 一眼就明白「那 40 条是被规则挡掉的」。
+     */
+    let searchStats: { raw: number; pages: number; rounds: number; relaxed: boolean } | null = null
     try {
-      const songSec = findSongDuration(keyword)
-      const picked = await biliApi.searchSongFiltered(keyword, songSec)
+      const songSec = findSongDuration(searchKey)
+      const settings = getSetting()
+      const picked = await biliApi.searchSongFiltered(
+        /** 歌名与歌手**分开传**（不拼 `歌名-歌手`）—— 见 `api:searchSong` 开头那段 */
+        songName,
+        singerName,
+        songSec,
+        settings['player.minSearchResults'],
+        settings['player.durationToleranceSec'],
+        /**
+         * ★ 过滤词与关键词表**必须传进去**
+         *
+         * `searchSongFiltered` 要用它们算出「过滤之后还剩几条」，
+         * 才能正确判断要不要降级。不传的话它只能按一个虚高的数字判断，
+         * 降级机制等于失效（踩过：搜到 80 条判「够了」，实际过滤完只有 25 条）。
+         */
+        settings['player.filterKeywords'],
+        settings['player.tagBonus'],
+        /**
+         * ★ 把上面已经取到的第 1 页响应传进去
+         *
+         * 不传的话 `searchSongFiltered` 会**再搜一次第 1 页** ——
+         * 每次缓存未命中都白打一次完整的 WBI 签名 + 网络往返。
+         * 上面那次 `biliApi.searchSong(primaryKeyword)` 的用途是「失败要能抛错」，
+         * 而它拿到的 `result` 恰好就是第 1 页，直接复用即可。
+         */
+        result,
+      )
+      /** ★ 这份结果是不是按放宽后的时长上限取的（下面排序要跟着放宽） */
+      relaxedBound = picked.relaxed
       if (picked.items.length > 0) {
-        /**
-         * 用过滤后的列表替换响应的 `result`（后续合并/排序/写库全都基于它）。
-         *
-         * `filteredOut` 只记日志：它代表「因为时长差太多而丢掉的候选数」，
-         * 排查「为什么这首歌搜不到视频」时这一行很关键。
-         */
         result.data = { ...(result.data ?? {}), result: picked.items }
-        if (picked.filteredOut > 0 || picked.pages > 1) {
-          console.log(
-            `[search] 《${keyword}》时长过滤 ${songSec ?? '未知'}s：` +
-              `保留 ${picked.items.length} 条，丢弃 ${picked.filteredOut} 条，用了 ${picked.pages} 页`,
-          )
-        }
-      } else if (picked.filteredOut > 0) {
-        /**
-         * 全被过滤掉了：**保留原样**（不返回空）。
-         *
-         * 理由：空结果会让渲染层走「重试 3 次」的逻辑，而这里根本不是搜索失败，
-         * 是「按时长判全都不是同一首歌」。返回原列表至少让用户有得挑，
-         * 界面还能自己判断。日志里说明过滤情况即可。
-         */
-        console.warn(
-          `[search] 《${keyword}》按时长过滤后为空（丢弃 ${picked.filteredOut} 条），` +
-            `回退为不过滤（避免被当成搜索失败去重试）`,
-        )
+      }
+      /** 记下这几个数，最后和「过滤后」合成**一行**打出去（见下面） */
+      searchStats = {
+        raw: picked.items.length,
+        pages: picked.pages,
+        rounds: picked.rounds,
+        relaxed: relaxedBound,
       }
     } catch (err) {
-      /** 过滤/翻页失败**不能**让搜索整体失败 —— 用原结果继续 */
-      console.warn('[search] 时长过滤/翻页失败（用原始结果继续）:', err)
+      /** 补齐/降级失败**不能**让搜索整体失败 —— 用原结果继续 */
+      console.warn('[search] 补齐/降级搜索失败（用原始结果继续）:', err)
     }
 
     /**
@@ -256,7 +380,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
      */
     if (cacheEnabled()) {
       try {
-        cacheManager.setSearchLoginState(keyword, await biliApi.ensureLoginState())
+        cacheManager.setSearchLoginState(searchKey, await biliApi.ensureLoginState())
       } catch (err) {
         // 登录态记不上不影响搜索结果本身，别让它把整次搜索搞失败
         console.warn('[search] 记录搜索登录态失败（忽略）:', err)
@@ -281,7 +405,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
      * 而「刷新列表」恰恰是最需要保住收藏顺序的场景 ——
      * 那时候 `cached` 是 null，用它当收藏来源等于「一刷新收藏全散了」。
      */
-    const oldRows = cacheEnabled() ? cacheManager.listVideos(keyword) : []
+    const oldRows = cacheEnabled() ? cacheManager.listVideos(searchKey) : []
 
     /**
      * **空结果不写缓存**（踩过）
@@ -304,26 +428,73 @@ export const registerApiHandlers = (context: ApiContext): void => {
      */
     const videoCount = freshItems.length
     if (videoCount === 0) {
-      console.warn(`[search] 《${keyword}》搜索结果为空，不写入缓存（避免把偶发失败固化）`)
+      console.warn(`[search] ${searchKey} 搜索结果为空，不写入缓存（避免把偶发失败固化）`)
       return { data: { ...(result.data ?? {}), result: [] } }
     }
 
     const merged = await mergeWithFavorites(freshItems, oldRows)
 
     /**
-     * **在这里把「其余候选」按打分排好，然后才写库** —— 顺序不能颠倒
+     * ★ 硬过滤 + 分层打分 + 排序（**在写库之前**）
      *
-     * 这是这次改动要解决的核心不一致：库里的 `videos.ord` 原来只是
-     * 「收藏 + 其余按 B 站返回顺序」，而渲染层拿到列表后又按打分重排一遍，
-     * 于是**界面顺序和库里的顺序是两套**（`sortSearchedVideos` 那层）。
-     * 后果是「收藏再取消来提升顺序」这类依赖持久化顺序的用法一刷新就散。
+     * 判据全部来自 `@common/utils/videoRank`，与渲染层共用同一份实现。
+     * 顺序不能颠倒：`save()` 是按数组下标写 `ord`，所以这一步必须在 `save` 之前。
      *
-     * 现在打分搬到主进程（`@common/utils/videoRank`，与渲染层共用同一份实现），
-     * **写库前**就排好，`ord` 直接等于用户看到的顺序。渲染层不再排序。
-     *
-     * 注意 `save()` 是按数组下标写 `ord`，所以这一步必须在 `save` 之前。
+     * 过滤**只作用于非收藏项**（见 `rankVideos` 的说明）：
+     * 收藏是用户自己挑的（点收藏 / 手动「添加视频」），不该被
+     * 「标题有没有歌名」「时长对不对」这类**搜索匹配规则**判掉。
      */
-    const ordered = sortByRelevance(merged, keyword, getSetting()['player.tagBonus'])
+    const finalList = rankVideos(merged, {
+      song: songName,
+      singer: singerName,
+      songDurationSec: findSongDuration(searchKey),
+      tagBonus: getSetting()['player.tagBonus'],
+      filterKeywords: getSetting()['player.filterKeywords'],
+      durationToleranceSec: getSetting()['player.durationToleranceSec'],
+      /**
+       * ★ 与上面「取结果时」用同一套上限
+       *
+       * 降级轮放宽过（`容差 × 1.7`），这里必须跟着放宽 —— 否则
+       * 「按放宽的规则数出 40 条、按严格规则只剩 5 条」，白降级一场。
+       */
+      relaxUpperBound: relaxedBound,
+    })
+
+    /**
+     * 一次搜索打**一行**日志
+     *
+     * 格式：`关键词 取回N → 过滤M（P页/R轮，挡掉K）`
+     *
+     * 两端都显示才解释得清「取回 80 条怎么列表里只有 40 项」——
+     * 那 40 条是被规则挡掉的（标题不含歌名 / 命中过滤词 / 时长差太多），不是丢了。
+     *
+     * 措辞注意：`R轮 = 1` 时走的是**主搜索词**，不是降级词。
+     * 之前一律写「降级词「X」」会让人以为走了降级（用户直接指出过）。
+     */
+    if (searchStats) {
+      const dropped = searchStats.raw - finalList.length
+      console.log(
+        `[search] ${searchKey} 取回${searchStats.raw} → 过滤${finalList.length}` +
+          `（${searchStats.pages}页/${searchStats.rounds}轮` +
+          `${searchStats.relaxed ? '/放宽' : ''}${dropped > 0 ? `，挡掉${dropped}` : ''}）`,
+      )
+    }
+
+    /**
+     * 过滤后为空 = **合法结果**，不是搜索失败
+     *
+     * 靠 `filtered: true` 告诉渲染层，它据此**跳过那 3 次重试**
+     * （否则空结果会被当成网络问题，白打 3 次请求、白等两秒）。
+     *
+     * 这也是为什么**不能**用「回退成不过滤」来解决空结果：
+     * 那会把标题不含歌名的条目一起放回列表里。
+     */
+    if (finalList.length === 0) {
+      console.warn(
+        `[search] ${searchKey} 按过滤规则后为空（原 ${merged.length} 条）—— 返回空并标记 filtered`,
+      )
+      return { data: { ...(result.data ?? {}), result: [], filtered: true } }
+    }
 
     if (cacheEnabled()) {
       /**
@@ -333,12 +504,12 @@ export const registerApiHandlers = (context: ApiContext): void => {
        * `save` 会保留库里已有的 `favorites`（新搜索结果里没有「收藏」这个概念），
        * 而 `view_result` / `playurl_result` 已经搬去 `video_details`，压根不会被碰到。
        */
-      await cacheManager.save(keyword, {
+      await cacheManager.save(searchKey, {
         ...result,
-        data: { ...(result.data ?? {}), result: ordered },
+        data: { ...(result.data ?? {}), result: finalList },
       })
     }
-    return { data: { ...(result.data ?? {}), result: ordered } }
+    return { data: { ...(result.data ?? {}), result: finalList } }
   })
 
   /** 「添加视频」：把用户粘贴的链接 / BV 号解析成可预览的信息 */

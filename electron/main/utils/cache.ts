@@ -1079,8 +1079,11 @@ export const setSearchLoginState = (searchKey: string, state: boolean | null): v
  * 行里还有标题、封面、收藏、顺序，这些永不过期。
  *
  * schema v2 之后「置 NULL」的清单就是**所有地址列**：
- * `durl_url` / `dash_video` / `dash_audio` / `dash_duration` / `quality` /
- * `support_formats` / `playurl_at`。
+ * `durl_url` / `dash_video` / `dash_audio` / `dash_duration` / `playurl_at`。
+ *
+ * > ⚠️ 这里以前还列着 `quality` / `support_formats` 两列，但它们在 schema v4
+ * > 就已经删掉了（durl 的清晰度改成从 URL 反推，档位表内置在 `constants`）——
+ * > 属于**注释漂移**，以 SQL 为准。
  *
  * 但**刻意保留 `dash_tried` 和 `playurl_login_state`**：
  *  - `dash_tried` 不是地址，它是「试没试过」的记忆，清掉就失去了

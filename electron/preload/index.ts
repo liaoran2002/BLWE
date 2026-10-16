@@ -26,7 +26,7 @@ import type {
   UserInfo,
 } from '@common/types/ipc'
 import type { RendererAPI, ScreenWorkArea } from '@common/types/api'
-import type { GetPlaylistDetailParams, PlaylistDetail } from '@common/types/musicSdk'
+import type { GetPlaylistDetailParams } from '@common/types/musicSdk'
 import type {
   PlaylistSaveParams,
   PlaylistStoreData,
@@ -94,8 +94,8 @@ const api = {
 
   // #region B 站接口
   getUserInfo: (): Promise<UserInfo> => rendererInvoke('api:getUserInfo'),
-  searchSong: (keyword: string, skipCache = false): Promise<{ data: unknown }> =>
-    rendererInvoke('api:searchSong', { keyword, skipCache }),
+  searchSong: (song: string, singer: string, skipCache = false): Promise<{ data: unknown }> =>
+    rendererInvoke('api:searchSong', { song, singer, skipCache }),
   /** 「添加视频」：解析 B 站链接 / BV 号 */
   parseVideo: (input: string): Promise<ParsedVideoInfo> =>
     rendererInvoke('api:parseVideo', { input }),
@@ -120,7 +120,9 @@ const api = {
   ): Promise<IpcChannelMap['api:resolveVideo']['result']> =>
     rendererInvoke('api:resolveVideo', { bvid, keyword, skipCache, noDash, qn, audioId }),
   /** 解析各大音乐平台的歌单分享链接（网易云 / QQ音乐 / 酷我音乐） */
-  getPlaylistDetail: (params: GetPlaylistDetailParams): Promise<PlaylistDetail> =>
+  getPlaylistDetail: (
+    params: GetPlaylistDetailParams,
+  ): Promise<IpcChannelMap['music:getPlaylistDetail']['result']> =>
     rendererInvoke('music:getPlaylistDetail', params),
   // #endregion
 

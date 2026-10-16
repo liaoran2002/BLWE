@@ -237,7 +237,7 @@ import { SOURCE_LABELS, SYNC_INTERVAL_OPTIONS } from '@common/constants';
 import type { PlaylistRecord, PlaylistSong } from '@common/types/playlist';
 import { parseSearchKey } from '@common/types/playlist';
 // 库里存的是**秒**（schema v2 起统一），展示要转回 mm:ss；反向转换在解析音源时用
-import { durationToSeconds, formatDuration } from '@common/utils/duration';
+import { formatDuration } from '@common/utils/duration';
 import api from '../api/electron';
 import { usePlaylistStore } from '../stores/playlists';
 import { normalizeImageUrl } from '../utils/image';
@@ -447,18 +447,32 @@ export default defineComponent({
         let songs = this.originalSongs;
         let source: string | undefined = existing?.source;
         let remoteName = '';
+        /**
+         * ★ 主进程**拼好的**歌单主键（`tx_8153225605`）
+         *
+         * 渲染层直接拿来当 id 用 —— 不需要认识 `listId`，也不需要知道拼装规则。
+         * 没有平台链接（手动新建）时它是 `null`，那时 store 会退化成随机 id。
+         */
+        let presetId: string | null = null;
 
         if (url) {
           const detail = await api.getPlaylistDetail({ input: url });
-          songs = detail.songs.map((s) => ({
-            name: s.name,
-            singer: s.singer,
-            album: s.albumName,
-            cover: s.cover ?? null,
-            // 音源给的是 "4:03" 这类字符串，库里存秒（schema v2 起统一）
-            duration: durationToSeconds(s.interval),
-          }));
+          /**
+           * ★ **原样透传**，不再在这里转字段
+           *
+           * 主进程（`music:getPlaylistDetail`）已经做完了这两件事：
+           *  1. 用 `toPlaylistSongs` 把音源的 `interval: "4:03"` / `albumName`
+           *     转成库里的 `duration: 243`（秒） / `album`，**并带上 `platformId`**；
+           *  2. 拼好歌单主键 `id`（`tx_8153225605`）。
+           *
+           * 早先第 1 件写在这里，代价是 **`platformId` 被丢掉** ——
+           * 渲染层不知道它有用，于是 `songs.id` 只能退化成 `歌名-歌手`。
+           *
+           * 现在渲染层只做展示（曲目列表本来就是只读的），回传时原样送回去。
+           */
+          songs = detail.songs as unknown as PlaylistSong[];
           source = detail.source;
+          presetId = detail.id;
           remoteName = detail.info.name || '';
           if (songs.length === 0) throw new Error('该歌单没有解析到任何歌曲');
         } else if (manual.length > 0) {
@@ -501,6 +515,8 @@ export default defineComponent({
             songs,
             source,
             sourceUrl: url || undefined,
+            /** 主进程拼好的主键；手动新建时为 null（store 退化成随机 id） */
+            id: presetId,
             syncMode: sync.mode,
             intervalMs: sync.intervalMs,
           });

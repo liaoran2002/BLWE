@@ -27,18 +27,25 @@ import type {
   PlaylistStoreData,
   SyncResult,
 } from '@common/types/playlist'
-import {
-  getSyncInterval,
-  isAutoSyncable,
-  isSyncDue,
-} from '@common/types/playlist'
+import { getSyncInterval, isAutoSyncable, isSyncDue } from '@common/types/playlist'
 import { toPlain } from '@/utils/plain'
 
-/** 生成 id（渲染进程侧；主进程保存时会补齐/校验） */
+/**
+ * 生成**兜底** id（渲染进程侧，`pl_` 前缀）
+ *
+ * ⚠️ 只在「主进程没能拼出主键」时用 —— 也就是**手动新建的歌单**
+ * （用户手填歌曲、没有分享链接，所以没有平台歌单 id 可拼）。
+ *
+ * 有链接的歌单，主键是主进程拼好的 `平台_平台歌单id`（`tx_8153225605`），
+ * 直接由 `addPlaylist({ id })` 传进来，**不走这个函数**。
+ *
+ * `pl_` 前缀是刻意加的：一眼能看出「这不是平台 id」，
+ * 排查时不用猜 `a9648dca-…` 属于哪个平台。
+ */
 const newId = (): string => {
   const cryptoObj = globalThis.crypto
   if (cryptoObj && typeof cryptoObj.randomUUID === 'function') {
-    return cryptoObj.randomUUID()
+    return `pl_${cryptoObj.randomUUID()}`
   }
   return `pl_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
 }
@@ -93,12 +100,31 @@ export const usePlaylistStore = defineStore('playlists', () => {
     songs: PlaylistSong[]
     source?: string
     sourceUrl?: string
+    /**
+     * **拼好的歌单主键**（`平台_平台歌单id`，如 `tx_8153225605`）
+     *
+     * 由主进程在 `music:getPlaylistDetail` 里拼好给出 ——
+     * 渲染层直接拿来当 id 用，不需要知道 `listId` 或拼装规则。
+     *
+     * 不传（手动新建的歌单）时退化成随机 id。
+     */
+    id?: string | null
     syncMode?: PlaylistRecord['sync']['mode']
     intervalMs?: number
   }): Promise<PlaylistRecord> => {
     const now = Date.now()
+    /**
+     * 主键用**主进程拼好的那个**（`tx_8153225605`）
+     *
+     * 主进程在 `music:getPlaylistDetail` 里已经拼好（它才知道音源给的
+     * 平台歌单 id）—— 渲染层不需要知道拼装规则，也不需要认识 `listId`。
+     *
+     * 退化成随机 id（`pl_xxx`）的只有「手动新建的歌单」：
+     * 那种情况主进程也没法拼（没有平台歌单 id）。
+     */
+    const id = input.id || newId()
     const record: PlaylistRecord = {
-      id: newId(),
+      id,
       name: input.name || '未命名歌单',
       source: input.source,
       sourceUrl: input.sourceUrl,
@@ -146,6 +172,10 @@ export const usePlaylistStore = defineStore('playlists', () => {
 
   /**
    * 记录当前歌单播放到第几首
+   *
+   * ⚠️ 下标会被**重新同步**改变含义（曲目增删后第 N 个位置可能是别的歌）。
+   * 所以主进程在 `syncPlaylist` 里会把它**重算**成新列表里的位置 ——
+   * 那是这个字段能当定位用的前提，见那边的注释。
    */
   const setLastIndex = async (index: number): Promise<void> => {
     const target = current.value

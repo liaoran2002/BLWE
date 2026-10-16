@@ -121,11 +121,14 @@ const loadSqlite = (): SqliteConstructor => {
  */
 const CREATE_TABLES_SQL = `
 -- 歌单
+--
+-- 'id' = '平台_平台歌单id'（如 'tx_8153225605'），**不是随机 UUID** ——
+-- 这样同一个歌单重复导入会自然命中同一行，而不是攒出一堆副本。
+-- 手动新建的歌单（没有平台链接）没有平台 id，那时用随机 id 兜底。
 CREATE TABLE IF NOT EXISTS playlists (
   id               TEXT PRIMARY KEY,
   name             TEXT    NOT NULL,
-  source           TEXT,
-  source_url       TEXT,
+  url              TEXT,
   sync_mode        TEXT    NOT NULL DEFAULT 'off',
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at     INTEGER,
@@ -134,30 +137,56 @@ CREATE TABLE IF NOT EXISTS playlists (
   last_index       INTEGER NOT NULL DEFAULT 0
 );
 
--- 歌单里的曲目（按 ord 排序）
-CREATE TABLE IF NOT EXISTS playlist_songs (
-  playlist_id TEXT    NOT NULL,
-  ord         INTEGER NOT NULL,
+-- 歌曲实体（**全局唯一**，与歌单无关）
+--
+-- ## 为什么单独一张表
+--
+-- 原来曲目信息塞在 playlist_songs 里，于是**同一首歌在 2 个歌单就存 2 份**
+-- （歌名 / 歌手 / 专辑 / 封面 / 时长全重复一遍）。现在拆开：
+-- 同一首歌在 songs 里**只有一行**，playlist_songs 只存「哪个歌单的第几位是它」。
+--
+-- ## id = '平台_平台歌曲id'（如 'tx_101104624'）
+--
+-- ⚠️ 它**只在这里用**。'videos.search_key' 存的是**歌名**（见下面 videos 表）——
+-- 那些表要拿键去搜 B站，用 id 搜不出任何东西。
+--
+-- 手动添加的歌没有平台 id，'songId()' 会退化成 '歌名-歌手'。
+CREATE TABLE IF NOT EXISTS songs (
+  id          TEXT PRIMARY KEY,
   name        TEXT    NOT NULL,
   singer      TEXT    NOT NULL DEFAULT '',
   album       TEXT,
   cover       TEXT,
-  -- 时长统一成**秒**（整数）。原来是音乐平台原样给的 "4:03" 字符串，
+  -- 时长统一成**秒**（整数）。音乐平台原样给的是 "4:03" 字符串，
   -- 而候选视频那边（videos.duration）一直是秒 —— 两种形状在下游到处判断。
   -- 展示时再格式化回 mm:ss，见渲染层的 durationText。
-  duration    INTEGER,
-  -- 来源音源（wy / tx / kw），与 platform_id 配对使用
-  source      TEXT,
-  -- **平台侧歌曲 id**（QQ 的数字 id / 网易云 id / 酷我 rid）
-  --
-  -- 为什么要存它：**取歌词必须要这个 id**。不存就得拿「歌名 + 歌手」再去
-  -- 平台搜一次，而那是模糊搜索 —— 可能搜到别的版本（同名 live / 翻唱），
-  -- 于是显示错误的歌词。有它就精确对应「用户歌单里那一首」，也省一次搜索。
-  platform_id TEXT,
+  duration    INTEGER
+);
+
+-- 歌单 ⨯ 歌曲 的**成员关系 + 顺序**（不存曲目信息）
+--
+-- 同一首歌在两个歌单里 = 这里两行、songs 表**一行**。
+CREATE TABLE IF NOT EXISTS playlist_songs (
+  playlist_id TEXT    NOT NULL,
+  ord         INTEGER NOT NULL,
+  -- 指向 songs.id（'平台_平台id'）
+  song_id     TEXT    NOT NULL,
   PRIMARY KEY (playlist_id, ord)
 );
 
+-- 按 song_id 反查歌单（「这首歌在哪些歌单里」；也让删除/更新能走索引）
+CREATE INDEX IF NOT EXISTS idx_playlist_songs_song ON playlist_songs(song_id);
+
 -- 每首歌的候选视频：搜索结果 + 收藏 + 顺序 + 解析结果
+--
+-- ## 'search_key' 存的是**歌名**（'歌名-歌手'），不是 'songs.id'
+--
+-- 为什么不用 id：这张表要拿键**去 B站搜索**（'-' 会被换成空格），
+-- 用 'tx_101104624' 那种 id 搜不出任何东西。
+-- 而且搜索要的正是「歌名 + 歌手」，那本来就是这个键的内容。
+--
+-- 所以 'songs.id'（平台 id）与它**没有关系** —— id 只在 songs 表内部
+-- 用来标识「同一首歌」，两张表各用各的键。
 CREATE TABLE IF NOT EXISTS videos (
   search_key     TEXT    NOT NULL,
   bvid           TEXT    NOT NULL,
@@ -319,18 +348,34 @@ const migrateSchema = (database: SqliteDatabase): void => {
    * 副作用：**收藏、顺序、选中视频、歌单会一起清掉**。要保留就先备份 `blmv.db`。
    */
   console.warn('[db] 表结构已变更（指纹不匹配），重建数据库（数据会清空）')
-  // 视图必须显式 DROP VIEW —— `DROP TABLE` 管不到它，而残留的旧视图会让
-  // 后面的 `CREATE VIEW IF NOT EXISTS` 变成空操作（视图停留在旧列结构上）。
-  database.exec(`
-    DROP VIEW IF EXISTS videos_meta;
-    DROP TABLE IF EXISTS videos;
-    DROP TABLE IF EXISTS song_meta;
-    DROP TABLE IF EXISTS playlist_songs;
-    DROP TABLE IF EXISTS playlists;
-  `)
+  /**
+   * ⚠️ **把所有表 / 视图都 drop 掉，而不是列一份手写清单**
+   *
+   * 手写清单会**漂移**：删掉一个功能时很容易忘了把它从 DROP 列表里去掉
+   * （或者反过来 —— 新表忘了加）。踩过：歌词功能整体移除后，
+   * `lyrics` / `subtitles` 两张表从建表语句里删了，但 DROP 列表里没有它们，
+   * 于是**每次指纹不匹配重建时都清不掉**，一直留在库里当垃圾。
+   *
+   * 改成「查 `sqlite_master` 拿全部表名再逐个 drop」之后就不可能漏：
+   *  - 视图必须**先于**表 drop（表被删后视图就悬空了，但 SQLite 不会自动清）——
+   *    所以按 `type` 排序，把 `view` 排前面（`'view' > 'table'`，用 DESC）;
+   *  - `sqlite_%` 开头的（`sqlite_sequence` / `sqlite_stat1` 等）是 SQLite
+   *    自己维护的，**绝不能被 drop**。
+   */
+  const leftovers = database
+    .prepare(
+      `SELECT type, name FROM sqlite_master
+        WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+        ORDER BY type DESC`,
+    )
+    .all() as Array<{ type: string; name: string }>
+  for (const item of leftovers) {
+    /** 表名来自 sqlite_master，不是用户输入；但仍用双引号包住防止关键字冲突 */
+    database.exec(`DROP ${item.type === 'view' ? 'VIEW' : 'TABLE'} IF EXISTS "${item.name}"`)
+  }
   database.exec(CREATE_TABLES_SQL)
   database.pragma(`user_version = ${wanted}`)
-  console.log('[db] 已重建数据库')
+  console.log(`[db] 已重建数据库（清理了 ${leftovers.length} 个旧表/视图）`)
 }
 
 

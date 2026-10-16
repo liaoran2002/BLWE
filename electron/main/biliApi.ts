@@ -15,6 +15,7 @@ import {
 } from '@common/constants'
 import type { QualityOption } from '@common/constants'
 import type { UserInfo } from '@common/types/ipc'
+import { rankVideos } from '@common/utils/videoRank'
 
 const SEARCH_API = 'https://api.bilibili.com/x/web-interface/wbi/search/type'
 const NAV_API = 'https://api.bilibili.com/x/web-interface/nav'
@@ -383,67 +384,15 @@ export const isUrlUsable = (url: string | null | undefined): boolean => {
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 /**
- * 视频时长与歌曲时长的容差（秒）
+ * ⚠️ **时长过滤已经搬到 `@common/utils/videoRank` 了**
  *
- * **用户定的规则**：搜索出来的 MV 时长和歌单里那首歌的时长差超过 ±90 秒就丢掉 ——
- * 那多半不是同一首歌（可能是合集、live 全场、串烧）。
+ * 原来这里有 `DURATION_TOLERANCE_SEC` / `filterByDuration` / `parseDurationToSeconds`
+ * 三件套。新的排序方案把「硬过滤（含时长）→ 分层 → 排序」收在一个地方，
+ * 于是时长判断也必须跟着走 —— 否则「过滤」和「排序」会用两套规则，
+ * 出现「排序认为该留、过滤已经扔掉」这种自相矛盾。
  *
- * 为什么是 90 秒：MV 常有前奏画面 / 片尾，比纯音频长十几秒很正常；
- * 而「不是同一首歌」的差距通常是几分钟（合集更夸张）。
- * 90 秒是这两者之间一个宽松但有效的分界。
+ * 这里只保留**搜索 + 翻页**（网络部分），过滤与打分的判据全部由 `videoRank` 决定。
  */
-export const DURATION_TOLERANCE_SEC = 90
-
-/**
- * 按「视频时长 vs 歌曲时长」过滤候选
- *
- * @param items 搜索结果里的视频条目
- * @param songDurationSec 歌单里那首歌的时长（秒）；**未知时不过滤**
- *        （宁可多留也不要因为拿不到时长而误杀）
- * @returns 过滤后的条目；`songDurationSec` 未知时原样返回
- */
-export const filterByDuration = <T extends { duration?: string | number | null }>(
-  items: T[],
-  songDurationSec: number | null | undefined,
-): T[] => {
-  /** 歌曲时长未知就不过滤 —— 没有参照物时任何过滤都是瞎猜 */
-  if (typeof songDurationSec !== 'number' || !Number.isFinite(songDurationSec) || songDurationSec <= 0) {
-    return items
-  }
-  return items.filter((item) => {
-    const sec = parseDurationToSeconds(item.duration)
-    /** 视频时长解析不出来时**保留**它（同上：不因缺数据而误杀） */
-    if (sec === null) return true
-    return Math.abs(sec - songDurationSec) <= DURATION_TOLERANCE_SEC
-  })
-}
-
-/**
- * 把 B 站的时长字段解析成秒
- *
- * B 站的搜索结果里 `duration` 是 **`"4:03"` 这样的字符串**（或 `"1:02:03"`）。
- * 这里独立实现一份（而不是复用 `@common/utils/duration`）是因为
- * **main/biliApi.ts 不该依赖 common 的工具函数**（那是渲染层共享的），
- * 而且这个解析只有十几行。
- */
-export const parseDurationToSeconds = (
-  raw: string | number | null | undefined,
-): number | null => {
-  if (raw === null || raw === undefined) return null
-  if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? raw : null
-  const s = String(raw).trim()
-  if (!s) return null
-  /** 纯数字（秒） */
-  if (/^\d+$/.test(s)) {
-    const n = Number(s)
-    return n > 0 ? n : null
-  }
-  const parts = s.split(':').map((x) => Number(x))
-  if (parts.some((n) => !Number.isFinite(n))) return null
-  if (parts.length === 2) return parts[0] * 60 + parts[1]
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
-  return null
-}
 
 export async function searchSong(
   keyword: string,
@@ -512,41 +461,141 @@ export interface SearchVideoItem {
 }
 
 /**
- * 搜索结果最少要多少条才够用
+ * 搜索结果太少时的**降级搜索词**
  *
- * **用户定的规则**：过滤后**少于 30 条就再查一页**。
- * 因为时长过滤会砍掉一批候选（尤其在歌单时长和 MV 对不上的时候），
- * 只剩几条的话用户没得挑。
- */
-export const MIN_SEARCH_RESULTS = 30
+ * ## 四级搜索词（用户定的）
+ *
+ * | 级别 | 搜索词 | 说明 |
+ * | --- | --- | --- |
+ * | 1 | `《歌名》歌曲 歌手` | 正常搜索（最精确） |
+ * | 2 | `《歌名》歌曲 MV` | 降级 |
+ * | 3 | `《歌名》歌曲 可视化` | 兜底 |
+ * | 4 | `《歌名》` | ★ 最后兜底：**不带任何后缀**，直接搜歌名 |
+ *
+ * **书名号是字面量**（不是占位符）—— B站上音乐视频的标题大量写作
+ * `《歌名》`，带上它能显著提高相关度。
+ *
+ * ## ⚠️ 为什么第 1 级不用 `《歌名》歌曲 - 歌手`
+ *
+ * 原来是 `歌名 歌手`，用户要求改成 `《歌名》歌曲 - 歌手` 这种形态 ——
+ * 但那个 `-` **去掉了**：B站搜索把 `-` 当**排除语法**
+ * （"A -B" = 搜 A 并排除含 B 的结果），写成 `- 胡夏` 会变成
+ * 「搜《那些年》歌曲、**排除**胡夏」，正好和意图相反。
+ * 用空格分隔就是普通的「与」语义，三个词都要命中。
+ *
+ * ## 为什么降级词不带歌手名
+ *
+ * 硬过滤只要求「标题含歌名」，带歌手名会把「原唱但标题没写歌手」的候选挡掉。
+ *
+ * ## ★ 为什么还要第 4 级（`《歌名》`）
+ *
+ * 前三级的搜索词都带后缀（`歌曲` / `歌曲 MV` / `歌曲 可视化`），
+ * 而 B站的相关性排序会把**带这些词的**排在前面 —— 于是**其他形式的好视频**
+ * 排在两页之外，永远搜不到。
+ *
+ * 实测（用户反馈）：《无见》排骨教主 的「动态歌词排版」版本，
+ * 用前三级都搜不到；**直接搜 `《无见》` 才出得来**。
+ *
+ * 第 4 级**只搜歌名本身**，覆盖「动态歌词排版 / 饭制 / 混剪」这类标题里
+ * 不写 `歌曲` 或 `MV` 的视频。
+ *
+ *  */
+const FALLBACK_SUFFIXES = ['MV', '可视化'] as const
+/** 最后一级：直接 `《歌名》`（无后缀）—— 单独列出因为它没有 suffix */
 
 /**
- * 搜索 + 时长过滤 +「结果太少就再查一页」
+ * 拼「第 1 级」搜索词：`《歌名》歌曲 歌手`
  *
- * ## 流程（用户定的规则）
+ * @param songName 歌名（**不要带书名号**，这里会加）
+ * @param singer   歌手名；空则不拼（只有歌名时退化成 `《歌名》歌曲`）
+ */
+export const buildPrimaryKeyword = (songName: string, singer: string): string => {
+  const parts = [`《${songName}》歌曲`]
+  const a = singer.trim()
+  if (a) parts.push(a)
+  return parts.join(' ')
+}
+
+/**
+ * 拼「降级轮」搜索词：`《歌名》歌曲 <后缀>`
  *
- *  1. 搜第 1 页（B站每页 42 条）
- *  2. 按「视频时长 vs 歌曲时长 ±90 秒」过滤
- *  3. 过滤后**少于 30 条**就再查第 2 页，把两页合并（**去重后**）再过滤一次
+ * 刻意**不带歌手名**（理由见 `FALLBACK_SUFFIXES` 上方那段）。
+ */
+export const buildFallbackKeyword = (songName: string, suffix: string): string =>
+  `《${songName}》歌曲 ${suffix}`
+
+/**
+ * 拼「最后一级」搜索词：`《歌名》`（**不带任何后缀**）
  *
- * ## 为什么要「先过滤再判断够不够」
+ * 见 `FALLBACK_SUFFIXES` 上方那段 —— 前三级都带后缀，
+ * 而 `动态歌词排版` / `饭制` / `混剪` 这类标题里既不写 `歌曲` 也不写 `MV`，
+ * 只有直接搜歌名才排得上来。
+ */
+export const buildBareKeyword = (songName: string): string => `《${songName}》`
+
+/**
+ * 搜索 + **降级重搜**
  *
- * 因为时长过滤是**真的会砍掉很多**的 —— 一首 4 分钟的歌，
- * 搜索结果里常混着「合集（2 小时）」「live 全场（1 小时）」。
- * 不滤的话看着有 42 条，实际能用的可能只有十来个。
+ * ## 流程
  *
- * ## 关于「第二页」
+ *  1. 用主搜索词搜，取第 1 页；
+ *  2. 若结果条数 `< minResults`（设置项 `player.minSearchResults`），再查第 2 页；
+ *  3. 仍不够 → 换降级词再搜（最多两轮兜底词）。
  *
- * 只查一页追加（不循环到第 3 页）：B站的音乐搜索相关性排序，
- * 第 3 页以后基本是无关结果，再翻下去等于用噪声凑数。
+ * ## ⚠️ 这里的过滤是「粗略过滤」，精确过滤在调用方
  *
- * @param keyword 搜索词
- * @param songDurationSec 歌单里那首歌的时长（秒）；**未知则不过滤**
+ * 这一层只做**时长**过滤（用来判断"够不够多、要不要降级"），
+ * 因为「标题是否含歌名」「命中屏蔽词」要读**当前的设置**，
+ * 而设置是在 IPC 层拿的（这个函数是纯网络层，不该依赖 setting 模块）。
+ *
+ * 真正的判据统一由 `@common/utils/videoRank` 在 IPC 层执行 ——
+ * 两处若各写一份，迟早漂移。
+ *
+ * @param song 歌名（**纯歌名**，不含歌手）
+ * @param singer 歌手（空串 = 未知）；与歌名**分开传**，不再拼成 `歌名-歌手` 再拆
+ * @param songDurationSec 歌曲时长（秒）；**未知则不做时长过滤**
+ * @param minResults 过滤后少于它就开始补齐/降级；`0` = 不补齐、不降级
+ * @param toleranceSec 时长容差（秒）
+ * @param filterKeywords 命中即丢的关键词（设置项 `player.filterKeywords`）
+ *        —— **必须传**，否则「够不够」会按一个虚高的数字判断（见下）
+ * @param tagBonus 关键词加权表（设置项 `player.tagBonus`）；只影响排序，不影响条数
  */
 export const searchSongFiltered = async (
-  keyword: string,
+  song: string,
+  singer: string,
   songDurationSec: number | null | undefined,
-): Promise<{ items: SearchVideoItem[]; filteredOut: number; pages: number }> => {
+  minResults: number,
+  toleranceSec: number,
+  filterKeywords: string[],
+  tagBonus: Record<string, string[]>,
+  /**
+   * **已经取到的第 1 页响应**（可选）
+   *
+   * 调用方（`api:searchSong`）为了「搜索失败要能抛错」先调了一次
+   * `searchSong(主搜索词)`，那个响应的 `result` 就是第 1 页。
+   * 传进来就能**省掉一次网络往返**（一次完整的 WBI 签名 + 请求）。
+   *
+   * ⚠️ 复用它的前提是**调用方用的搜索词与本函数的第一级搜索词一致** ——
+   * 两边都走 `buildPrimaryKeyword`，所以是一致的。
+   *
+   * 不传则自己搜第 1 页（保持这个函数能独立使用）。
+   */
+  firstPage?: BiliResponse,
+): Promise<{
+  items: SearchVideoItem[]
+  /** 采了几页 */
+  pages: number
+  /** 走了几轮（1 = 没降级） */
+  rounds: number
+  /**
+   * ★ 这份结果是否**按放宽后的时长上限**取的
+   *
+   * 降级轮次会放宽（`容差 × 1.7`）。调用方做**精确过滤**（`rankVideos`）时
+   * 必须传同样的 `relaxUpperBound`，否则会出现
+   * 「按放宽的规则数出 40 条、按严格规则只剩 5 条」—— 白降级一场。
+   */
+  relaxed: boolean
+}> => {
   /** 从响应里取出视频条目（`result` 里可能混着番剧/专栏，只要 `type === 'video'`） */
   const extract = (res: BiliResponse): SearchVideoItem[] => {
     const list = res.data?.result
@@ -556,41 +605,270 @@ export const searchSongFiltered = async (
     )
   }
 
-  const first = await searchSong(keyword, 0, 1)
-  if (first.code !== 0) throw new Error(first.message ?? '搜索失败')
-  let all = extract(first)
-  const firstFiltered = filterByDuration(all, songDurationSec)
-  let filteredOut = all.length - firstFiltered.length
-  let pages = 1
+  /**
+   * 「够不够」的计数：跑**完整的**过滤规则（不是只做时长）
+   *
+   * ## ⚠️ 这里曾经只做时长过滤，那是个 bug
+   *
+   * 原实现是：
+   *
+   * ```ts
+   * items.filter(v => passHardFilter(v, '', [], songDurationSec, toleranceSec, relax))
+   * //                              ↑ 歌名传空  ↑ 过滤词传空
+   * ```
+   *
+   * 歌名与过滤词都传空 → 那两条规则**直接跳过**，于是这个计数**只反映时长过滤**
+   * 的结果。而它被用来判断「够不够 `minResults` 条、要不要降级」——
+   * 于是出现：
+   *
+   * ```
+   * 粗过滤 80 条 → 80 >= 30 → 判定「够了，不降级」
+   * 精过滤 25 条 → 用户实际只拿到 25 条，本该降级
+   * ```
+   *
+   * **降级机制等于永远不生效** —— 而它存在的唯一理由就是
+   * 「过滤之后不够条数时去多搜一点」。用一个虚高的数字判断，
+   * 这个功能就白写了。
+   *
+   * 现在直接把**同一套规则**（歌名 + 屏蔽词 + 时长）用上：
+   * `rankVideos` 也是这套，所以「这里数的」和「用户看到的」是同一个数。
+   * 唯一差别是不做排序（只取 `.length`，排序对条数没影响）。
+   *
+   * ## ⚠️⚠️ 但**必须先把 B站自己的 `favorites` 字段清掉**（第二次踩）
+   *
+   * B站搜索接口返回的每条里**本来就有个 `favorites`** —— 它是
+   * 「这条视频被多少人收藏了」（一个数字，几乎总是 truthy），
+   * 而 `rankVideos` 用 `v.favorites` 判断「**是不是用户在我们这儿收藏的**」，
+   * 并**豁免收藏项不参与过滤**。
+   *
+   * 于是不清掉的话：
+   *
+   * ```
+   * 39 条搜索结果 → 38 条被当成"收藏" → 全部豁免过滤 → countPassing = 39
+   * 判定「39 >= 30 够了」→ 不补第 2 页、不降级
+   * 而 mergeWithFavorites 之后 favorites 被规范成 false → 真过滤 → 只剩 24 条
+   * ```
+   *
+   * 表现就是日志里那两个数字对不上：
+   * 「取回 39 条（1 页）」但「过滤后 24 条」—— 而且降级永远不触发。
+   *
+   * 所以这里显式把 `favorites` 置为 `false`（搜索结果**一律不是**收藏，
+   * 「收藏」是 `mergeWithFavorites` 之后才有的概念）。
+   */
+  /**
+   * 三级搜索词（发给 B站的）
+   *
+   * - `primaryKeyword` = `《歌名》歌曲 歌手`
+   * - 降级词 = `《歌名》歌曲 MV` / `《歌名》歌曲 可视化`
+   *
+   * 歌名与歌手是**两个独立入参**，直接用（以前是拼成 `歌名-歌手` 再 `splitSearchKey`
+   * 拆回来 —— 那个往返已经删掉了）。
+   */
+  const primaryKeyword = buildPrimaryKeyword(song, singer)
 
-  if (firstFiltered.length < MIN_SEARCH_RESULTS) {
+  const countPassing = (items: SearchVideoItem[], relax: boolean): number =>
+    rankVideos(
+      items.map((v) => ({ ...v, favorites: false })),
+      {
+        song,
+        singer,
+        songDurationSec,
+        tagBonus,
+        filterKeywords,
+        durationToleranceSec: toleranceSec,
+        relaxUpperBound: relax,
+      },
+    ).length
+
+  /**
+   * 搜一轮：第 1 页，不够则追加第 2 页
+   *
+   * 只翻到第 2 页（不循环）：B 站音乐搜索的相关性排序，第 3 页以后
+   * 基本是无关结果，再翻等于用噪声凑数。
+   *
+   * ★ 每一级都是「**一页不够就两页**」—— 这是**统一**行为，
+   * 不是某一级的特例（用户明确说过：一页不够就两页，两页不够就降级，
+   * 下一级同样一页不够就两页，依此类推）。
+   *
+   * @param relax 是否放宽时长上限（**降级轮次传 true**，理由见 `FALLBACK_SUFFIXES`）
+   */
+  const searchRounds = async (
+    kw: string,
+    relax: boolean,
     /**
-     * 结果偏少 → 再查一页。
+     * 这一轮的第 1 页响应（复用调用方已取到的那份）
      *
-     * 第二页失败**不影响**已有结果（拿第 1 页的照样能用），
-     * 所以单独 try 起来。
+     * 只在**第一轮**会传 —— 降级轮换了关键词，必须自己搜。
      */
-    try {
-      await sleep(600) // 稍微错开，避免触发风控
-      const second = await searchSong(keyword, 0, 2)
-      if (second.code === 0) {
-        const more = extract(second)
-        /** 按 bvid 去重：两页之间可能有重复条目 */
-        const seen = new Set(all.map((x) => String(x.bvid ?? '')))
-        const add = more.filter((x) => x.bvid && !seen.has(String(x.bvid)))
-        all = [...all, ...add]
-        pages = 2
-        filteredOut = all.length - filterByDuration(all, songDurationSec).length
+    reusedFirstPage?: BiliResponse,
+  ): Promise<{ items: SearchVideoItem[]; pages: number }> => {
+    /**
+     * 复用已有响应，避免把第 1 页搜两遍
+     *
+     * ⚠️ `api:searchSong` 为了「失败要抛错」先调了一次 `searchSong(keyword)`，
+     * 而这里原本又搜了一次第 1 页 —— 每次缓存未命中都白打一次
+     * 完整的 WBI 签名 + 网络往返。
+     */
+    const first = reusedFirstPage ?? (await searchSong(kw, 0, 1))
+    if (first.code !== 0) throw new Error(first.message ?? '搜索失败')
+    let all = extract(first)
+    let pages = 1
+
+    /**
+     * ★ 每一级都是「一页不够就两页」
+     *
+     * `minResults <= 0`（用户选了「不补齐」）时只搜一页。
+     */
+    const needSecond = minResults > 0 && countPassing(all, relax) < minResults
+    if (needSecond) {
+      try {
+        await sleep(600) // 错开一点，避免触发风控
+        const second = await searchSong(kw, 0, 2)
+        if (second.code === 0) {
+          const more = extract(second)
+          /** 按 bvid 去重：两页之间可能有重复条目 */
+          const seen = new Set(all.map((x) => String(x.bvid ?? '')))
+          const add = more.filter((x) => x.bvid && !seen.has(String(x.bvid)))
+          all = [...all, ...add]
+          pages = 2
+        }
+      } catch (err) {
+        /** 第二页失败**不影响**已有结果（拿第 1 页的照样能用） */
+        console.warn(`[search] 《${kw}》第 2 页失败（用第 1 页结果继续）:`, err)
       }
-    } catch (err) {
-      console.warn('[search] 第 2 页失败（用第 1 页结果继续）:', err)
+    }
+    return { items: all, pages }
+  }
+
+  /** 第一轮：主搜索词（**不放宽**上限，按标题里有没有 MV/Live 决定） */
+  const first = await searchRounds(primaryKeyword, false, firstPage)
+  /**
+   * ★ **累加合并**的结果池（降级是「补充」，不是「替换」）
+   *
+   * 用户的原话：「降级的意思是降级搜索，**不是要把之前的结果不要啊**」——
+   * 完全正确。原来的实现是「哪一轮过滤后更多就用哪一轮」，
+   * 于是第 1 轮的 10 条会被降级轮的 36 条**整个顶掉**：
+   *
+   * ```
+   * 第1轮: 10 条  ┐
+   *               ├─ 旧实现：比大小 → 用 36 条 → 最终 36 条（第1轮的 10 条丢了）
+   * 降级轮: 36 条 ┘
+   *
+   * 正确：10 + 36 去重合并 = 46 条（降级是为了**多搜一些补进来**）
+   * ```
+   *
+   * 降级词搜出来的往往是**另一批**视频（`《歌名》歌曲 MV` vs `《歌名》歌曲 歌手`），
+   * 两批的重合度并不高，合起来才是「能挑的候选」。
+   */
+  const merged: SearchVideoItem[] = [...first.items]
+  const seenBvid = new Set(merged.map((x) => String(x.bvid ?? '')))
+  /** 用过的搜索词（第一轮 + 降级轮），只用于日志 */
+  const usedKeywords: string[] = [primaryKeyword]
+  let pages = first.pages
+  let rounds = 1
+  /**
+   * 是否走过降级轮（走过就要放宽时长上限）
+   *
+   * 初值 `false` = 只有第一轮的结果，按严格上限。
+   */
+  let relaxed = false
+
+  /**
+   * 不够 → 依次试降级词（**累加**到结果池，不替换）
+   *
+   * ## 「够不够」判的是**过滤之后**的条数
+   *
+   * 用户设的 `minResults`（默认 30）是「**过滤完**还剩几条才算够」。
+   * 用过滤前的条数判断的话，搜出来 80 条就一定「够」，
+   * 哪怕过滤完只剩 25 条也不会降级 —— 那这个设置项就等于没有。
+   *
+   * ⚠️ 这里踩过：原实现用的 `roughFilter` 把歌名和过滤词都传空，
+   * 实际只做了时长过滤，于是判断数字虚高、降级**永远不触发**。
+   * 现在用 `countPassing`，跑的是与 `rankVideos` 完全相同的规则。
+   */
+  if (minResults > 0) {
+    /**
+     * 降级词序列 = 前三级（`歌曲 MV` / `歌曲 可视化`）+ 最后一级（裸歌名 `《歌名》`）
+     *
+     * 用 `undefined` 表示"裸歌名"那一级，因为它没有后缀
+     * （`buildBareKeyword` 而不是 `buildFallbackKeyword`）。
+     */
+    const fallbackLevels: Array<string | undefined> = [...FALLBACK_SUFFIXES, undefined]
+
+    for (const suffix of fallbackLevels) {
+      /** 够了吗？够了就不再加了（`countPassing` 跑的是完整规则） */
+      if (countPassing(merged, relaxed) >= minResults) break
+
+      /**
+       * 降级词：
+       *  - 有 suffix → `《歌名》歌曲 <后缀>`（**不带歌手名**，理由见上面那段）
+       *  - 无 suffix → `《歌名》`（最后一级，见 `FALLBACK_SUFFIXES`）
+       */
+      const fallbackKeyword =
+        suffix === undefined ? buildBareKeyword(song) : buildFallbackKeyword(song, suffix)
+      if (!fallbackKeyword || usedKeywords.includes(fallbackKeyword)) continue
+
+      try {
+        /**
+         * ★ 降级轮**放宽时长上限**（`relax = true` → `容差 × 1.7`）
+         *
+         * 降级时搜出来的结果更杂（大量合集 / 全场 / 串烧），
+         * 用第一轮那套上限会把本来能找到的砍掉。
+         *
+         * ⚠️ 这里以前传的是写死的 `false` —— `relaxUpperBound` 这个参数
+         * **声明了、注释了，却从来没有被传成 `true`**，等于那条规则根本没生效。
+         * 是代码审查时靠全仓 grep 才发现的：它是个**永远走不到的分支**。
+         *
+         * 每一级都是「**一页不够就两页**」—— 由 `searchRounds` 内部统一处理，
+         * 这里不需要为某一级加特例（用户明确说过：一页不够就两页，两页不够
+         * 就降级，下一级同样一页不够就两页，依此类推）。
+         */
+        const round = await searchRounds(fallbackKeyword, true)
+        rounds++
+        usedKeywords.push(fallbackKeyword)
+
+        /**
+         * ★ 按 bvid 去重后**追加**到结果池
+         *
+         * 去重是必须的：降级词与主搜索词的结果**一定会重合**
+         * （`《歌名》歌曲 MV` 搜出来的东西里，有相当一部分
+         * `《歌名》歌曲 歌手` 也能搜到）。同一 bvid 只留第一次出现的 ——
+         * 那批是主搜索词的结果，元数据（带 `<em>` 高亮的标题）更贴合。
+         */
+        let added = 0
+        for (const item of round.items) {
+          const bvid = String(item.bvid ?? '')
+          if (!bvid || seenBvid.has(bvid)) continue
+          seenBvid.add(bvid)
+          merged.push(item)
+          added++
+        }
+        pages = Math.max(pages, round.pages)
+        /**
+         * 走过降级轮就置 `relaxed`：调用方做**精确过滤**（`rankVideos`）时
+         * 要跟着放宽上限，否则降级轮补进来的那些会因为「时长超了严格上限」
+         * 又被挡回去 —— 白降级一场。
+         */
+        relaxed = true
+
+        console.log(
+          `[search] ${song}-${singer} 降级「${fallbackKeyword}」+${added}（累计 ${merged.length}）`,
+        )
+      } catch (err) {
+        console.warn(
+          `[search] ${song}-${singer} 降级搜索「${fallbackKeyword}」失败（继续用已有结果）:`,
+          err,
+        )
+      }
     }
   }
 
   return {
-    items: filterByDuration(all, songDurationSec),
-    filteredOut,
+    items: merged,
     pages,
+    rounds,
+    /** ★ 本次结果是否按放宽后的时长上限取的（调用方排序时要跟着放宽） */
+    relaxed,
   }
 }
 
@@ -682,8 +960,15 @@ export interface ResolveVideoResult {
   /**
    * 视频的 `cid`
    *
-   * 它**本来就要取**（拿 playurl 必须用），顺手带出来是为了让调用方
-   * 能拿它去取 **AI 字幕**（歌词自动对齐要用）—— 这样不增加任何额外请求。
+   * 它**本来就要取**（拿 playurl 必须用）。顺手带出来是为了让调用方
+   * 以后要用时不必再发一次 view 请求。
+   *
+   * ⚠️ 当前**没有任何消费方** —— 它曾经是给「取 AI 字幕做歌词对齐」用的，
+   * 而歌词功能已经整体移除（`api:resolveVideo` 把解析结果拆成
+   * `videoUrl/dash/viewData/playData`，**丢掉了 `cid`**）。
+   *
+   * 留着它而不是删掉：字段是免费的（cid 已经在手里），
+   * 删了以后要加回来又得改一处签名。
    */
   cid: number
 }

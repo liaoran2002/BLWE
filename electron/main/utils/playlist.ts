@@ -29,7 +29,7 @@ import type {
   PlaylistSyncMode,
   SyncResult,
 } from '@common/types/playlist'
-import { parseSearchKey, toSearchKey } from '@common/types/playlist'
+import { parseSearchKey, platformIdOfSongId, songId, sourceOfSongId } from '@common/types/playlist'
 import { durationToSeconds } from '@common/utils/duration'
 import { getDb, tx } from './db'
 import { resolvePlaylist } from '../music'
@@ -45,8 +45,19 @@ const emptyData = (): PlaylistStoreData => ({
 
 let data: PlaylistStoreData = emptyData()
 
-/** 生成一个歌单 id */
-const newId = (): string => randomUUID()
+/**
+ * 生成**兜底**歌单 id（`pl_` 前缀）
+ *
+ * ⚠️ 只在「**没有**拼出平台主键」时用 —— 也就是**手动新建的歌单**
+ * （没有分享链接，也就没有平台歌单 id 可拼）。
+ *
+ * 有链接的歌单，主键是 `平台_平台歌单id`（`tx_8153225605`），
+ * 由 `music:getPlaylistDetail` 用 `playlistKey()` 拼好后一路带过来。
+ *
+ * 前缀 `pl_` 是刻意加的：一眼能看出「这不是平台 id」，
+ * 排查时不用猜 `a9648dca-…` 属于哪个平台。
+ */
+const newId = (): string => `pl_${randomUUID()}`
 
 // #region 数据库行 <-> 领域对象
 
@@ -59,8 +70,7 @@ const newId = (): string => randomUUID()
 interface PlaylistDbRow {
   id: string
   name: string
-  source: string | null
-  source_url: string | null
+  url: string | null
   sync_mode: string
   sync_interval_ms: number
   last_sync_at: number | null
@@ -69,19 +79,26 @@ interface PlaylistDbRow {
   last_index: number
 }
 
-interface SongDbRow {
-  playlist_id: string
-  ord: number
+/**
+ * `songs` 表的原始行（曲目实体，全局唯一）
+ *
+ * 没有 `source` / `platform_id` 列 —— 它们已经编码在 `id`（`tx_101104624`）里，
+ * 需要时用 `sourceOfSongId(id)` 反推。少两列就少两处可能不一致的地方。
+ */
+interface SongRow {
+  id: string
   name: string
   singer: string
   album: string | null
   cover: string | null
-  /** 秒（schema v2 起；原来是平台原样给的 "4:03" 字符串） */
   duration: number | null
-  /** 来源音源（wy / tx / kw） */
-  source: string | null
-  /** 平台侧歌曲 id —— 取歌词要用它精确定位 */
-  platform_id: string | null
+}
+
+/** `playlist_songs` 的原始行（成员关系 + 顺序） */
+interface PlaylistSongRow {
+  playlist_id: string
+  ord: number
+  song_id: string
 }
 
 /** `sync_mode` 列 -> `PlaylistSyncMode`（脏值一律当 off，别让界面拿到未定义的行为） */
@@ -173,13 +190,64 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
 
 // #endregion
 
+// #region 解析结果 → 领域对象
+
+/**
+ * ★ 把音源解析出的 `ParsedSong[]` 转成 `PlaylistSong[]`（**主进程唯一入口**）
+ *
+ * ## 为什么这件事必须在主进程做
+ *
+ * `resolvePlaylist` 拿到的 `ParsedSong` 里字段名与库里**不一样**：
+ *
+ * | 音源给的 | 库里要的 |
+ * | --- | --- |
+ * | `interval: "4:03"` | `duration: 243`（**秒**） |
+ * | `albumName` | `album` |
+ * | `platformId` | `platformId`（**拼 `songs.id` 要用**） |
+ *
+ * 早先这段转换写在**渲染层**（`PlaylistManager.vue`），于是：
+ *  - 渲染层要懂「interval 是什么形状」这种音源细节；
+ *  - **`platformId` 在转换时被丢掉**了（渲染层根本不知道它有用），
+ *    导致 `songs.id` 只能退化成 `歌名-歌手` —— 白拆了表。
+ *
+ * 现在统一在这里转完，**主进程的 IPC 出口直接返回最终形态**，
+ * 渲染层原样透传即可（它只负责展示与回传）。
+ *
+ * @param songs 音源解析出的原始歌曲
+ */
+export const toPlaylistSongs = (
+  songs: Array<{
+    name: string
+    singer: string
+    interval?: string | null
+    albumName?: string
+    cover?: string | null
+    platformId?: string | null
+    source?: string
+  }>,
+): PlaylistSong[] =>
+  (songs ?? []).map((song) => ({
+    name: song.name,
+    singer: song.singer ?? '',
+    album: song.albumName,
+    cover: song.cover ?? null,
+    /** 音源给的是 `"4:03"` 这类字符串，库里统一存**秒** */
+    duration: durationToSeconds(song.interval),
+    /** ★ 平台 id —— 拼 `songs.id` 的关键，**不能丢** */
+    platformId: song.platformId ?? null,
+    source: song.source,
+  }))
+
+// #endregion
+
 // #region 读
 
-/** 读全部歌单（含曲目），按 created_at 排序 —— 界面上的顺序必须稳定 */const readPlaylistsFromDb = (): PlaylistRecord[] => {
+/** 读全部歌单（含曲目），按 created_at 排序 —— 界面上的顺序必须稳定 */
+const readPlaylistsFromDb = (): PlaylistRecord[] => {
   const db = getDb()
   const playlistRows = db
     .prepare(
-      `SELECT id, name, source, source_url, sync_mode, sync_interval_ms,
+      `SELECT id, name, url, sync_mode, sync_interval_ms,
               last_sync_at, created_at, updated_at, last_index
          FROM playlists
         ORDER BY created_at ASC`,
@@ -188,42 +256,67 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
   if (playlistRows.length === 0) return []
 
   /**
-   * 曲目一次性全查出来再按 playlist_id 分组
+   * 曲目信息一次全查出来，建成 `id -> PlaylistSong` 的字典
    *
-   * 不用「每条歌单查一次」：歌单数量不多（几十个），但逐个查就是几十次
-   * prepare + 往返，而且这里每次启动都会跑。一次查完在 JS 里分组更划算，
-   * 也避免了「歌单很多时启动变慢」这种以后才会发现的性能问题。
+   * 曲目实体在 `songs` 表（全局唯一），`playlist_songs` 只存关系 ——
+   * 所以这里是**两次全表读 + 内存拼装**，不是每条歌单查一次（N+1）。
    */
-  const songRows = db
-    .prepare(
-      `SELECT playlist_id, ord, name, singer, album, cover, duration, source, platform_id
-         FROM playlist_songs
-        ORDER BY playlist_id ASC, ord ASC`,
-    )
-    .all() as SongDbRow[]
-  const songsByPlaylist = new Map<string, PlaylistSong[]>()
-  for (const row of songRows) {
-    let list = songsByPlaylist.get(row.playlist_id)
-    if (!list) {
-      list = []
-      songsByPlaylist.set(row.playlist_id, list)
-    }
-    list.push({
+  const songById = new Map<string, PlaylistSong>()
+  for (const row of db
+    .prepare(`SELECT id, name, singer, album, cover, duration FROM songs`)
+    .all() as SongRow[]) {
+    songById.set(row.id, {
       name: row.name,
       singer: row.singer ?? '',
       album: row.album ?? undefined,
       cover: row.cover,
       duration: row.duration,
-      platformId: row.platform_id,
-      source: row.source ?? undefined,
+      /**
+       * `platformId` / `source` 从 `id`（`tx_101104624`）反推 ——
+       * 表里没这两列，前缀已经表达了它们。
+       */
+      platformId: platformIdOfSongId(row.id),
+      source: sourceOfSongId(row.id) ?? undefined,
     })
+  }
+
+  /**
+   * 关系表按 `(playlist_id, ord)` 读出来，直接就是各歌单的顺序
+   *
+   * 排序在 SQL 里做（`ORDER BY playlist_id, ord`），所以在 JS 里
+   * `push` 的顺序天然正确，不需要再排一次。
+   */
+  const songsByPlaylist = new Map<string, PlaylistSong[]>()
+  for (const row of db
+    .prepare(
+      `SELECT playlist_id, ord, song_id FROM playlist_songs ORDER BY playlist_id ASC, ord ASC`,
+    )
+    .all() as PlaylistSongRow[]) {
+    const song = songById.get(row.song_id)
+    /**
+     * `songs` 里找不到 = 悬空引用（关系表有、实体表没有）。
+     *
+     * 正常情况下不会发生（写库在同一个事务里），但真要出现时
+     * **跳过它而不是补一条空的** —— 补空壳会在界面上留一个点不动的空行。
+     */
+    if (!song) {
+      console.warn(`[playlist] 曲目 ${row.song_id} 在 songs 表里不存在，已跳过`)
+      continue
+    }
+    let list = songsByPlaylist.get(row.playlist_id)
+    if (!list) {
+      list = []
+      songsByPlaylist.set(row.playlist_id, list)
+    }
+    list.push(song)
   }
 
   return playlistRows.map((row) => ({
     id: row.id,
     name: row.name,
-    source: row.source ?? undefined,
-    sourceUrl: row.source_url ?? undefined,
+    /** 音源从歌单 id 前缀反推（`tx_8153225605` → `tx`） */
+    source: sourceOfSongId(row.id) ?? undefined,
+    sourceUrl: row.url ?? undefined,
     songs: songsByPlaylist.get(row.id) ?? [],
     sync: { mode: toSyncMode(row.sync_mode), intervalMs: row.sync_interval_ms ?? 0 },
     lastSyncAt: row.last_sync_at,
@@ -264,23 +357,47 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
     db.prepare(`DELETE FROM playlists`).run()
     db.prepare(`DELETE FROM playlist_songs`).run()
 
+    /**
+     * ⚠️ `songs` 表**不能无脑全清**
+     *
+     * 它是**全局共享**的曲目实体表，而这里保存的是「歌单集合」——
+     * 无脑 `DELETE FROM songs` 会把别的歌单引用的曲目一起删掉
+     * （关系表虽然有记录，但实体没了 → 读的时候全是悬空引用 → 曲目整片消失）。
+     *
+     * 正确做法见下面：先建**本次用到的 id 集合**，只删「没人再引用」的那些。
+     * 这样既不会留垃圾（歌单删了曲目也删），也不会误删别的歌单在用的。
+     */
     const insertPlaylist = db.prepare(
       `INSERT INTO playlists
-         (id, name, source, source_url, sync_mode, sync_interval_ms,
+         (id, name, url, sync_mode, sync_interval_ms,
           last_sync_at, created_at, updated_at, last_index)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    const insertSong = db.prepare(
-      `INSERT INTO playlist_songs
-         (playlist_id, ord, name, singer, album, cover, duration, source, platform_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
+    /**
+     * 曲目实体用 upsert：同一个 id 可能被多个歌单引用，
+     * 第二次遇到时**覆盖**（以最新那份为准 —— 同步刚拉回来的元数据更可信）。
+     */
+    const upsertSong = db.prepare(
+      `INSERT INTO songs (id, name, singer, album, cover, duration)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         name     = excluded.name,
+         singer   = excluded.singer,
+         album    = excluded.album,
+         cover    = excluded.cover,
+         duration = excluded.duration`,
+    )
+    const insertRelation = db.prepare(
+      `INSERT INTO playlist_songs (playlist_id, ord, song_id) VALUES (?, ?, ?)`,
+    )
+
+    /** 本次保存里出现过的 song id（用来决定 `songs` 表要删哪些） */
+    const keepIds = new Set<string>()
 
     for (const record of store.playlists) {
       insertPlaylist.run(
         record.id,
         record.name,
-        record.source ?? null,
         record.sourceUrl ?? null,
         record.sync.mode,
         record.sync.intervalMs,
@@ -290,18 +407,55 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
         record.lastIndex,
       )
       record.songs.forEach((song, index) => {
-        insertSong.run(
-          record.id,
-          index,
+        /**
+         * `songs.id` = `平台_平台id`（由 `songId` 拼）
+         *
+         * ⚠️ 它依赖 `song.platformId`，而那个字段由 `resolvePlaylist` 带出来 ——
+         * 所以主进程在 IPC 出口**就把解析结果加工成最终形态**（含 platformId），
+         * 渲染层只是原样透传。见 `music:getPlaylistDetail` 的 handler。
+         */
+        const id = songId(song)
+        /**
+         * 自检：有平台 id 却没拼出 `平台_` 前缀 → 说明 `song.source` 丢了
+         *
+         * 这是「渲染层原样透传」这条链路唯一的**隐含耦合**：
+         * `songId()` 需要 `platformId` **和** `source` 两个字段，
+         * 任一丢失都会静默退化成 `歌名-歌手`（曾经 221 条全退化过，
+         * 而界面上完全看不出异常）。所以这里打一行警告，让问题**当场可见**。
+         */
+        if (song.platformId && !/^[a-z]+_/.test(id)) {
+          console.warn(
+            `[playlist] 曲目「${song.name}」有 platformId 却拼不出平台前缀` +
+              `（source 丢了？）→ songs.id 退化成 ${id}`,
+          )
+        }
+        keepIds.add(id)
+        upsertSong.run(
+          id,
           song.name,
           song.singer ?? '',
           song.album ?? null,
           song.cover ?? null,
           song.duration ?? null,
-          song.source ?? null,
-          song.platformId ?? null,
         )
+        insertRelation.run(record.id, index, id)
       })
+    }
+
+    /**
+     * 清掉**没人再引用**的曲目实体
+     *
+     * 用 `NOT IN (...)` 而不是遍历比对：`keepIds` 可能上千个，
+     * 逐个 `DELETE` 就是上千次语句执行。这里只有一条语句。
+     *
+     * `keepIds` 为空时（歌单全删了）`NOT IN ()` 是语法错误 ——
+     * 那种情况直接全清，所以单独分支。
+     */
+    if (keepIds.size === 0) {
+      db.prepare(`DELETE FROM songs`).run()
+    } else {
+      const placeholders = [...keepIds].map(() => '?').join(',')
+      db.prepare(`DELETE FROM songs WHERE id NOT IN (${placeholders})`).run(...keepIds)
     }
   })
 }
@@ -373,20 +527,36 @@ export const getPlaylists = (): PlaylistStoreData => structuredClone(data)
  * （不是查库）：歌单是主进程内存里的权威副本，而且这里要的是「快」——
  * 每次搜索都要调一次，走 SQLite 反而多一层开销。
  *
+ * ⚠️ 入参是 `songId`（形如 `tx_002dNLgZ2dk7sy`，或没有平台 id 时的
+ * `歌名-歌手`），**不是显示名**。两者在「有平台 id」时完全不同，传错就找不到。
+ *
  * @returns 时长（秒）；找不到或时长为空返回 `null`（调用方据此**跳过过滤**）
  */
-export const findSongDuration = (searchKey: string): number | null => {
-  const want = searchKey.trim().toLowerCase()
+export const findSongDuration = (cacheKey: string): number | null => {
+  const song = findSongByCacheKey(cacheKey)
+  const d = song?.duration
+  return typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null
+}
+
+/**
+ * 按缓存键（`songId`）找到那首歌的**完整信息**
+ *
+ * 用途：拼搜索词要用「歌名 + 歌手」，而缓存键本身（`tx_xxx`）里没有歌名。
+ * 找不到返回 `null` —— 调用方应退化成「直接把键当搜索词」。
+ *
+ * 遍历内存里的 `data`（不是查库）：每次搜索都要调，走 SQLite 多一层开销。
+ */
+export const findSongByCacheKey = (cacheKey: string): PlaylistSong | null => {
+  const want = cacheKey.trim().toLowerCase()
   if (!want) return null
   for (const record of data.playlists) {
     for (const song of record.songs) {
       /**
-       * 用 `toSearchKey` 生成键再比 —— 与渲染层、缓存用的是**同一个函数**，
-       * 这样三处的「这首歌是谁」判定完全一致（手工拼字符串早晚会漂移）。
+       * 用 `songId` 生成键再比 —— 与写缓存、读缓存用的是**同一个函数**，
+       * 这样「这首歌是谁」的判定完全一致（手工拼字符串早晚会漂移）。
        */
-      if (toSearchKey(song).trim().toLowerCase() !== want) continue
-      const d = song.duration
-      return typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null
+      if (songId(song).trim().toLowerCase() !== want) continue
+      return song
     }
   }
   return null
@@ -428,10 +598,6 @@ export const savePlaylists = (params: PlaylistSaveParams): PlaylistStoreData => 
   return structuredClone(data)
 }
 
-/** 去重用的归一化 key */
-const songKey = (song: PlaylistSong): string =>
-  toSearchKey(song).trim().toLowerCase()
-
 /**
  * 正在同步中的歌单 id
  *
@@ -464,24 +630,19 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
   syncingIds.add(id)
 
   try {
+    /**
+     * 同步时**复用同一个归一化函数**（`toPlaylistSongs`）——
+     * 它保证主进程各处产出的 `PlaylistSong` 形态一致（含 `platformId`）。
+     */
     const detail = await resolvePlaylist({ input: target.sourceUrl })
     /**
-     * 直接保留结构化字段（封面/专辑/歌手/时长），不再压成字符串。
+     * ★ 用与 IPC 出口**同一个** `toPlaylistSongs` 归一
      *
-     * `interval` 各音源给的形状不一样（wy 是 `"4:03"`、tx 先按秒再被
-     * `formatPlayTime` 转成字符串、kw 同样），所以统一过一遍
-     * `durationToSeconds` 归一成秒 —— 库里那一列现在是 INTEGER。
+     * 同步不经过渲染层（直接在主进程改内存），但产出的形状必须与
+     * 「解析 → 渲染层原样回传」那条路径**完全一致** —— 否则同一首歌
+     * 走两条路径会得到不同的 `duration` / `platformId`。
      */
-    let songs: PlaylistSong[] = detail.songs.map((song) => ({
-      name: song.name,
-      singer: song.singer,
-      album: song.albumName,
-      cover: song.cover ?? null,
-      duration: durationToSeconds(song.interval),
-      /** 顺手带上平台 id 与音源 —— 取歌词要用（见 PlaylistSong.platformId） */
-      platformId: song.platformId ?? null,
-      source: song.source,
-    }))
+    let songs: PlaylistSong[] = toPlaylistSongs(detail.songs)
     if (songs.length > MAX_SYNC_SONGS) songs = songs.slice(0, MAX_SYNC_SONGS)
 
     /**
@@ -490,30 +651,63 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
      * 曾经有个 `duplicatePolicy` 参数（`'keep' | 'dedupe'`），但 IPC 只传 `{ ids }`、
      * 主进程也从来没人传第二个参数 —— `'keep'` 是不可达的死分支，还让人以为「保留重复」可配。
      * 现在直接写明：同步一律去重。
+     *
+     * 用 `songId` 去重（有平台 id 时是 `tx_xxx`）而不是「歌名-歌手」——
+     * 后者会把「同名但不同版本」（live 版、翻唱版）误判成重复。
      */
     {
       const seen = new Set<string>()
       songs = songs.filter((song) => {
-        const key = songKey(song)
+        const key = songId(song).trim().toLowerCase()
         if (seen.has(key)) return false
         seen.add(key)
         return true
       })
     }
 
-    const before = new Set(target.songs.map(toSearchKey))
-    const after = new Set(songs.map(toSearchKey))
-    const added = songs.filter((s) => !before.has(toSearchKey(s))).length
-    const removed = target.songs.filter((s) => !after.has(toSearchKey(s))).length
+    /** added / removed 也按 `songId` 算 —— 与「缓存键」同一套，语义才对得上 */
+    const before = new Set(target.songs.map((s) => songId(s).trim().toLowerCase()))
+    const after = new Set(songs.map((s) => songId(s).trim().toLowerCase()))
+    const added = songs.filter((s) => !before.has(songId(s).trim().toLowerCase())).length
+    const removed = target.songs.filter((s) => !after.has(songId(s).trim().toLowerCase())).length
 
     // 名称与来源以远端为准，但保留用户自定义的名字（仅当原名为空时更新）
     if (!target.name.trim()) target.name = detail.info.name || target.name
     target.source = detail.source
+
+    /**
+     * ★ 把 `lastIndex` **重算成新列表里的位置**（这是「下标能当定位用」的前提）
+     *
+     * 下标本身是脆弱的：同步后曲目会增删，第 N 个位置可能已经是别的歌。
+     * 所以同步时必须把「用户上次听到的那首歌」的**新位置**算出来 ——
+     * 此刻旧列表（`target.songs`）和新列表（`songs`）都在手上，正是做这件事的时机。
+     *
+     * 三种情况：
+     *  ① 那首歌还在 → 用它的新下标（可能是另一个位置了）
+     *  ② **那首歌被删了** → 保留原下标并夹进范围（效果是「下一首顶上来」，
+     *     这是播放器的标准行为；干瞪眼或跳回第一首都不如它合理）
+     *  ③ 旧列表本来就是空的（新歌单）→ 0
+     */
+    const oldSongs = target.songs
+    const oldIndex = target.lastIndex
+    const playedSong = oldSongs[oldIndex]
+    if (songs.length === 0) {
+      target.lastIndex = 0
+    } else if (playedSong) {
+      /** ① 按 `songId` 找它在新列表里的位置（不能用歌名 —— 同步可能改名）*/
+      const newPos = songs.findIndex(
+        (s) => songId(s).toLowerCase() === songId(playedSong).toLowerCase(),
+      )
+      /** ② 找不到（歌被删了）就保留原下标；两种情况都要夹进范围 */
+      target.lastIndex = Math.min(newPos >= 0 ? newPos : oldIndex, songs.length - 1)
+      target.lastIndex = Math.max(0, target.lastIndex)
+    } else {
+      target.lastIndex = Math.min(Math.max(0, oldIndex), songs.length - 1)
+    }
+
     target.songs = songs
     target.lastSyncAt = Date.now()
     target.updatedAt = Date.now()
-    // 曲目数变化可能让下标越界
-    if (target.lastIndex >= songs.length) target.lastIndex = 0
 
     /**
      * 这里以前要顺手清掉「已不存在歌曲」的 videoCache / favorites。

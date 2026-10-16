@@ -100,7 +100,10 @@ export interface IpcChannelMap {
   'api:getUserInfo': { params: void; result: UserInfo }
   'api:searchSong': {
     params: {
-      keyword: string
+      /** 歌名（**纯歌名**，不含歌手） */
+      song: string
+      /** 歌手（多个用「、」连接）；未知传空串。**与歌名分开传** */
+      singer: string
       /** 视频列表的刷新按钮：绕过缓存真的重搜（同时会与旧条目合并，保住已解析的地址） */
       skipCache?: boolean
     }
@@ -168,9 +171,29 @@ export interface IpcChannelMap {
   // #endregion
 
   // #region 音乐平台歌单解析（移植自 LX 的 musicSdk）
+  /**
+   * 解析歌单
+   *
+   * 返回的是**主进程加工好的成品**，渲染层不需要自己拼任何东西：
+   *
+   *  - `songs` 是 **`PlaylistSong[]`**（与库里同一形态：`duration` 是秒、
+   *    `album` 而非 `albumName`、**带 `platformId`**）；
+   *  - `id` 是**拼好的歌单主键**（`平台_平台歌单id`，如 `tx_8153225605`）
+   *    —— 渲染层直接拿它当 `PlaylistRecord.id` 用。
+   *
+   * 音源的 `listId` **不透出**（只用于主进程拼 `id`）。
+   *  见 `main/ipc/music.ts`。
+   */
   'music:getPlaylistDetail': {
     params: import('./musicSdk').GetPlaylistDetailParams
-    result: import('./musicSdk').PlaylistDetail
+    result: Omit<import('./musicSdk').PlaylistDetail, 'songs' | 'listId'> & {
+      songs: import('./playlist').PlaylistSong[]
+      /**
+       * 拼好的歌单主键；**音源没给 `listId` 时为 `null`**
+       * （那时渲染层退化成随机 id —— 手动新建的歌单走那条路）
+       */
+      id: string | null
+    }
   }
   // #endregion
 

@@ -1647,7 +1647,7 @@ function startWindowDrag(): { offsetX: number; offsetY: number } | null {
     fullScreenRestore = null
     mainWindow.setAlwaysOnTop(false)
     // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
-  applyAspectRatio()
+    applyAspectRatio()
     syncFullScreenState()
     mainWindow.setBounds({
       x: Math.round(cursor.x - ratioX * normalBounds.width),

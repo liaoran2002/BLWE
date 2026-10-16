@@ -44,6 +44,20 @@ export const COLOR_HEX_PATTERN = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/
  */
 export const DARK_TINT_LUMINANCE = 0.5
 
+/**
+ * 搜索结果排序的取值范围（设置页用）
+ *
+ * `DURATION_TOLERANCE_*` 是「视频时长与歌单时长允许差多少秒」的上下限：
+ *  - 下限 10：再小会把正常的 MV（带几秒前奏画面）都砍掉；
+ *  - 上限 600：比很多歌本身还长，再宽就等于关闭时长过滤了。
+ *
+ * `MIN_SEARCH_RESULTS_MAX` 是「过滤后少于多少条就降级重搜」的上限。
+ * **`0` 是合法值**（表示从不降级），所以设置页的 `min` 是 0 而不是这个常量。
+ */
+export const DURATION_TOLERANCE_MIN = 10
+export const DURATION_TOLERANCE_MAX = 600
+export const MIN_SEARCH_RESULTS_MAX = 200
+
 
 /**
  * 透明度的取值范围与步进

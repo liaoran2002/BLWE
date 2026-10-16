@@ -62,7 +62,7 @@ export interface PlaylistInfo {
   playCount?: string | number | null
 }
 
-/** 歌单解析结果 */
+/** 歌单解析结果（**音源原始形态**：`songs` 里是 `ParsedSong`） */
 export interface PlaylistDetail {
   /** 歌单元信息 */
   info: PlaylistInfo
@@ -76,6 +76,21 @@ export interface PlaylistDetail {
   limit: number
   /** 来源音源 */
   source: MusicSource
+  /**
+   * ★ **平台侧歌单 id**（QQ 的 `disstid` / 网易云的 `id` / 酷我的 `rid`）
+   *
+   * 用途：让上层拼出歌单主键 `平台_平台歌单id`（如 `tx_8153225605`）。
+   *
+   * ⚠️ 为什么主键不用随机 UUID：
+   *  - 同一个歌单重复导入会**命中同一行**，而不是攒出一堆副本；
+   *  - 重启 / 换机器后靠 `sourceUrl` 能推出同一个 id，不会认成新歌单。
+   *
+   * 几个音源都在 `getListId()` 里解析过它 —— 这里把它带出来。
+   *
+   * ⚠️ **不要把这个字段直接交给渲染层去拼主键** ——
+   * 拼装由主进程做（见 `music:getPlaylistDetail` 返回的 `id`）。
+   */
+  listId: string
 }
 
 /** IPC 入参 */

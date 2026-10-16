@@ -184,6 +184,14 @@ export const resetSetting = (): AppSetting => {
     // 否则会把 defaultSetting 里的对象直接共享给运行时，被意外修改
     'player.tagBonus': structuredClone(defaultSetting['player.tagBonus']),
     /**
+     * `player.filterKeywords` 是**数组**，同样必须深拷贝
+     *
+     * 理由和 `common.customAspectRatios` 完全一样：`{...defaultSetting}` 只做浅拷贝，
+     * 数组成员和 `defaultSetting` 是同一个引用。用户在设置页加一个过滤词，
+     * 就会把模块级的 defaultSetting 改脏 —— 表现是「恢复默认」之后那个词还在。
+     */
+    'player.filterKeywords': [...defaultSetting['player.filterKeywords']],
+    /**
      * `customAspectRatios` 是**数组**，同样要深拷贝
      *
      * 原因和上面 tagBonus 一样：`{...defaultSetting}` 只做浅拷贝，

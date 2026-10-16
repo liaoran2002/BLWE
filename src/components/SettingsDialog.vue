@@ -8,8 +8,35 @@
     @update:model-value="(v: boolean) => $emit('update:modelValue', v)"
   >
     <div class="st-body">
+      <!--
+        左侧目录 + 右侧一页到底
+        ============================
+        ⚠️ 左栏**不是 Tab（不是切换页面）**，是**目录**：
+        右边始终是完整的一页（所有设置都在），点左栏只是**滚到对应位置**。
+
+        为什么不做成 Tab 切换：
+          - 切换会让人「找不到刚看过的那一项」——设置项之间经常要对照着调
+            （比如「时长容差」和「降级阈值」），换页就把上下文切断了；
+          - 用户的原话是「不要点一下就像换了个页面一样」。
+
+        左栏的高亮跟着**滚动位置**走（scroll spy），而不是只记"最后点了谁"——
+        否则用户自己滚到「搜索」时，左栏还停在「播放」，看着像坏了。
+      -->
+      <div class="st-nav">
+        <div
+          v-for="tab in TABS"
+          :key="tab.key"
+          class="st-nav-item"
+          :class="{ 'is-active': activeTab === tab.key }"
+          @click="scrollToSection(tab.key)"
+        >
+          {{ tab.label }}
+        </div>
+      </div>
+
+      <div ref="content" class="st-content" @scroll="onContentScroll">
       <!-- 播放 -->
-      <div class="st-group">
+      <div :data-section="'player'" class="st-group">
         <div class="st-group-title">播放</div>
         <div class="st-row">
           <div class="st-name">最高视频清晰度</div>
@@ -71,7 +98,7 @@
       </div>
 
       <!-- 界面 -->
-      <div class="st-group">
+      <div :data-section="'ui'" class="st-group">
         <div class="st-group-title">界面</div>
         <div class="st-row">
           <div class="st-name">主题色</div>
@@ -179,7 +206,7 @@
       </div>
 
       <!-- 通用 -->
-      <div class="st-group">
+      <div :data-section="'common'" class="st-group">
         <div class="st-group-title">通用</div>
         <div class="st-row">
           <div class="st-name">启动时进入桌面壁纸模式</div>
@@ -251,6 +278,174 @@
           </el-popconfirm>
         </div>
       </div>
+
+      <!-- ==================== 搜索 ==================== -->
+      <div :data-section="'search'" class="st-group">
+        <div class="st-group-title">搜索</div>
+
+        <!-- ① 时长容差 -->
+        <div class="st-row">
+          <div class="st-name">时长容差</div>
+          <div class="st-actions">
+            <el-input-number
+              :model-value="setting['player.durationToleranceSec']"
+              size="small"
+              style="width: 120px"
+              :min="DURATION_TOLERANCE_MIN"
+              :max="DURATION_TOLERANCE_MAX"
+              :step="10"
+              @update:model-value="(v: number | undefined) => setNumber('player.durationToleranceSec', v)"
+            />
+            <span class="st-desc">秒（MV / Live 自动放宽）</span>
+          </div>
+        </div>
+
+        <!-- ② 降级阈值 -->
+        <div class="st-row">
+          <div class="st-name">降级重搜阈值</div>
+          <div class="st-actions">
+            <el-input-number
+              :model-value="setting['player.minSearchResults']"
+              size="small"
+              style="width: 120px"
+              :min="0"
+              :max="MIN_SEARCH_RESULTS_MAX"
+              :step="5"
+              @update:model-value="(v: number | undefined) => setNumber('player.minSearchResults', v)"
+            />
+            <span class="st-desc">条；0 = 从不降级</span>
+          </div>
+        </div>
+
+        <!--
+          ③ 关键词加权（**在过滤关键词之上**，按用户要求）
+          ================================================
+          每一档一行：左边是分值，右边是**一个个的标签**（不是一个大输入框）。
+          点 `+` 才出现一个输入框，回车/失焦即提交 —— 和下面过滤关键词同一套交互。
+        -->
+        <div class="st-sub">
+          关键词加权
+          <span class="st-desc">歌手名命中 +100，之后按这里的分值累加</span>
+          <el-button class="st-add-tier" size="small" text @click="openTierInput">
+            + 分值档
+          </el-button>
+        </div>
+        <!-- 新增分值档：点了「+ 分值档」才出现 -->
+        <div v-if="tierInputVisible" class="st-row">
+          <div class="st-name">新分值</div>
+          <div class="st-actions">
+            <el-input
+              v-model="newTierText"
+              size="small"
+              style="width: 90px"
+              placeholder="如 -5"
+              autofocus
+              @keyup.enter="addTier"
+            />
+            <el-button size="small" @click="addTier">确定</el-button>
+            <el-button size="small" text @click="cancelTierInput">取消</el-button>
+          </div>
+        </div>
+        <div v-for="score in tagBonusScores" :key="`tb-${score}`" class="st-row st-row--tags">
+          <div class="st-name st-name--score">
+            <!--
+              分值调节：`←` 减 1 / `→` 加 1
+              键盘的 ←/→ 也能调（见 .st-score 的 tabindex + @keydown）
+            -->
+            <el-button
+              class="st-score-btn"
+              size="small"
+              text
+              title="减小 1 分"
+              @click="shiftTagBonusScore(score, -1)"
+            >
+              ←
+            </el-button>
+            <span
+              class="st-score"
+              :class="Number(score) >= 0 ? 'st-score-pos' : 'st-score-neg'"
+              tabindex="0"
+              :title="'当前 ' + (Number(score) > 0 ? '+' : '') + score + ' 分（左右箭头 / ←→ 按钮可调）'"
+              @keydown.left.prevent="shiftTagBonusScore(score, -1)"
+              @keydown.right.prevent="shiftTagBonusScore(score, 1)"
+            >
+              {{ Number(score) > 0 ? '+' : '' }}{{ score }}
+            </span>
+            <el-button
+              class="st-score-btn"
+              size="small"
+              text
+              title="增加 1 分"
+              @click="shiftTagBonusScore(score, 1)"
+            >
+              →
+            </el-button>
+            <el-button class="st-tier-del" size="small" text @click="removeTagBonus(score)">
+              删除
+            </el-button>
+          </div>
+          <div class="st-tags">
+            <el-tag
+              v-for="(kw, i) in setting['player.tagBonus'][score] ?? []"
+              :key="`tbk-${score}-${i}-${kw}`"
+              closable
+              size="small"
+              :type="Number(score) >= 0 ? 'success' : 'danger'"
+              @close="removeTagBonusKeyword(score, i)"
+            >
+              {{ kw }}
+            </el-tag>
+            <!-- 点 + 才出现输入框（同一个时间只有一个） -->
+            <el-input
+              v-if="tagInputs[score]?.visible"
+              :model-value="tagInputs[score]?.text ?? ''"
+              size="small"
+              class="st-tag-input"
+              placeholder="回车添加"
+              autofocus
+              @update:model-value="(v: string) => setTagInputText(score, v)"
+              @keyup.enter="addTagBonusKeyword(score)"
+              @blur="closeTagInput(score)"
+            />
+            <el-button v-else class="st-add" size="small" @click="openTagInput(score)">+</el-button>
+          </div>
+        </div>
+
+        <!--
+          ④ 过滤关键词（在加权**下面**）
+          命中直接丢弃，所以和加权是两套 —— 界面上也分成两块。
+        -->
+        <div class="st-sub">
+          过滤关键词
+          <span class="st-desc">命中直接丢弃</span>
+        </div>
+        <div class="st-row st-row--tags">
+          <div class="st-name">关键词</div>
+          <div class="st-tags">
+            <el-tag
+              v-for="(kw, i) in setting['player.filterKeywords']"
+              :key="`fk-${i}-${kw}`"
+              closable
+              size="small"
+              @close="removeFilterKeyword(i)"
+            >
+              {{ kw }}
+            </el-tag>
+            <el-input
+              v-if="filterInputVisible"
+              v-model="newFilterKeyword"
+              size="small"
+              class="st-tag-input"
+              placeholder="回车添加"
+              autofocus
+              @keyup.enter="addFilterKeyword"
+              @blur="filterInputVisible = false"
+            />
+            <el-button v-else class="st-add" size="small" @click="openFilterInput">+</el-button>
+          </div>
+        </div>
+      </div>
+      </div>
     </div>
 
   </el-dialog>
@@ -269,6 +464,9 @@ import {
   CACHE_EXPIRE_DAYS_MIN,
   CACHE_EXPIRE_DAYS_STEP,
   CUSTOM_ASPECT_RATIO_MAX_COUNT,
+  /** 搜索排序：时长容差与降级阈值的取值范围 */
+  DURATION_TOLERANCE_MAX,
+  DURATION_TOLERANCE_MIN,
   GLASS_BLUR_PERCENT_PER_PX,
   GLASS_BLUR_PERCENT_STEP,
   GLASS_SHADOW_PERCENT_PER_PX,
@@ -277,6 +475,7 @@ import {
   GLASS_TRANSPARENCY_MIN,
   GLASS_TRANSPARENCY_STEP,
   MS_PER_DAY,
+  MIN_SEARCH_RESULTS_MAX,
   VIDEO_QUALITY_OPTIONS,
 } from '@common/constants';
 import type { AppSetting } from '@common/types/app_setting';
@@ -291,6 +490,22 @@ const formatBytes = (bytes: number): string => {
   const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
   return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 };
+
+/**
+ * 左侧目录的分区
+ *
+ * ⚠️ 这些**不是 Tab**（不是切换页面），而是**锚点**：
+ * 右边始终是完整的一页，点它只是滚到对应位置。
+ * `key` 同时用作 `data-section` 的值，两边靠它对应。
+ */
+const TABS = [
+  { key: 'player', label: '播放' },
+  { key: 'ui', label: '界面' },
+  { key: 'common', label: '通用' },
+  { key: 'search', label: '搜索' },
+] as const;
+
+type TabKey = (typeof TABS)[number]['key']
 
 /**
  * 把滑块回调的值收敛成「范围内的步进倍数」
@@ -329,6 +544,45 @@ export default defineComponent({
       CACHE_EXPIRE_DAYS_MIN,
       CACHE_EXPIRE_DAYS_MAX,
       CACHE_EXPIRE_DAYS_STEP,
+      /** 搜索排序：时长容差的范围 */
+      DURATION_TOLERANCE_MIN,
+      DURATION_TOLERANCE_MAX,
+      MIN_SEARCH_RESULTS_MAX,
+      /** 左侧目录常量（模板里 v-for 用） */
+      TABS,
+      /**
+       * 当前高亮的分区
+       *
+       * ⚠️ 它跟着**滚动位置**走（见 `onContentScroll`），不是"最后点了谁" ——
+       * 否则用户自己滚到「搜索」时左栏还停在「播放」，看着像坏了。
+       */
+      activeTab: 'player' as TabKey,
+      /**
+       * 点击目录后正在「程序化滚动」的标记
+       *
+       * 平滑滚动期间会连续触发 `scroll` 事件，若不加标记，
+       * scroll spy 会一路把高亮改成途经的分区（点「搜索」会看到高亮
+       * 从播放→界面→通用→搜索 扫过去，很乱）。滚动结束后自动清掉。
+       */
+      scrollingTo: false as boolean,
+      /** 「等滚动停下」的 rAF 句柄（见 watchScrollSettle） */
+      _settleRaf: 0 as number,
+      /** 过滤关键词：输入框是否展开（点 + 才出现） */
+      filterInputVisible: false,
+      /** 过滤关键词输入框里正在打的字（回车才落到设置里） */
+      newFilterKeyword: '',
+      /**
+       * 关键词加权：**每一档各自的输入框状态**
+       *
+       * 键是分值（字符串，与 `player.tagBonus` 的键一致），值是 `{ visible, text }`。
+       * 用对象而不是「当前编辑哪一档」的单个变量：那样切档时上一档的半成品
+       * 内容会丢，而用户很可能一边看一边改。
+       */
+      tagInputs: {} as Record<string, { visible: boolean; text: string }>,
+      /** 新增分值档：输入框是否展开 */
+      tierInputVisible: false,
+      /** 新增分值档：输入的分值文本 */
+      newTierText: '',
     };
   },
   computed: {
@@ -349,6 +603,17 @@ export default defineComponent({
     cacheText(): string {
       const { count, bytes } = this.cacheStats;
       return `${count} 个视频 / ${formatBytes(bytes)}`;
+    },
+    /**
+     * 关键词加权表的分值档（**按数值降序**）
+     *
+     * 排序是为了让界面上的标签有个稳定顺序 —— 直接用 `Object.keys` 的话，
+     * 顺序取决于对象的插入顺序，用户改一次分值档位顺序就会跳。
+     */
+    tagBonusScores(): string[] {
+      return Object.keys(this.setting['player.tagBonus'] ?? {}).sort(
+        (a, b) => Number(b) - Number(a),
+      );
     },
     /**
      * 搜索结果过期时间：界面上的「天」
@@ -386,11 +651,33 @@ export default defineComponent({
   watch: {
     // 每次打开时刷新一次占用
     modelValue(visible: boolean) {
-      if (visible) void this.refreshCacheStats();
+      if (visible) {
+        void this.refreshCacheStats();
+        return;
+      }
+      /**
+       * 关弹窗时把「滚动停止检测」停掉
+       *
+       * ⚠️ 这个组件是**常驻挂载**的（`v-model` 而不是 `v-if`），
+       * 所以关弹窗不会触发 `beforeUnmount` —— 清理必须写在这里。
+       *
+       * `watchScrollSettle` 是个自我调度的 rAF 循环。用户点着左栏目录、
+       * 滚动还没停就关掉弹窗时，循环里读的是已经隐藏的容器，
+       * 虽然会自己跑到「连续 3 帧没变」而退出（不会真的泄漏），
+       * 但 `scrollingTo` 会停在 `true` —— 下次打开时 scroll spy 被它挡住不工作。
+       */
+      if (this._settleRaf) window.cancelAnimationFrame(this._settleRaf);
+      this._settleRaf = 0;
+      this.scrollingTo = false;
     },
   },
   mounted() {
     if (this.modelValue) void this.refreshCacheStats();
+  },
+  beforeUnmount() {
+    /** 组件真被销毁时（App 卸载）也兜一次，别留着 rAF */
+    if (this._settleRaf) window.cancelAnimationFrame(this._settleRaf);
+    this._settleRaf = 0;
   },
   methods: {
 
@@ -398,6 +685,123 @@ export default defineComponent({
     set<K extends keyof AppSetting>(key: K, value: AppSetting[K]): void {
       void this.store.update({ [key]: value } as Partial<AppSetting>);
     },
+
+    // #region 左侧目录（滚动定位 + scroll spy）
+    /**
+     * 点目录 → 平滑滚到对应分区
+     *
+     * ⚠️ 这里**刻意不用 `scrollIntoView`**，而是手算 `scrollTop`。
+     * （这段 JSDoc 以前写反了，说"用 scrollIntoView 而不是手算" —— 代码一直
+     * 都是手算，注释才是错的。）
+     *
+     * 为什么不用 `scrollIntoView`：它会把**所有可滚祖先**都滚一遍 ——
+     * 包括弹窗外面那层，结果整个对话框也跟着动，看着像页面在跳。
+     * 手算 `scrollTop` 只动这一个容器，行为可预期。
+     *
+     * 至于"分区高度会变、手算的偏移量会过期"那个顾虑：这里不是缓存偏移量，
+     * 而是**每次点击时现算**（`el.offsetTop - box.offsetTop`），
+     * 所以标签换行、输入框展开都不会让它失准。
+     */
+    scrollToSection(key: TabKey): void {
+      const box = this.$refs.content as HTMLElement | undefined;
+      if (!box) return;
+      const el = box.querySelector<HTMLElement>(`[data-section="${key}"]`);
+      if (!el) return;
+      /** 立刻点亮（不等滚动结束）—— 用户点了就该马上有反馈 */
+      this.activeTab = key;
+      this.scrollingTo = true;
+      /** 现算目标位置（不缓存）：分区高度会随标签换行 / 输入框展开而变 */
+      const top = el.offsetTop - box.offsetTop;
+      box.scrollTo({ top, behavior: 'smooth' });
+      this.watchScrollSettle(box);
+    },
+    /**
+     * 等「滚动真的停下来」再解除 `scrollingTo`
+     *
+     * ## ⚠️ 为什么不能用固定定时器（我第一版就是那么写的）
+     *
+     * 平滑滚动的**时长取决于距离**（滚 100px 和滚 2000px 差很多），
+     * 用一个写死的毫秒数必然两头不对：
+     *  - 定太短（如 420ms）→ 长距离还没滚完就解锁，
+     *    此时 scroll spy 会把高亮改成"途经的"分区 —— 用户点「搜索」会看到
+     *    高亮一路从 播放→界面→通用→搜索 扫过去；
+     *  - 定太长 → 用户点完立刻自己滚，高亮却不响应，像卡住了。
+     *
+     * ## ⚠️ 也不能只看「连续几帧没变」（第二版踩的坑）
+     *
+     * 平滑滚动**起步前**有几帧 `scrollTop` 是不动的（浏览器还没开始动画），
+     * 于是"连续 3 帧没变"会被**误判成已经停下** → 提前解锁 →
+     * 剩下的滚动就交给 scroll spy 了（实测：点「界面」只滚了 24px 就解锁，
+     * 高亮被改回「播放」）。
+     *
+     * 所以加一条前置条件：**必须先观察到"动过"**，或者等够一个保守帧数
+     * （防止目标就是当前位置、压根不会动的情况）。
+     */
+    watchScrollSettle(box: HTMLElement): void {
+      if (this._settleRaf) window.cancelAnimationFrame(this._settleRaf);
+      const start = box.scrollTop;
+      let last = start;
+      let still = 0;
+      let frames = 0;
+      let moved = false;
+      const tick = (): void => {
+        frames++;
+        const cur = box.scrollTop;
+        if (cur !== start) moved = true;
+        if (cur === last) {
+          still++;
+          /**
+           * 停下的判据：连续 3 帧没变，**且**「已经动过 或 等够了 15 帧」。
+           * 15 帧 ≈ 250ms，足够覆盖平滑滚动的起步延迟。
+           */
+          if (still >= 3 && (moved || frames >= 15)) {
+            this.scrollingTo = false;
+            this._settleRaf = 0;
+            return;
+          }
+        } else {
+          still = 0;
+          last = cur;
+        }
+        this._settleRaf = window.requestAnimationFrame(tick);
+      };
+      this._settleRaf = window.requestAnimationFrame(tick);
+    },
+    /**
+     * 内容区滚动 → 反向高亮左栏（scroll spy）
+     *
+     * 判据：**最后一个「顶部已经滚过内容区上沿」的分区**。
+     * 用「上沿」而不是「中心」是因为分区高度差别很大（搜索那栏很长），
+     * 按中心判会在长分区里长时间显示错的高亮。
+     */
+    onContentScroll(): void {
+      /** 程序化滚动期间不抢高亮（见 `scrollingTo` 的说明） */
+      if (this.scrollingTo) return;
+      const box = this.$refs.content as HTMLElement | undefined;
+      if (!box) return;
+      /**
+       * 留 8px 余量：分区标题刚好贴着上沿时也算「已经到这一区」，
+       * 否则滚到标题处高亮还停在上一个分区，差一点点很别扭。
+       */
+      const y = box.scrollTop + 8;
+      let current: TabKey = TABS[0].key;
+      for (const tab of TABS) {
+        const el = box.querySelector<HTMLElement>(`[data-section="${tab.key}"]`);
+        if (!el) continue;
+        if (el.offsetTop - box.offsetTop <= y) current = tab.key;
+      }
+      /**
+       * 滚到底时**强制点亮最后一个分区**
+       *
+       * 因为最后一个分区可能不够高，永远滚不到它的上沿（内容已经到底了），
+       * 于是高亮会卡在倒数第二个 —— 用户滚到底却看到高亮在上一栏，很怪。
+       */
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 2;
+      if (atBottom) current = TABS[TABS.length - 1].key;
+      this.activeTab = current;
+    },
+    // #endregion
+
     /**
      * 开关类控件
      *
@@ -509,6 +913,214 @@ export default defineComponent({
      *     步进/失焦时钳制），而超出上限的毫秒值没有意义；
      *  3. 取整：小数点后的「天」没有意义，还会让毫秒值变成小数。
      */
+    /**
+     * 数值类设置（搜索排序用的两个）
+     *
+     * 落盘前夹紧到合法范围：`el-input-number` 自己会夹，但用户手输时
+     * （清空、只留一位、粘贴一个大数）回调可能给 `undefined` 或越界值。
+     */
+    setNumber(
+      key: 'player.durationToleranceSec' | 'player.minSearchResults',
+      v: number | undefined,
+    ): void {
+      const n = Math.round(Number(v) || 0);
+      /** 降级阈值允许 0（= 从不降级），容差不允许 —— 0 容差等于把 MV 全砍掉 */
+      const min = key === 'player.minSearchResults' ? 0 : DURATION_TOLERANCE_MIN;
+      const max = key === 'player.minSearchResults' ? MIN_SEARCH_RESULTS_MAX : DURATION_TOLERANCE_MAX;
+      this.set(key, Math.min(max, Math.max(min, n)));
+    },
+    /**
+     * 展开过滤关键词的输入框（点 `+` 才出现）
+     *
+     * 为什么不像原来那样**常显**输入框：一屏里有两处关键词（加权 + 过滤），
+     * 每处都挂一个空输入框会让界面看起来很吵，而且用户多数时候是「来删词」不是「来加词」。
+     * 点 `+` 展开、回车提交、失焦收起 —— 和 `el-tag` 的交互是同一套。
+     */
+    openFilterInput(): void {
+      this.newFilterKeyword = '';
+      this.filterInputVisible = true;
+    },
+    /**
+     * 加一个过滤关键词
+     *
+     * 去重是必要的：重复词不会出错（`includes` 判断），但界面上会显示两个一样的标签，
+     * 用户会以为没加进去又点一次。
+     */
+    addFilterKeyword(): void {
+      const kw = this.newFilterKeyword.trim();
+      if (!kw) {
+        this.filterInputVisible = false;
+        return;
+      }
+      const list = [...(this.setting['player.filterKeywords'] ?? [])];
+      /**
+       * 去重按**归一化后**比较（小写、去空格）—— 用户输入「吉他谱」和「吉他谱 」
+       * 应该算同一个词，而 `includes` 判断本来就是归一化的，存两份没意义。
+       */
+      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, '');
+      if (!list.some((x) => norm(x) === norm(kw))) {
+        list.push(kw);
+        this.set('player.filterKeywords', list);
+      }
+      this.newFilterKeyword = '';
+      this.filterInputVisible = false;
+    },
+    removeFilterKeyword(index: number): void {
+      const list = [...(this.setting['player.filterKeywords'] ?? [])];
+      list.splice(index, 1);
+      this.set('player.filterKeywords', list);
+    },
+
+    // #region 关键词加权（每一档各自一个标签列表 + 各自的输入框）
+
+    /** 读某一档的关键词数组（拿不到就给空数组，模板里少写判空） */
+    tierKeywords(score: string): string[] {
+      return this.setting['player.tagBonus']?.[score] ?? [];
+    },
+    /** 展开某一档的输入框 */
+    openTagInput(score: string): void {
+      this.tagInputs = { ...this.tagInputs, [score]: { visible: true, text: '' } };
+    },
+    setTagInputText(score: string, text: string): void {
+      this.tagInputs = { ...this.tagInputs, [score]: { visible: true, text } };
+    },
+    closeTagInput(score: string): void {
+      const cur = this.tagInputs[score];
+      if (!cur) return;
+      this.tagInputs = { ...this.tagInputs, [score]: { visible: false, text: '' } };
+    },
+    /**
+     * 给某一档加一个关键词
+     *
+     * ## ⚠️ 整个对象必须换新引用再落盘
+     *
+     * `updateSetting` 对嵌套对象是**整体替换**语义（见 `main/utils/setting.ts`）：
+     * 原地改 `this.setting['player.tagBonus'][score]` 不会触发写入 ——
+     * 引用没变，主进程那边的深比较也看不出差异，表现就是「改了没反应」。
+     */
+    addTagBonusKeyword(score: string): void {
+      const text = (this.tagInputs[score]?.text ?? '').trim();
+      const next = { ...(this.setting['player.tagBonus'] ?? {}) };
+      const list = [...(next[score] ?? [])];
+      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, '');
+      if (text && !list.some((x) => norm(x) === norm(text))) {
+        list.push(text);
+        next[score] = list;
+        this.set('player.tagBonus', next);
+      }
+      this.closeTagInput(score);
+    },
+    removeTagBonusKeyword(score: string, index: number): void {
+      const next = { ...(this.setting['player.tagBonus'] ?? {}) };
+      const list = [...(next[score] ?? [])];
+      list.splice(index, 1);
+      next[score] = list;
+      this.set('player.tagBonus', next);
+    },
+    /** 展开「新增分值档」输入框 */
+    openTierInput(): void {
+      this.newTierText = '';
+      this.tierInputVisible = true;
+    },
+    cancelTierInput(): void {
+      this.tierInputVisible = false;
+      this.newTierText = '';
+    },
+    /**
+     * 新增一个分值档（如 `-8`）
+     *
+     * 校验：必须是整数、不能是已存在的档。
+     *
+     * ⚠️ **没有分值范围限制**（这里去掉过）—— 关键词加权现在不再被 clamp，
+     * 用户想给「伴奏」配 `-50` 是完全合理的（比 `-4` 档更重地压下去）。
+     * 早先限制 ±10 是因为打分侧会把加权夹在 ±10 内，超出无意义；
+     * 那个 clamp 已经取消了，所以这里的限制也一起去掉。
+     */
+    addTier(): void {
+      const raw = this.newTierText.trim();
+      const n = Number(raw);
+      if (!raw || !Number.isFinite(n) || !Number.isInteger(n)) {
+        ElMessage.warning('请输入一个整数分值，例如 -5');
+        return;
+      }
+      const key = String(n);
+      const next = { ...(this.setting['player.tagBonus'] ?? {}) };
+      if (key in next) {
+        ElMessage.warning(`分值 ${key} 已经存在了`);
+        return;
+      }
+      next[key] = [];
+      this.set('player.tagBonus', next);
+      this.cancelTierInput();
+    },
+    /**
+     * 把一整档分值**加 1 / 减 1**（←/→ 按钮或键盘左右箭头）
+     *
+     * ## 为什么要改键名而不是改数值
+     *
+     * `player.tagBonus` 的**键就是分值**（`{ "5": [...], "-2": [...] }`），
+     * 所以「把 +5 档改成 +6」= 把键 `"5"` 换成 `"6"`，**关键词跟着搬过去**。
+     *
+     * ## 撞到已存在的档就不动
+     *
+     * 已经有 `+6` 档时再按 →，两档会**合并**（关键词全并进 +6）——
+     * 那是**丢信息**的（用户本来分了两档不同权重）。这里直接拒绝并提示，
+     * 让他先删掉或改名，比悄悄合并不知不觉改变打分结果安全。
+     *
+     * @param score 当前分值（字符串键）
+     * @param delta `+1` 或 `-1`
+     */
+    shiftTagBonusScore(score: string, delta: number): void {
+      const from = Number(score);
+      if (!Number.isFinite(from)) return;
+      const to = from + delta;
+      const toKey = String(to);
+      if (toKey === score) return;
+      const next = { ...(this.setting['player.tagBonus'] ?? {}) };
+      if (toKey in next) {
+        ElMessage.warning(`已经有 ${to > 0 ? '+' : ''}${to} 这一档了`);
+        return;
+      }
+      /**
+       * 重建对象时要**保持键的顺序**（`tagBonusScores` 依赖键序）
+       *
+       * 直接把新键塞到最后会让这一档在界面上**跳到最后一行** ——
+       * 用户按一下 → 就往下一行跳，很别扭。
+       * 所以按当前显示顺序重建，把新键放在**原位置**。
+       */
+      const rebuilt: Record<string, string[]> = {};
+      for (const key of this.tagBonusScores) {
+        if (key === score) rebuilt[toKey] = next[score] ?? [];
+        else rebuilt[key] = next[key] ?? [];
+      }
+      this.set('player.tagBonus', rebuilt);
+
+      /** 输入框的临时状态也跟着搬（否则用户正在输的那半截字会丢） */
+      if (this.tagInputs[score]) {
+        const moved = { ...this.tagInputs };
+        moved[toKey] = moved[score];
+        delete moved[score];
+        this.tagInputs = moved;
+      }
+    },
+    /** 删掉一整档分值（连同它的关键词） */
+    removeTagBonus(score: string): void {
+      const next = { ...(this.setting['player.tagBonus'] ?? {}) };
+      delete next[score];
+      this.set('player.tagBonus', next);
+      /**
+       * 顺手清掉这一档的输入框状态
+       *
+       * `tagInputs` 是按分值键的对象，删档后那个键就没人再读了 ——
+       * 不清的话它会一直留着（虽然只有几十字节，但属于「删了还在」的那种脏状态，
+       * 而且如果用户再加一个同分值的档，会看到上次残留的半成品文字）。
+       */
+      if (this.tagInputs[score]) {
+        const cleaned = { ...this.tagInputs };
+        delete cleaned[score];
+        this.tagInputs = cleaned;
+      }
+    },
     setExpireDays(v: number | undefined): void {
       const days = Math.round(Number(v) || 0);
       const clamped = Math.min(CACHE_EXPIRE_DAYS_MAX, Math.max(CACHE_EXPIRE_DAYS_MIN, days));
@@ -566,9 +1178,70 @@ export default defineComponent({
 </script>
 
 <style scoped>
+/*
+ * 主体：左侧目录 + 右侧一页到底
+ *
+ * ## ⚠️ 为什么必须显式写 `overflow-x: hidden`（修掉横向滚动条）
+ *
+ * 只写 `overflow-y: auto` 是**不够**的：按 CSS 规范，当 `overflow-y` 是 `auto`
+ * 而 `overflow-x` 还是默认的 `visible` 时，浏览器会把 `overflow-x` **计算成 `auto`**
+ * （不能出现"一个方向滚动、另一个方向溢出到外面"的组合）。
+ * 于是只要有任何一个子元素比容器宽（长标签、`white-space: nowrap` 的说明文字），
+ * 底部就会冒出一条横向滚动条。
+ *
+ * ## ⚠️ 滚动条挂在 `.st-content` 上，不是 `.st-body`
+ *
+ * 因为左栏要**跟着内容滚**吗？不是 —— 左栏要**固定**（它是指南针）。
+ * 所以滚动容器是右边那一栏，左栏在容器外，天然不跟着滚。
+ * 这也顺带解决了一个问题：滚动条不会压在左栏旁边，视觉上"不分家"。
+ */
 .st-body {
-  max-height: 62vh;
+  display: flex;
+  /* 左栏和内容之间只留间距，**没有分隔线**（用户要的是"分栏不分家"） */
+  gap: 6px;
+  height: 62vh;
+}
+/* 左侧目录 */
+.st-nav {
+  flex: none;
+  width: 76px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* 顶部留一点，和右边第一个分组标题对齐 */
+  padding-top: 2px;
+}
+.st-nav-item {
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  /* 未选中时淡一点，选中项才突出 */
+  opacity: 0.6;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
+  user-select: none;
+}
+.st-nav-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  opacity: 1;
+}
+.st-nav-item.is-active {
+  background: rgba(255, 255, 255, 0.14);
+  opacity: 1;
+  font-weight: 500;
+}
+/*
+ * 右侧内容：**滚动容器**
+ *
+ * `min-width: 0` 让它能被压缩（flex 子项默认 `min-width: auto` 会拒绝收缩，
+ * 长内容就会顶宽整个弹窗，那是横向溢出的另一半原因）。
+ */
+.st-content {
+  flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+  /* 给滚动条留一点空隙，免得贴着文字 */
   padding-right: 4px;
 }
 .st-group {
@@ -581,6 +1254,21 @@ export default defineComponent({
   margin-bottom: 6px;
   padding-left: 2px;
 }
+/*
+ * 分组内的小标题（「关键词加权」「过滤关键词」）
+ *
+ * 比 `st-group-title` 低一级：它是**同一页里的子块**，不该和分类标题抢视觉层级。
+ */
+.st-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 2px;
+  padding-left: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.8;
+}
 .st-row {
   display: flex;
   align-items: center;
@@ -589,23 +1277,109 @@ export default defineComponent({
   padding: 9px 2px;
   border-bottom: 1px solid var(--panel-divider);
 }
+/* 标签行要**顶对齐**：标签可能换行，居中会让左标题浮在中间很怪 */
+.st-row--tags {
+  align-items: flex-start;
+}
 .st-row:last-child {
   border-bottom: none;
 }
 .st-name {
   font-size: 13px;
+  flex: none;
 }
-/* 只有「搜索缓存」那一行用它显示占用体积，属于数据不是说明 */
+/* 分值 + 删除按钮横排的那一列 */
+.st-name--score {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 118px;
+}
+/*
+ * ←/→ 加减分按钮
+ *
+ * 用 `text` 型按钮（无边框）＋ 紧凑内边距，让它像一个可点的箭头而不是"按钮"——
+ * 这一列已经有「删除」，三个按钮都做成方块会很挤。
+ */
+.st-score-btn {
+  padding: 0 2px !important;
+  min-width: 16px !important;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.7;
+}
+.st-score-btn:hover {
+  opacity: 1;
+}
+/*
+ * 分值本身
+ *
+ * 定宽 + 等宽数字：从 `+9` 变到 `+10` 时宽度不变，右边的 `→` 不会左右跳。
+ * `tabindex` 让它可聚焦（键盘 ←/→ 也能调分）。
+ */
+.st-score {
+  display: inline-block;
+  min-width: 30px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+  border-radius: 3px;
+  outline: none;
+}
+.st-score:focus-visible {
+  box-shadow: 0 0 0 2px var(--el-color-primary-light-5);
+}
+.st-score-pos {
+  color: #67c23a;
+  font-variant-numeric: tabular-nums;
+}
+.st-score-neg {
+  color: #f56c6c;
+  font-variant-numeric: tabular-nums;
+}
+/*
+ * 说明文字
+ *
+ * 去掉 `white-space: nowrap`：那是横向溢出的主要来源之一
+ * （「秒（MV / Live 自动放宽）」这类文字一长就把行顶宽）。
+ */
 .st-desc {
   font-size: 11px;
   opacity: 0.55;
-  white-space: nowrap;
 }
 .st-actions {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex: none;
+  /* 允许收缩：否则输入框 + 说明文字的固定宽度会把行撑破 */
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-end;
+}
+/*
+ * 标签容器：**自动换行**
+ *
+ * 这是修掉横向滚动条的关键 —— 标签多了就往下排，而不是一直往右顶。
+ */
+.st-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+/* 标签添加输入框：窄一点，免得占满整行 */
+.st-tag-input {
+  width: 100px;
+}
+/* 「+」按钮：做成小方块，和标签同一视觉重量 */
+.st-add {
+  width: 24px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
 }
 /* 颜色行：前面是 16 进制输入框，后面是取色盘 */
 .st-color-box {

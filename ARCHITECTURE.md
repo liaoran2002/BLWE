@@ -40,8 +40,9 @@
 │   │   ├── rendererIpc.ts          #   渲染进程（preload）侧类型化 IPC 包装
 │   │   └── utils/
 │   │       ├── migrateSetting.ts   #   配置版本迁移（版本闸门逐级抬升）
-│   │       ├── mergeSetting.ts     #   默认值 + 用户值合并，并算出变化的 key
-│   │       ├── videoRank.ts        #   ★ 候选视频打分排序（主进程写 ord 前调用）
+│   │       ├── mergeSetting.ts     #   默认值 + 用户值合并，并算出变化的 key（含类型校验）
+│   │       ├── duration.ts         #   时长归一化（"4:03" / 秒 / 脏数据 → 秒）
+│   │       ├── videoRank.ts        #   ★ 硬过滤 + 分层打分 + 排序（主进程写 ord 前调用）
 │   │       └── common.ts           #   compareVer / debounce
 │   ├── main/
 │   │   ├── index.ts                # 入口：便携模式 → 初始化配置/歌单 → 注册 IPC → 建窗口
@@ -63,10 +64,11 @@
 │   │   ├── utils/
 │   │   │   ├── setting.ts          # ★ 配置服务：内存常驻 + 防抖落盘 + 变更通知
 │   │   │   ├── playlist.ts         # ★ 歌单集合服务：迁移 / 增删改 / 同步 / 收藏
+│   │   │   ├── db.ts               # ★ SQLite 单库 schema（4 表 + 1 视图 + schema 指纹）
 │   │   │   ├── store.ts            # 原子写入的 JSON 存储
 │   │   │   ├── atomicJson.ts       # 公共的「temp + rename」原子写
-│   │   │   ├── cache.ts            # 搜索缓存（文件名 = 关键词 md5）
-│   │   │   └── quality.ts          # ★ 读出「实际在播」的档位（dash 靠 URL 比对、durl 从 URL 反推）ants）
+│   │   │   ├── cache.ts            # ★ 搜索缓存（存 SQLite，按 ord 拼回列表）
+│   │   │   └── quality.ts          # ★ 读出「实际在播」的档位（dash 靠 URL 比对、durl 从 URL 反推）
 │   │   └── ipc/                    # 按领域拆分的 handler：app / auth / window / wallpaper /
 │   │                               #   tray / setting / playlist / cache / music / biliApi
 │   ├── preload/
@@ -81,12 +83,13 @@
 │   ├── api/electron.ts             # 直接透出 window.electronAPI（已带类型）
 │   ├── assets/                     # 图标字体 + 头像（avatar.jpg / avatar-fish.jpg）
 │   ├── trayMenu/main.ts            # ★ 自绘托盘菜单页逻辑（独立窗口 / 独立构建入口）
-│   ├── types/app.ts                # 组件数据类型
+│   ├── types/app.ts                # 组件数据类型（AppData 等）
 │   ├── utils/
 │   │   ├── dashPlayer.ts           # ★ MSE（dash）分片调度
 │   │   ├── videoQuality.ts         # 按解码分辨率兜底一个清晰度标签
 │   │   ├── image.ts                # 图片地址规整
 │   │   ├── plain.ts                # 去响应式（写盘前）
+│   │   ├── title.ts                # 窗口标题拼装
 │   │   └── uiTheme.ts              # 主题令牌（颜色/模糊/阴影）
 │   └── components/
 │       ├── PlaylistPanel.vue       # ★ 左上歌单入口（点一下直接开管理弹窗）
@@ -1190,7 +1193,8 @@ targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
 ### 数据存储（SQLite）
 
 > **⚠️ 字段仍在调整中** —— 这份 schema 是当前实现，用户（本人）后续还要再看一遍字段设计。
-> 改字段时记得同步这一节，并把 `db.ts` 的 `SCHEMA_VERSION` +1。
+> 改字段时**不需要**手动升版本号：`user_version` 存的是建表语句的**哈希指纹**（见下），
+> 改了 `CREATE_TABLES_SQL` 指纹就变，重启即自动重建。但记得同步这一节。
 
 数据层是 **SQLite 单库**（`better-sqlite3`），库文件在 `userData/blmv.db`，
 连接 / 建表 / 事务都在 `electron/main/utils/db.ts`。
@@ -1200,38 +1204,57 @@ targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
 还要靠「读-改-写整个文件」来做部分更新 —— 而这些正是 SQLite 一句话能解决的事。
 换掉之后最直接的收益是**过期语义能落到字段级**（只清播放地址，见下）。
 
-**四张表 + 一个视图**（`SCHEMA_VERSION = 4`，用 `PRAGMA user_version` 当闸门）：
+**五张表 + 一个视图 + 三个索引**（用 `PRAGMA user_version` 存**建表语句的哈希指纹**当闸门）：
 
 ```sql
 -- 歌单
-CREATE TABLE playlists (
+--
+-- id = 平台_平台歌单id（如 tx_8153225605），**不是随机 UUID** ——
+-- 这样同一个歌单重复导入会自然命中同一行，而不是攒出一堆副本。
+-- 手动新建（没有分享链接）的歌单没有平台 id，那时用 pl_<uuid> 兜底。
+CREATE TABLE IF NOT EXISTS playlists (
   id               TEXT PRIMARY KEY,
   name             TEXT    NOT NULL,
-  source           TEXT,              -- 音源（wy / tx / kw）
-  source_url       TEXT,              -- 歌单分享链接；自动同步靠它重新解析
+  url              TEXT,              -- 歌单分享链接；自动同步靠它重新解析（原 source_url）
   sync_mode        TEXT    NOT NULL DEFAULT 'off',   -- off | startup | interval
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at     INTEGER,
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
-  last_index       INTEGER NOT NULL DEFAULT 0        -- 上次播到第几首
+  last_index       INTEGER NOT NULL DEFAULT 0        -- 上次播到第几首（**下标**，见下）
 );
 
--- 歌单里的曲目（按 ord 排序）
-CREATE TABLE playlist_songs (
-  playlist_id TEXT    NOT NULL,
-  ord         INTEGER NOT NULL,
+-- 歌曲实体（**全局唯一**，与歌单无关）
+--
+-- 同一首歌在 2 个歌单 = songs 表 **1 行** + playlist_songs **2 行**。
+-- id = 平台_平台歌曲id（如 tx_1828354）；手动添加的歌退化成 歌名-歌手。
+--
+-- ⚠️ 它**只在这里用**。videos.search_key / song_meta.search_key 存的是**歌名**
+-- （歌名-歌手）—— 那些表要拿键去搜 B 站，用 id 搜不出任何东西。
+-- ⚠️ **没有 source / platform_id 两列**：两者都编码在 id 前缀里。
+CREATE TABLE IF NOT EXISTS songs (
+  id          TEXT PRIMARY KEY,
   name        TEXT    NOT NULL,
   singer      TEXT    NOT NULL DEFAULT '',
   album       TEXT,
   cover       TEXT,
-  duration    INTEGER,               -- ★ 秒（原为音乐平台原样给的 "4:03" 字符串）
+  duration    INTEGER               -- ★ 秒（原为音乐平台原样给的 "4:03" 字符串）
+);
+
+-- 歌单 ⨯ 歌曲 的**成员关系 + 顺序**（不存曲目信息）
+CREATE TABLE IF NOT EXISTS playlist_songs (
+  playlist_id TEXT    NOT NULL,
+  ord         INTEGER NOT NULL,
+  song_id     TEXT    NOT NULL,      -- 指向 songs.id
   PRIMARY KEY (playlist_id, ord)
 );
 
--- 每首歌的候选视频 = 搜索结果 + 收藏 + 顺序 + 解析结果（★ v2 起合表）
-CREATE TABLE videos (
-  search_key     TEXT    NOT NULL,   -- "歌名-歌手"（toSearchKey）
+-- 按 song_id 反查歌单（「这首歌在哪些歌单里」）
+CREATE INDEX IF NOT EXISTS idx_playlist_songs_song ON playlist_songs(song_id);
+
+-- 每首歌的候选视频 = 搜索结果 + 收藏 + 顺序 + 解析结果
+CREATE TABLE IF NOT EXISTS videos (
+  search_key     TEXT    NOT NULL,   -- ★ "歌名-歌手"，**不是 songs.id**
   bvid           TEXT    NOT NULL,
   ord            INTEGER NOT NULL DEFAULT 0,  -- 顺序权威（0 起连续）
   title          TEXT,               -- 来自【搜索结果】：含 <em class="keyword"> 高亮
@@ -1255,22 +1278,164 @@ CREATE TABLE videos (
 );
 
 -- 每首歌的元信息
-CREATE TABLE song_meta (
+CREATE TABLE IF NOT EXISTS song_meta (
   search_key         TEXT PRIMARY KEY,
   selected_bvid      TEXT,           -- 这首歌上次播的是哪个视频
   search_login_state INTEGER,        -- ★ 这份【搜索结果】取时的登录态：0/1/NULL(未知)
   updated_at         INTEGER NOT NULL
 );
 
-CREATE INDEX idx_videos_key_ord ON videos(search_key, ord);
-CREATE INDEX idx_videos_playurl_at ON videos(playurl_at);
+CREATE INDEX IF NOT EXISTS idx_videos_key_ord ON videos(search_key, ord);
+CREATE INDEX IF NOT EXISTS idx_videos_playurl_at ON videos(playurl_at);
 
 -- ★ 元数据视图：不含任何地址列
-CREATE VIEW videos_meta AS
+CREATE VIEW IF NOT EXISTS videos_meta AS
   SELECT search_key, bvid, ord, title, pic, author, duration, favorites,
          playurl_login_state, dash_tried, playurl_at
     FROM videos;
 ```
+
+> **⚠️ `CREATE_TABLES_SQL` 里绝对不能出现反引号**
+>
+> 上面那段 SQL 是**模板字符串**，而在 SQL 注释里用反引号包标识符（`` `bvid` ``）
+> 会**提前终止字符串**，于是后面所有 SQL 都变成 JS 代码 → 一串
+> `TS1005` / `TS1443` 语法错误，而报错行指向 SQL 中间，
+> **完全看不出根因是"注释里多了个反引号"**。
+>
+> `db.ts` 里有一条**模块求值阶段**的自检断言（`includes('\u0060')` 就 throw），
+> 就是为了让后来者一眼看到真正的原因。这个错作者犯过三次，所以用代码根治。
+
+**★ 为什么把 `songs` 与 `playlist_songs` 拆开**
+
+原来曲目信息直接塞在 `playlist_songs` 里，于是**同一首歌在 2 个歌单就存 2 份**
+（歌名 / 歌手 / 专辑 / 封面 / 时长全重复一遍）。现在拆成两张表：
+
+| 表 | 存什么 | 同一首歌在两个歌单里 |
+| --- | --- | --- |
+| `songs` | 曲目**实体**（歌名/歌手/专辑/封面/时长） | **只有 1 行** |
+| `playlist_songs` | `(playlist_id, ord, song_id)` —— 只存「哪个歌单的第几位是它」 | 2 行 |
+
+顺带解决「改一次歌名要改多处」：信息只有一份来源，不会出现 A 歌单显示旧名、
+B 歌单显示新名。
+
+**代价是写库变复杂了** —— `writePlaylistsToDb` 不能无脑 `DELETE FROM songs`：
+那张表是**全局共享**的，而这里保存的是「歌单集合」，无脑清会把**别的歌单引用的曲目**
+一起删掉（关系表还有记录、实体没了 → 读的时候全是悬空引用 → 曲目整片消失）。
+
+所以它这么做：
+
+```ts
+// ① 曲目实体用 upsert：同一个 id 可能被多个歌单引用，第二次遇到就覆盖
+INSERT INTO songs (...) VALUES (...)
+  ON CONFLICT(id) DO UPDATE SET name = excluded.name, singer = excluded.singer, ...
+
+// ② 记下本次保存用到的全部 song id
+keepIds.add(id)
+
+// ③ 最后只删「没人再引用」的那些
+if (keepIds.size === 0) {
+  DELETE FROM songs                              // 歌单全删了就整体清空
+} else {
+  DELETE FROM songs WHERE id NOT IN (?, ?, ...)  // 一条语句，而不是逐个 DELETE
+}
+```
+
+> 为什么用 `NOT IN (...)` 而不是「查出来逐个比对」：`keepIds` 可能上千个，
+> 逐个 `DELETE` 就是上千次语句执行。这里只有一条语句。
+>
+> `keepIds` 为空时 `NOT IN ()` 是**语法错误**，所以那种情况（歌单全删了）
+> 单独走 `DELETE FROM songs` 全清分支。
+
+实测验证过（19 项断言全过）：两歌单共有 1 首歌时 `songs` 表 3 行 / 关系表 4 行；
+删掉一个歌单后，**只有它独有的歌被清掉、共用的那首保留**。
+
+**★ `songs.id = 平台_平台id`（`songId()`），但它只用于 `songs` 表**
+
+- `songs.id` → `tx_1828354`（有平台 id 时）/ `手写的歌-某人`（手动添加、没有平台 id 时退化）
+- 带音源前缀是**必须的**：各平台 id 空间独立，QQ 的 `123` 和酷我的 `123` 是两首不同的歌
+- **`videos.search_key` / `song_meta.search_key` 存的是「歌名-歌手」**，不是这个 id ——
+  因为那些表要拿键**去 B 站搜索**（`-` 会被换成空格），用 `tx_101104624` 搜不出任何东西
+
+```
+songs.id          tx_1828354              ← 只在 songs 表内部标识「同一首歌」
+videos.search_key 泪海-许茹芸               ← 拿去搜 B 站、当缓存主键
+```
+
+两张表**各用各的键**，这是刻意的。
+
+> 踩过的坑（代价很大）：曾经把 `videos.search_key` 也改成平台 id，
+> 于是搜索词变成 `《tx_101104624》歌曲`、分层打分也拿它比对标题 →
+> **所有结果全被当"标题不含歌名"挡掉**（日志表现为 `取回231 → 过滤0`）。
+> 平台 id 是给数据库用的，不是给人搜的。
+
+**★ `playlists.id = 平台_平台歌单id`（`playlistKey()`）**
+
+| 场景 | id | 说明 |
+| --- | --- | --- |
+| 有分享链接 | `tx_8153225605` | 重复导入同一歌单**命中同一行**，不会攒副本 |
+| 手动新建（无链接） | `pl_<uuid>` | 没有平台 id 可拼，只能兜底 |
+
+`source` **不再单独存列** —— 从 id 前缀反推（`sourceOfSongId()`），
+不可能出现「id 是 `tx_` 但 `source` 写了 `wy`」这种自相矛盾。
+
+> ⚠️ 反推时**只认 wy / tx / kw / kg 这几个已知音源**，前缀不认识就返回 `null`。
+> 否则 `pl_xxx` 会被解析成音源 `pl` —— 那是个不存在的平台，下游拿去用会静默出错。
+
+**★ schema 闸门是「哈希指纹」，不是手写的版本号**
+
+`PRAGMA user_version` 里存的是 `sha256(CREATE_TABLES_SQL).readUInt32BE(0) & 0x7fffffff`。
+
+原来靠手写的 `SCHEMA_VERSION` 常量当闸门：改表结构就得手动 +1，**忘了 +1**
+就会出现「旧库带着旧列结构跑起来、然后在某个查询上报错」—— 而那是**运行时才炸**
+的错，最难查。改成指纹之后：
+
+- `CREATE_TABLES_SQL` 有一个字符变了指纹就变 → 自动重建；
+- **忘了"升版本"这件事不可能再发生**（根本没有版本号要维护）；
+- 开发阶段反复改 schema 不用管版本，改完重启就生效。
+
+代价是**每次改 schema 都会清库**（开发期无所谓）。指纹不匹配时的处理是
+**丢弃重建**，绝不写逐字段迁移 —— 理由：本项目只有一个用户、数据层从未发布过，
+「升级」只发生在开发机上；而逐字段搬运要处理「旧列可能不存在 / 类型变了 /
+JSON 要重新拆成列」三种情况，出错面远大于丢掉重来。
+
+> **副作用要说清楚**：重建会清空**收藏、顺序、选中视频，以及歌单本身**。
+> 要保留就得自己先备份 `blmv.db`。
+
+> ⚠️ **DROP 列表必须是动态的，不能手写**
+>
+> 手写清单会**漂移**：删掉一个功能时很容易忘了把它从 DROP 列表里去去掉
+> （或者反过来 —— 新表忘了加）。**踩过**：歌词功能整体移除后，`lyrics` /
+> `subtitles` 两张表从建表语句里删了，但 DROP 列表里没有它们，于是
+> **每次指纹不匹配重建时都清不掉**，一直留在库里当垃圾。
+>
+> 现在改成「查 `sqlite_master` 拿全部表名再逐个 drop」：
+>
+> ```sql
+> SELECT type, name FROM sqlite_master
+>  WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+>  ORDER BY type DESC   -- 视图先于表：表被删后视图就悬空了，SQLite 不会自动清
+> ```
+>
+> `sqlite_%` 开头的（`sqlite_sequence` / `sqlite_stat1`）是 SQLite 自己维护的，
+> **绝不能 drop**。实测清掉了 10 个旧表/视图（含那两个删歌词时漏掉的残留）。
+
+**★ `last_index` 是下标，但同步时会「按歌重算」**
+
+`last_index` 存的是**下标**（不是「哪首歌的 id」）。下标本身是脆弱的：
+歌单重新同步后曲目会增删，第 110 个位置可能已经是**另一首歌**了 ——
+用户续播会听到莫名其妙的东西。
+
+所以 `syncPlaylist` 在同步时会**把它重算成新列表里的位置**（此刻旧列表和新列表
+都在手上，正是做这件事的时机）：
+
+```
+① 那首歌还在    → 用它的新下标（位置可能变了）
+② 那首歌被删了  → 保留原下标并夹进范围（效果是「下一首顶上来」——
+                 播放器的标准行为；干瞪眼或跳回第一首都不如它合理）
+③ 旧列表本来为空 → 0
+```
+
+匹配用 `songId` 而不是歌名 —— 同步可能同时改了歌名。
 
 **为什么只有一个视图，而且它必须是「元数据」那个**
 
@@ -1386,44 +1551,377 @@ COMMIT;
 
 **排序在写库之前做 —— `ord` 就是最终显示顺序**
 
-打分排序（`matchScore` / `nameBonus` / `tagBonus`）原来住在渲染层的
-`sortSearchedVideos()`，而主进程写 `ord` 时只按「收藏 + B 站返回顺序」，于是
-**界面顺序和库里顺序是两套**：
+排序原来住在渲染层的 `sortSearchedVideos()`，而主进程写 `ord` 时只按
+「收藏 + B 站返回顺序」，于是**界面顺序和库里顺序是两套**：
 
 | | 之前 | 现在 |
 | --- | --- | --- |
-| 库里的 `videos.ord` | 收藏 + 其余按**B 站顺序** | 收藏 + 其余按**打分排序** |
+| 库里的 `videos.ord` | 收藏 + 其余按**B 站顺序** | 收藏 + 其余按**过滤 + 打分排序** |
 | 界面显示 | 收藏 + 其余按**打分排序**（渲染层再排一次） | 直接照用 `ord`，**不再排序** |
 
 两套顺序的危害不只是「看着不一致」：任何**依赖持久化顺序**的用法都会在刷新后失效，
 因为库里的那份顺序根本没被排序影响过。
 
-修法是把打分抽到 **`electron/common/utils/videoRank.ts`**（主 / 渲染共用一份），
+修法是把这套逻辑抽到 **`electron/common/utils/videoRank.ts`**（主 / 渲染共用一份），
 由 `api:searchSong` 在 **`cacheManager.save()` 之前**调用：
 
 ```ts
 const merged = await mergeWithFavorites(freshItems, oldRows)
 // ★ 必须在 save 之前：save 是按数组下标写 ord 的
-const ordered = sortByRelevance(merged, keyword, getSetting()['player.tagBonus'])
-if (cacheEnabled()) await cacheManager.save(keyword, { ...result, data: { ...result.data, result: ordered } })
-return { data: { ...result.data, result: ordered } }
+const finalList = rankVideos(merged, {
+  // ★ song / singer 是**两个独立入参**（不是 "歌名-歌手" 拼串）
+  song: songName,
+  singer: singerName,
+  songDurationSec: findSongDuration(searchKey),
+  tagBonus: getSetting()['player.tagBonus'],
+  filterKeywords: getSetting()['player.filterKeywords'],
+  durationToleranceSec: getSetting()['player.durationToleranceSec'],
+  // 与「取结果时」用同一套时长上限（降级轮放宽过，这里要跟着放宽）
+  relaxUpperBound: relaxedBound,
+})
+if (cacheEnabled()) await cacheManager.save(searchKey, { ...result, data: { ...result.data, result: finalList } })
+return { data: { ...result.data, result: finalList } }
 ```
+
+> **★ `RankOptions` 收的是 `song` + `singer` 两个独立字段，不是一个拼串**
+>
+> 早先是 `searchKey: "歌名-歌手"`，用的时候再 `splitSearchKey()` 拆开 ——
+> 那是「先合并再拆开」的多余往返：
+>
+> - 歌名和歌手本来就是**两个独立字段**（歌单里、界面上都分开存）；
+> - 而拼串**天生有歧义** —— 歌名本身可能含 `-`
+>   （`下坠Falling` / `R.` / `若是明仔载`），按 `-` 切会切错。
+>
+> 现在 `splitSearchKey()` **只用于解析旧 JSON 数据**（`playlists.json` 里
+> 遗留的 `"歌名-歌手"` 字符串），**搜索链路里不再调用它**。
+>
+> 同理 `scoreVideo()` 也**不再需要 `song` 参数** —— 硬过滤已经保证标题含歌名了，
+> 在那里再判一次「歌名命中」永远是 true，没有信息量。
 
 - **为什么抽成共享模块而不是在主进程重写一份**：两处各写一份必然漂移，
   而它的返回值直接决定用户看到什么。
 - **为什么渲染层保留一个恒等的 `sortSearchedVideos()` 而不是删掉**：
   调用点分布在续播 / 预热 / 重试等 6 处，逐个删容易漏；恒等之后行为立刻正确。
-  （`matchScore` / `nameBonus` / `tagBonus` / `tagBonusConfig` 已从渲染层删除。）
+  （`matchScore` / `nameBonus` / `tagBonus` 三个旧函数已从渲染层删除。）
 - **`Array.prototype.sort` 是稳定排序**，所以同分候选保持 B 站返回顺序，不会被随机打乱。
 
-实测（用真实源文件转译后跑）：
+### 排序方案（现行）：硬过滤 → 歌手断层 → 关键词细分
+
+**一句话**：标题里的歌名必须**独立出现**，时长必须对得上；**歌手名命中给 +100 断层分**，
+之后按用户配的关键词加权细分；找不到就降级换搜索词。
+
+**① 硬过滤**（三条，任一命中直接丢）
+
+| 规则 | 说明 |
+| --- | --- |
+| 标题里歌名**没有独立出现** | 见下面「歌名必须独立出现」一节 —— 这是本方案最讲究的一条 |
+| 时长超出容差 | 下限 `max(时长−容差, 时长×0.5)`、上限 `时长+容差`。标题含 `MV/官方/Live/现场` 时上限放宽 **×1.7**（那些版本带前奏画面/片尾，用同一套容差会误杀真的官方 MV）。歌曲时长未知、或视频时长解析不出 → **不过滤**（不因缺数据误杀） |
+| 命中过滤关键词 | 默认是一组谱类/演奏类词（吉他谱、钢琴谱、指弹、口琴……），命中即丢 |
+
+**歌名必须独立出现**（`titleHasSongName()` —— 本方案最讲究的一条）
+
+简单判「标题含歌名」会放进**别的歌**（实测踩过）：
 
 ```
-输入: A(某歌 翻唱) | B(某歌 Official MV) | C(不相干,收藏) | D(某歌 Live) | E(某歌-歌手 官方)
-输出: C → E → B → D → A
-      收藏置顶 ✅  最相关(E) 居首 ✅  官方MV 先于 Live ✅  被降权的翻唱垫底 ✅
-同分稳定性: X1 → X2 → X3 ✅（保持原顺序）
+搜「童话」→ 放进《童话镇》             ← 不是同一首歌
+搜「旧」  → 放进《红颜旧》《旧梦一场》  ← 不是同一首歌
 ```
+
+因为「童话」在「童话镇」里只是**词的一部分**。所以规则是：
+
+| # | 规则 | 说明 |
+| --- | --- | --- |
+| 1 | 标题里有 `《…》` / `〈…〉`，任一段**等于**歌名 | **通过**（书名号指向的就是它）|
+| 1' | 书名号**不匹配** | **不因此否决** —— 继续走规则 2 |
+| 2 | 歌名前后是**符号 / 空格 / 串首尾** | 通过（`光良 - 童话`、`童话 光良`、`【罗艺恒】童话`）|
+| 2' | 歌名紧邻汉字 | 丢弃（`童话镇`、`哥本哈根的童话`、`红颜旧`）|
+| 3 | 歌名**右边**紧跟「形式词」（`歌词排版`/`伴奏`/`完整版`/`mv`/`live`…）| 也算独立（`聊表心意` + `歌词排版`）|
+
+> **⚠️ 书名号只放行、不否决**（这里改过一次）
+>
+> 标题里的书名号也可能指向**电视剧 / 专辑 / 栏目**，而不是歌名：
+>
+> ```
+> 【许茹芸】泪海（《真爱一世情》电视剧主题曲）   ← 《…》是剧名，歌名"泪海"在别处
+> ```
+>
+> 早先写的是「有书名号但都不等于歌名 → 丢弃」，于是上面这条**被误杀**。
+> 现在改成：不匹配就继续走规则 2（它靠「泪海」前后是 `】` 和 `（` 通过）。
+>
+> ⚠️ **但 `titleHasSongName()` 顶部的 JSDoc 还留着旧描述**（第 1 条写着
+> 「有书名号但都不等于歌名 → **丢弃**」），与实现不符 —— 实现里那条分支
+> **直接往下走规则 2**，并不 return false。以**实现和本节为准**；
+> 下次改这个文件时顺手把那段 JSDoc 改掉。
+
+> **⚠️ 判边界必须在「保留空格的原串」上做**（踩过）
+>
+> 比对时要去空格（`Shape of You` ↔ `shapeofyou`），但判「前后是不是符号」
+> 必须回**原串**看邻居 —— **空格本身就是关键的分隔符**，压缩后它已经没了。
+>
+> 踩过的坑：先 `normalize`（去空格）再判边界，于是「童话 光良」变成「童话光良」，
+> 右邻成了「光」→ 被判成"紧邻汉字"而**误杀**（其实中间明明有空格）。
+>
+> 实现是 `flattenWithMap()`：既给出「去空格串」，又给出
+> **「去空格后索引 → 原串索引」的映射**，判边界时按映射回原串取邻居。
+
+> **⚠️ 必须配简繁归一**（`toSimplified()`，opencc）
+>
+> B 站标题**大量用繁体**，而歌单里的歌名是简体：
+>
+> ```
+> 歌名（歌单）：旧
+> 标题（B站）：不夠 - 舊『也許是舊的道理 虛情假意，卻總說得很堅定。』
+>                                     ↑ 繁体「舊」≠ 简体「旧」→ 匹配不上 → 误杀
+> ```
+>
+> 而这**不是"另一首歌"** —— 它就是用户要的那首，只是字不同。
+> 不归一的话这条规则会把**正确的候选**也杀掉。
+
+**已知代价**：`光良童话KTV纯享版`（同曲不同歌手、无分隔符）会被判丢 ——
+它与「童话镇」在**字符层面完全同构**（歌名后紧邻汉字），纯字符串规则无法区分。
+这是「宁可漏掉也不能放错」的必然取舍。
+
+**② 歌手断层：歌手名命中 `+100`**
+
+| 层级 | 条件 | 基础分 |
+| --- | --- | --- |
+| 第一层 | 标题里命中**歌手名** | **+100** |
+| 第二层 | 没命中 | 0 |
+
+硬过滤已经保证了「标题含歌名」，所以打分阶段**还是 0 分的那一批，
+就等价于「只有歌名、歌手对不上」**（同曲不同歌手的翻唱 / 别的版本）。
+
+用户的要求很明确：**歌手名要先拉开档次**，所以给 100 ——
+一个「只有歌名」的候选哪怕把正分词全命中，也很难靠堆词追平这 100 分。
+
+歌手名可能带多个（`A、B`），按 `、,，/&` 拆开逐个试，命中任意一个就算命中。
+
+**③ 关键词细分：直接累加，没有上限**
+
+```ts
+for (const [score, keywords] of Object.entries(tagBonus)) {
+  for (const kw of keywords) {
+    if (title.includes(normalize(kw))) bonus += Number(score)
+  }
+}
+return layer + bonus     // ← 不 clamp
+```
+
+> **⚠️ 这里取消过一个 `±10` 上限**
+>
+> 早先层内加权被 `clamp` 到 `[-10, +10]`，而断层分定成 `+50` ——
+> 那个 50 是**由 clamp 上限倒推出来的**（保证两层数值区间不重叠：
+> `[40,60]` vs `[-10,10]`，`40 > 10` 所以永不重叠）。
+>
+> 但那个上限有个副作用：**堆几个关键词就能顶满**。用户把 `-20` 档给「伴奏」
+> 就是为了把伴奏压下去，结果被夹到 -10，与 `-4` 档的乐器演奏**只差 6 分**，
+> 表达不出「伴奏要重罚」的意图。
+>
+> 现在**去掉 clamp**：用户配 `-50` 就是 `-50`。代价是「断层分不再有数学上的保证」——
+> 理论上堆够多正分词可以超过 100 分。但那是**用户自己配的**，
+> 他配那么多正分词就是想让它们起作用；替他夹一个上限反而更不透明。
+
+**④ 排序**：收藏整段置顶（相对顺序不变、不参与打分）→ 其余按总分降序 → 同分保持 B 站原序。
+
+**⑤ 降级重搜：四级递进**（`searchSongFiltered`，在主进程网络层）
+
+| 级别 | 搜索词 | 拼法 |
+| --- | --- | --- |
+| 1 | `《歌名》歌曲 歌手` | `buildPrimaryKeyword(song, singer)` |
+| 2 | `《歌名》歌曲 MV` | `buildFallbackKeyword(song, 'MV')` |
+| 3 | `《歌名》歌曲 可视化` | `buildFallbackKeyword(song, '可视化')` |
+| 4 | `《歌名》` | `buildBareKeyword(song)` ★ **无后缀** |
+
+代码里是 `fallbackLevels = [...FALLBACK_SUFFIXES, undefined]` ——
+用 `undefined` 表示「裸歌名」那一级（它没有 suffix，走 `buildBareKeyword`）。
+
+**★ 为什么要有第 4 级（裸歌名）**
+
+前三级的搜索词都带后缀（`歌曲` / `歌曲 MV` / `歌曲 可视化`），
+而 B 站的相关性排序会把**带这些词的**排在前面 —— 于是**其他形式的好视频**
+排在两页之外、永远搜不到。
+
+实测（用户反馈踩到）：某首歌的「动态歌词排版」版本，用前三级都搜不到；
+**直接搜 `《歌名》` 才出得来**。第 4 级就是捞 `动态歌词排版 / 饭制 / 混剪`
+这类标题里**既不写 `歌曲` 也不写 `MV`** 的视频。
+
+**★ 每一级都是「一页不够就翻第二页」**（这是**统一行为**，不是某一级的特例）
+
+```
+searchRounds 内部：
+  needSecond = minResults > 0 && countPassing(all, relax) < minResults
+```
+
+用户明确纠正过一次：**不是「降级就搜两页」，而是「一页不够就两页、
+两页不够就降级」，下一级同样一页不够就两页，依此类推**。
+所以这里没有一个「无条件翻两页」的特例 —— 那是我一度写错又删掉的东西。
+
+**★ 降级轮一律放宽时长上限**（`relax = true` → `容差 × 1.7`）
+
+降级时搜出来的结果更杂（大量合集 / 全场 / 串烧），用第一轮那套上限会把
+本来能找到的砍掉。
+
+> ⚠️ 这里曾经是**死代码**：`relaxUpperBound` 这个参数**声明了、注释了，
+> 却从来没有被传成 `true`**，等于那条规则根本没生效（降级轮只享受到
+> 「标题含 MV/Live」那条常规放宽）。是代码审查时靠全仓 grep 才发现的 ——
+> 它是个**永远走不到的分支**。
+
+**★ 结果是「累加合并」，不是「哪一轮胜出就替换哪一轮」**
+
+用户的原话：**「降级的意思是降级搜索，不是要把之前的结果不要」**。
+所以每轮结果按 `bvid` 去重后**追加**到结果池：
+
+```
+第1轮: 10 条  ┐
+              ├─ 正确：10 + 36 去重合并 = 46 条
+降级轮: 36 条 ┘
+
+（我原来的实现是「比大小 → 用 36 条」→ 第 1 轮的 10 条被整个顶掉 ❌）
+```
+
+降级词搜出来的往往是**另一批**视频（`《歌名》歌曲 MV` vs `《歌名》歌曲 歌手`），
+两批重合度并不高，合起来才是「能挑的候选」。
+
+**★ 「够不够」判的是「过滤之后」的条数**
+
+用户设的 `minResults`（默认 30）是「**过滤完**还剩几条才算够」。
+
+> ⚠️ 这里踩过两次：
+>
+> 1. 原实现用的 `roughFilter` 把歌名和过滤词都传空，实际只做了时长过滤，
+>    于是判断数字虚高、降级**永远不触发**。现在用 `countPassing`，
+>    跑的是与 `rankVideos` 完全相同的规则。
+> 2. **`countPassing` 必须先把 B 站返回的 `favorites` 字段置为 `false`**。
+>    B 站的搜索结果里**本来就有个 `favorites`**（「这条视频被多少人收藏」，
+>    一个几乎总是 truthy 的数字），而 `rankVideos` 用它判断「是不是用户在我们
+>    这儿收藏的」并**豁免收藏项不参与过滤**。不清掉的话：
+>
+>    ```
+>    39 条搜索结果 → 38 条被当成"收藏" → 全部豁免过滤 → countPassing = 39
+>    判定「39 >= 30 够了」→ 不补第 2 页、不降级
+>    而 mergeWithFavorites 之后 favorites 规范化成 false → 真过滤 → 只剩 24 条
+>    ```
+>
+>    表现就是日志里两个数字对不上：`取回 39 条（1 页）` 但 `过滤后 24 条`。
+
+**★ 降级词刻意不带歌手名**
+
+硬过滤只要求「标题含歌名」，带歌手名会把「原唱但标题没写歌手」的候选挡掉。
+
+而**打分仍用传入的 `singer`**（不是降级词里的）—— 用户实际想要的仍是
+「歌名 + 那位歌手」。所以「不带歌手名」只影响**搜什么词**，
+不影响**怎么打分**（这两件事在新版里已经彻底分开了：`song` / `singer`
+是两个独立入参，不是从搜索词里拆出来的）。
+
+**★ 搜索词里不加 `-`**
+
+B站搜索把 `-` 当**排除语法**（`A -B` = 搜 A 并排除含 B 的结果），
+写成 `《歌名》歌曲 - 歌手` 会变成「搜歌、**排除**这个歌手」，正好反了。
+用空格分隔就是普通的「与」语义。
+
+> 搜索**词**（发给 B 站的）与搜索**键**（缓存主键）是两回事：
+>
+> | | 形态 | 用途 |
+> | --- | --- | --- |
+> | 搜索词 | `《歌名》歌曲 歌手` | 发给 B 站 |
+> | 搜索键 | `歌名-歌手`（`joinSearchKey`）| `videos.search_key` / `song_meta.search_key` |
+>
+> `-` 只出现在**搜索键**里（它只是个数据库主键，不参与 B 站查询），
+> **不出现在搜索词**里。
+
+**⑥ ⚠️ 过滤只作用于「非收藏项」**（这里改过一次）
+
+收藏是**用户自己挑的**（点收藏，或者手动「添加视频」粘的链接）——
+它不该被「标题里有没有歌名」「时长对不对」这类**搜索匹配规则**判掉。
+
+我第一版把收藏也一起过滤了，后果是：用户手动添加的视频（标题往往是自己起的、
+不含歌名）**直接从列表消失**，而且刷新也找不回来。
+
+```
+rankVideos 里的顺序：
+  ① 先把收藏摘出来（不参与过滤，顺序也不动）
+  ② 只对 !favorites 的做硬过滤
+  ③ 只对 !favorites 的按分数排序
+  ④ 拼起来：[...收藏, ...排好序的其余]
+```
+
+**⑦ 过滤后为空 → 返回空 + `filtered: true`，**不搞「回退」**
+
+```ts
+if (finalList.length === 0) {
+  return { data: { ...result.data, result: [], filtered: true } }
+}
+```
+
+渲染层看到 `filtered` 就**跳过那 3 次重试** —— 那是合法结果（搜索成功了，
+只是全被规则挡掉），不是搜索失败。提示也分开说：「结果都被过滤掉了，
+去设置里放宽规则」，而不是「检查网络」（那会把人引到错误方向）。
+
+> **为什么不「回退成不过滤」**（我第一版就是这么写的）：那会把
+> **标题不含歌名**的条目一起放回列表里 —— 用户看到列表里混着一堆不相关的视频。
+> 歌名是「是不是同一首歌」的唯一硬判据，它没有「回退」这个选项。
+
+### 缓存路径也要过一遍过滤（但**只读不写**）
+
+缓存里存的**本来就是过滤好的列表**（写进去的是 `finalList`），所以正常路径下
+这次过滤什么都不会改 —— 它只解决**一个**场景：**用户改了过滤设置**。
+
+```
+缓存是 3 天前写的（按当时的规则过滤过）
+用户今天新加了过滤词「吉他谱」
+→ 缓存不会因为设置变了就失效，读出来还是 3 天前那批（含吉他谱）
+→ 这里用当前规则再过一遍，设置立刻生效
+```
+
+**⚠️ 但不把结果回写缓存**（这里改过一次，有实测数据）。
+
+我原来写过「过滤后条数变了就把缓存也修好」。那是错的，因为
+**`save` 是 DELETE + INSERT**：把过滤后的列表写回去 = 把「按当前规则不该显示」
+的行从库里**永久删除**。
+
+实测（`cache.save` 真跑）：
+
+```
+初始:               D1, D2
+回写过滤后的列表后:  D1          ← D2 从库里消失了
+```
+
+后果：用户把容差从 30 调回 90（或删掉一个过滤词）想找回那些结果时，
+**它们已经不在库里了**，必须重新联网搜索才回得来。
+
+所以：读路径**只读不写**。规则错了最多这次显示不对，缓存本身保持完整。
+
+> 顺带一个实测结论：`save` 的 `orphans` 逻辑**确实会保住真收藏** ——
+> 「不在传入列表里、且 `favorites = 1`」的行会被补在列表最后。
+> （我一度以为收藏会丢，实测证明不会；那次测试失败是因为我在第一次 `save` 时
+> 就传了 `favorites: true`，而 `save` 里写的是 `old?.favorites ?? 0` ——
+> 全新条目的收藏标记**永远取自旧行**，所以那个 `true` 根本没生效。）
+
+实测（用真实数据跑现行 `videoRank`）：
+
+```
+歌名独立出现：书名号=歌名 保留 / 书名号≠歌名（但歌名在别处独立）保留 ✅
+              歌名紧邻汉字 丢弃（童话镇 / 哥本哈根的童话 / 红颜旧 / 旧梦一场）✅
+              歌名前后是空格/符号 保留（童话 光良 / 光良 - 童话 / 【罗艺恒】童话）✅
+              书名号指向剧名 不误杀（【许茹芸】泪海（《真爱一世情》…））✅
+简繁归一：     不夠 - 舊『…』 保留（繁体「舊」= 简体「旧」）✅
+              一笑傾城 / 我走後 / 紅色高跟鞋 同样保留 ✅
+形式词豁免：   聊表心意 + 歌词排版 / 伴奏 保留（歌名后紧接形式词）✅
+时长：         差 89s 保留 / 差 91s 丢弃 / 低于 max(时长-容差, 时长×0.5) 丢弃 ✅
+               MV/Live/官方 的 6:30 保留，翻唱的 6:30 丢弃 ✅
+歌手断层：     歌手名命中 +100，压在「只有歌名」之上 ✅
+关键词无上限： 堆满正面词可以超过 100（不再被夹到 ±10）✅
+排序：         收藏置顶 → 歌手命中在前 → 同分保持原序 → 负分垫底 ✅
+收藏豁免：     三个收藏（含手动添加的不含歌名项）全部保留 ✅
+```
+
+> 真实数据体检（用户自己那个 221 首歌单）：`童话` 71 条里**精确丢掉 17 条**
+> 别的歌（`童话镇` / `哥本哈根的童话` / `妈妈画的童话` / `夜之童话` /
+> `童话不骗人` / `草原童话` / `五环童话` / `平安夜童话` …），
+> 而 `泪海` 45 条**零误杀**、`只字不提` 40 条只丢 2 条。
+> 规律：**歌名越短（尤其单字），边界规则砍得越多** —— 因为单字太容易
+> 出现在别的词里（「旧」会命中「红颜旧」「旧梦一场」「旧朋友」）。
+> 这是「宁可漏掉也不能放错」的代价。
 
 > **⚠️ 仍未解决的：「收藏再取消来提升顺序」过不了重新搜索**
 >
@@ -1468,16 +1966,19 @@ return { data: { ...result.data, result: ordered } }
 不再被读取，也不写任何导入代码。用户（只有一个）明确要求过不做迁移。
 
 **schema 升级也是「丢弃重建」，不做逐字段搬运**：
-`db.ts` 的 `migrateSchema()` 在发现 `user_version` 低于当前版本时，会把
-表（含 v1 遗留的 `video_details`）**和视图**全部 `DROP`，再按新结构重建。理由：
+`db.ts` 的 `migrateSchema()` 发现 `user_version`（**建表语句的哈希指纹**）
+与当前不一致时，就会把**全部表 / 视图** `DROP`（动态查 `sqlite_master`，见上文），
+再按新结构重建。理由：
 
-- SQLite 数据层**从未发布过**（v1 只存在于开发期本机），所以「升级」实际只发生在
-  作者自己的机器上，重搜一次即可；
+- SQLite 数据层**从未发布过**，所以「升级」实际只发生在开发机上，重搜一次即可；
 - 逐字段搬运要处理「旧列可能不存在 / 类型变了 / JSON 要重新拆成列」三种情况，
   代码量和出错面都远大于丢掉重来，而收益只是省几次重新解析。
 
-> **副作用要说清楚**：升级会清空**收藏、顺序、选中视频，以及歌单本身**
+> **副作用要说清楚**：重建会清空**收藏、顺序、选中视频，以及歌单本身**
 > （都在同一个库里）。要保留就得自己先备份 `blmv.db`。
+>
+> 本轮就真的清过一次库（`playlists.id` 的语义从随机 UUID 改成
+> `平台_平台歌单id`，属于 schema 变化）—— 用户明确要求「不用管我，不要迁移，直接清库」。
 
 续播相关的信息存在 `setting.json` 里：`player.resumeOnStart`（记住播放进度）、`player.resumeTime`
 （上次播放到第几秒）；**播到第几首由每个歌单自己的 `lastIndex` 决定**（`player.playIndex` 是历史遗留、
@@ -1503,9 +2004,14 @@ return { data: { ...result.data, result: ordered } }
 ```
 渲染进程  window.electronAPI.getPlaylistDetail({ input })
    └─ IPC 'music:getPlaylistDetail'
-        └─ electron/main/music/index.ts   按链接 host 自动识别音源（wy / tx / kw）
-             └─ sources/<source>.ts       各平台自己解析自己格式的链接
-                  └─ 返回 { info, songs: [{ name, singer, interval }], total }
+        └─ 主进程 handler（electron/main/ipc/music.ts）
+             ├─ electron/main/music/index.ts   按链接 host 自动识别音源（wy / tx / kw）
+             │    └─ sources/<source>.ts       各平台自己解析自己格式的链接
+             │         └─ 返回 { info, songs: ParsedSong[], total, source, listId }
+             └─ ★ 出口加工成「成品」：
+                  toPlaylistSongs(detail.songs)   ← 字段归一 + 带上 platformId
+                  playlistKey(detail.source, detail.listId)  ← 拼好歌单主键
+             └─ 返回 { info, songs: PlaylistSong[], total, page, limit, source, id }
 ```
 
 支持的链接形式：
@@ -1515,6 +2021,60 @@ return { data: { ...result.data, result: ordered } }
 | 网易云音乐 | `https://music.163.com/#/playlist?id=xxx`（也支持 `xxx###token` 注入 MUSIC_U） |
 | QQ音乐 | `https://y.qq.com/n/ryqq/playlist/xxx` 或 `.../playlist/xxx.html` |
 | 酷我音乐 | `https://www.kuwo.cn/playlist_detail/xxx` |
+
+**★★ 核心设计原则：凡是主进程能算的，渲染层一律不碰**
+
+`resolvePlaylist`（解析）和 `writePlaylistsToDb`（写库）**都在主进程**，
+所以两者之间**根本不需要绕渲染层**。而现实是：
+
+```
+resolvePlaylist 拿到 ParsedSong[]（有 platformId、有 listId）
+     ↓ 返回给渲染层展示（用户会看到曲目列表）
+渲染层 savePlaylists({ playlists })  ← 回传
+writePlaylistsToDb → songId(song)    ← 此刻要 platformId，但它已经不在了
+```
+
+于是主进程在 **IPC 出口**就把结果加工成**最终形态**，渲染层只负责
+「展示 + 原样回传」：
+
+| 加工项 | 做什么 | 为什么必须在主进程 |
+| --- | --- | --- |
+| `toPlaylistSongs()` | `interval:"4:03"` → `duration:243`（秒）；`albumName` → `album`；**带上 `platformId`** | 渲染层不需要认识音源字段；而且它**不知道 `platformId` 有用** |
+| `playlistKey()` | 拼歌单主键 `tx_8153225605` | 只有主进程知道音源给的 `listId` |
+
+> **⚠️ 踩过的坑（代价很大，一定要写）**
+>
+> 这段字段转换**原本写在渲染层** `PlaylistManager.vue`。后果是
+> **`platformId` 被丢掉**（渲染层根本不知道它有用）→ `songs.id` 全部退化成
+> `歌名-歌手`。实测库里 **221 条无一例外、带平台前缀 0 条** ——
+> 白拆了 `songs` / `playlist_songs` 两张表，整个重设计等于没做。
+>
+> 后来还犯过一次同类错误：让渲染层调 `playlistKey(detail.source, detail.listId)`
+> 自己拼主键。**同样错** —— 那是主进程的事。
+
+`toPlaylistSongs()` 由 **IPC 出口和 `syncPlaylist` 共用** ——
+保证「解析 → 渲染层 → 回传」和「同步（直接在主进程改内存）」两条路径
+**产出形状完全一致**（实测：同一首歌两条路径的 `duration` / `platformId` /
+`songId()` 全一致，8 项断言通过）。
+
+**★ 平台歌单 id 怎么带出来的**
+
+三个音源的 `getListId()` 本来就在解析它，现在通过 `PlaylistDetail.listId` 带出来：
+
+| 音源 | 字段 | 例 |
+| --- | --- | --- |
+| QQ音乐 | `disstid` | `8153225605` |
+| 网易云 | `id` | `11332` |
+| 酷我 | `rid` | `xxx` |
+
+> ⚠️ **`listId` 不透出给渲染层** —— 它只用于主进程拼 `id`。
+> 返回给渲染层的 `id` 是**拼好的成品**（`tx_8153225605`），
+> 渲染层直接拿来当 `PlaylistRecord.id` 用。
+
+**★ 三个音源的 `songs` 里带的平台歌曲 id**
+
+`sources/<source>.ts` 里都填了 `ParsedSong.platformId`（tx: `item.id ?? item.mid`，
+wy: `song.id`，kw: `item.id`）。它是 `songs.id` 的来源，**不能丢**。
 
 移植时与 LX 的几处有意差异：
 
@@ -1527,8 +2087,34 @@ return { data: { ...result.data, result: ordered } }
 3. **自动识别音源**：LX 让用户在弹窗里手选音源，本项目按链接 host 自动判断，
    体验更省事；纯数字 ID 因无法判断平台会给出明确提示。
 4. **返回结构精简**：LX 的歌曲对象还带 `qualitys`/`typeUrl` 等取播放地址用的字段，全部砍掉；
-   本项目保留的是 `name / singer / interval / albumName / cover`（结构化曲目要展示专辑与封面，
-   见 `ParsedSong`），同步与手动新建都会把专辑 / 封面一起写进歌单。
+   本项目保留的是 `name / singer / interval / albumName / cover / platformId`
+   （结构化曲目要展示专辑与封面，见 `ParsedSong`），同步与手动新建都会把
+   专辑 / 封面一起写进歌单。
+
+**★ `songId()` 与 `playlistKey()`：两个拼 id 的纯函数**
+
+都在 `electron/common/types/playlist.ts`（主 / 渲染共用，但**渲染层一个都不该调**）：
+
+| 函数 | 形态 | 用途 |
+| --- | --- | --- |
+| `songId(song)` | `tx_1828354` / 退化成 `歌名-歌手` | `songs.id`、`playlist_songs.song_id` |
+| `playlistKey(source, listId)` | `tx_8153225605` / 参数不全返回 `null` | `playlists.id` |
+| `joinSearchKey(song, singer)` | `歌名-歌手` | `videos.search_key` / `song_meta.search_key` || `sourceOfSongId(id)` | `tx` / **不认识的前缀返回 `null`** | 从 id 反推音源 |
+| `platformIdOfSongId(id)` | `1828354` | 从 id 反推平台歌曲 id |
+| `baseSongName(name)` | `Take Me Hand (吉他版)` → `Take Me Hand` | 剥掉括号里的版本标记 |
+
+> `sourceOfSongId()` **只认 wy / tx / kw / kg** —— 否则 `pl_<uuid>`（手动歌单的
+> 兜底 id）会被解析成音源 `pl`，那是个不存在的平台，下游拿去用会静默出错。
+>
+> ⚠️ **小不一致**：`joinSearchKey()` 源码里的第二个参数名是 `artist`
+> （`joinSearchKey(song: string, artist: string)`），而全项目其它地方统一叫
+> `singer`。功能没影响（它只是拼串），但**下次改这个文件时顺手改成 `singer`**
+> 更一致 —— 调用方是按位置传参的，改名不会破坏任何调用。
+
+> `baseSongName()` 只剥**括号里含版本词**的（`版`/`live`/`dj`/`伴奏`/`女声`…），
+> `(Don't) Stop` 这类括号属于歌名本身，保留。用途：`songs.id` 判别、
+> 硬过滤比对、以及**拼搜索词**（`《Take Me Hand》歌曲` 而不是
+> `《Take Me Hand (吉他版)》歌曲`）。
 
 ---
 
@@ -1540,9 +2126,18 @@ return { data: { ...result.data, result: ordered } }
 
 | 情况 | 用哪个目录 |
 | --- | --- |
-| `%APPDATA%/BiLiMusicVideo-desktop` 里**已经有本应用数据** | 就用它（安装版 / 便携版共用一份，换版本不会「数据不见了」） |
+| `%APPDATA%/BiLiMusicVideo` 里**已经有本应用数据** | 就用它（安装版 / 便携版共用一份，换版本不会「数据不见了」） |
 | 没有数据，且当前是便携版（运行时带 `PORTABLE_EXECUTABLE_DIR`） | exe 同级的 **`blmvdata/`**（自动创建，数据跟着程序走） |
-| 没有数据，且是安装版（全新环境） | 默认的 `%APPDATA%/BiLiMusicVideo-desktop` |
+| 没有数据，且是安装版（全新环境） | 默认的 `%APPDATA%/BiLiMusicVideo` |
+
+> **⚠️ 目录名是 `BiLiMusicVideo`，不是 `BiLiMusicVideo-desktop`**
+>
+> Electron 的 `app.getPath('userData')` = `%APPDATA%/<app name>`，
+> 而 app name 取自 `package.json` 的 **`name`**（= `BiLiMusicVideo`）。
+> `build.productName` 是 `BLMV`，但那是 **electron-builder** 的字段，**Electron 不读它**。
+> 代码里也没有 `app.setName(...)`，所以目录就跟着 `name` 走。
+>
+> （`%APPDATA%/BiLiMusicVideo-desktop` 是早期遗留的空目录，**不要**往那儿找数据。）
 
 判断「已经有数据」看的是我们自己的文件（`setting.json` / `playlists.json` / `playlist.json` /
 `search-cache` / **`blmv.db`**），**不能只看目录存不存在** —— Electron 一启动就会把 userData
@@ -1617,8 +2212,36 @@ return { data: { ...result.data, result: ordered } }
 拷到 `build/Release/`，并用 `beforePack` 把 `binding.gyp` 改名以阻止现场编译）。
 
 **`node:sqlite` 其实也能用**（实测 Electron 42 内置的 Node 24 里可用，
-零原生模块、零打包配置），但它标注为 experimental，API 可能变；
+零原生模块、零打包配置），但它标注为 experimental、API 可能变；
 `better-sqlite3` 只多 1.9MB 且行为稳定，所以最终选了后者。
+
+**`opencc-js`（简繁归一）的打包 —— 已实跑验证**
+
+依赖表是 `better-sqlite3` / `bytenode` / `koffi` / **`opencc-js`**。
+
+用途只有一个：硬过滤里的**简繁归一**（B 站标题大量用繁体，见「排序方案」那节）。
+代码里引的是 **`opencc-js/t2cn` 子路径**，不是主入口：
+
+| 入口 | 体积 | 内容 |
+| --- | --- | --- |
+| `require('opencc-js')` | **1.1 MB** | 简→繁、繁→简、日文新字体、台湾/香港变体…… **我们一个都不用** |
+| `require('opencc-js/t2cn')` | **106 KB** | 只有「繁→简」，正是需要的那一件事 |
+
+体积差 **10 倍**，而程序里只用得到一个方向。
+
+> **为什么不用 `asarUnpack`**：`t2cn.js` 是**自包含**的 —— 106 KB、
+> **文件内零 `require`**，字典全内联，所以能直接在 `asar` 里跑，
+> 不需要摊到磁盘上。
+>
+> 已实跑验证：`npm run pack` 生成 `release/win-unpacked` → 用
+> `@electron/asar` 确认 `node_modules/opencc-js/dist/umd/t2cn.js` 在里面 →
+> 跑 `BLMV.exe` **无 opencc 告警**（拿不到 opencc 时 `videoRank` 会打
+> `[videoRank] opencc 不可用…` 的 warn，所以「没有这条告警」= 加载成功）。
+
+> `toSimplified()` 有**退化路径**：`require` 失败只打一行 warn、
+> 退回「不转换」，而不是让整个过滤崩掉 —— 代价是繁体标题的歌候选变少，
+> 但程序仍然可用。另外启动时会自检一次（`convert('舊') === '旧'`），
+> 转换器坏了要立刻知道，而不是让过滤结果悄悄变错。
 
 ### 搜索缓存策略（SQLite 之后）
 
@@ -1627,8 +2250,8 @@ return { data: { ...result.data, result: ordered } }
 内存 LRU 索引）已经整体删掉 —— 那些机制存在的唯一目的是模拟数据库能力。
 
 - **过期**：只清**地址那一批列**（`durl_url` / `dash_video` / `dash_audio` /
-  `dash_duration` / `quality` / `support_formats` / `playurl_at`），
-  时长取 `cache.searchResultExpireMs`（**0 = 永久**）。**不删任何行**
+  `dash_duration` / `playurl_at`；`quality` / `support_formats` 两列已删，
+  见 v4 改动），时长取 `cache.searchResultExpireMs`（**0 = 永久**）。**不删任何行**
 - **容量**：不再有文件数上限 / LRU 淘汰。留着的行只有标题封面这类短文本，
   体积由 `dash_video` / `dash_audio` 那两段 JSON 主导，而它们会被上面的过期清理收敛
 - **空结果不写缓存**（见下）
@@ -1898,8 +2521,17 @@ cmd /c "set ELECTRON_RUN_AS_NODE=&& node_modules\electron\dist\electron.exe veri
   跑脚本，于是 `require('electron').app` 是 `undefined`，报错是
   `Cannot read properties of undefined (reading 'setName')`。跑之前把它清掉。
 - **`npx electron` 也可能被这个变量带偏**，直接用 `node_modules/electron/dist/electron.exe` 最稳。
-- **脚本一定要 `app.setName('BiLiMusicVideo-desktop')`**：`userData` 目录跟着 app name 走，
-  不设就会去读写 `%APPDATA%\Electron` 那份，得出完全不同的结论。
+- **验证脚本必须把 `userData` 指到真实目录**：直接跑 `electron.exe script.js` 时，
+  app name 是默认的 `Electron`，于是 `userData` 会指向 `%APPDATA%\Electron` ——
+  **那是另一个空库**，读出来当然和真实数据对不上，得出完全不同的结论。
+  两种写法都行：
+  ```js
+  app.setPath('userData', path.join(process.env.APPDATA, 'BiLiMusicVideo'))
+  // 或： app.setName('BiLiMusicVideo')   ← userData 跟着 app name 走
+  ```
+  **目录名以 `package.json` 的 `name` 为准（= `BiLiMusicVideo`）**，
+  不是 `build.productName`（`BLMV`，那是 electron-builder 字段，Electron 不读）。
+  想验证**便携版**行为时反过来 —— 要显式指到临时目录，别碰真实库。
 - **临时插桩**：自绘托盘菜单的「弹出/收起」是模块内私有函数，没法从外部调用。
   验证时**在构建产物 `out/main/index.js` 末尾临时追加** `globalThis.__showTrayMenu = showTrayMenu`
   （只改产物、不碰源码），验完 `npm run build` 覆盖掉，并确认产物里没有 `TEST HOOK` 残留。
