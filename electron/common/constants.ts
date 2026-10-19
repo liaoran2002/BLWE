@@ -32,7 +32,7 @@ export const STORE_NAMES = {
 export const PLAY_LOOP_MODES = ['listLoop', 'singleLoop', 'random'] as const
 
 /** 界面颜色（hex）的取值范围与默认值 */
-export const DEFAULT_THEME_COLOR = '#ffffff'
+export const DEFAULT_THEME_COLOR = '#000000'
 export const DEFAULT_FONT_COLOR = '#ffffff'
 /** 只接受 `#RGB` / `#RRGGBB`（大小写都行） */
 export const COLOR_HEX_PATTERN = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/
@@ -92,6 +92,22 @@ export const IDLE_OPACITY_MAX = 100
  * 而且**整十的数值更好记**（用户会说"我要 30%"）。
  */
 export const IDLE_OPACITY_STEP = 10
+
+/**
+ * 关键词加权分值的**安全范围**（不是业务上限）
+ *
+ * ⚠️ 这和以前那个被删掉的 `TAG_BONUS_SCORE_MIN/MAX`（±10）**不是一回事**：
+ * 那一套是「只允许 ±10，超了就拒绝」，用户明确要求去掉（给「伴奏」配 -50 是合理的）。
+ *
+ * 这里只是给**数字输入框**一个边界，防止：
+ *  - 手滑多打几个 0（`-5000000`），把打分彻底压死；
+ *  - `el-input-number` 在没有 min/max 时会允许无限大的值。
+ *
+ * 范围给得很宽（±10000），正常使用**永远碰不到**，
+ * 所以既保留了"想配多少配多少"，又不会因为误输入把配置搞坏。
+ */
+export const TAG_BONUS_SCORE_HARD_MIN = -10000
+export const TAG_BONUS_SCORE_HARD_MAX = 10000
 
 /**
  * 模糊强度

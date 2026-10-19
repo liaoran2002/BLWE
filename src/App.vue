@@ -15,8 +15,33 @@
         @mousedown="onTitlebarMouseDown"
         @dblclick="onTitlebarDblClick"
       ></div>
-      <!-- 右侧：壁纸 / 头像 / 设置 / 窗口按钮 -->
+      <!-- 右侧：定时暂停 / 壁纸 / 头像 / 设置 / 窗口按钮 -->
       <div class="titlebar-right">
+        <!--
+          定时暂停 / 定时关闭
+
+          三种显示：
+            · 没定时   —— 「定时」
+            · 倒计时中 —— 剩余时间（`1:23:45` / `23:45`），强调色
+            · 已归零、等视频播完 —— `00:00`，**红色**（用户要求）
+        -->
+        <div
+          class="titlebar-btn sleep-trigger"
+          :class="{
+            'sleep-trigger--active': sleepState.active && !sleepState.pending,
+            'sleep-trigger--waiting': sleepState.pending,
+          }"
+          @click="sleepPanelVisible = true"
+          :title="
+            sleepState.pending
+              ? '计时已结束，等待视频播放完毕（点击修改或取消）'
+              : sleepState.active
+                ? `${sleepRemainText} 后${sleepActionText}（点击修改或取消）`
+                : '定时暂停 / 定时关闭'
+          "
+        >
+          {{ sleepState.active ? sleepRemainText : '定时' }}
+        </div>
         <div class="titlebar-btn" @click="toggleWallpaper">
           {{ wallpaperEnabled ? '窗口模式' : '壁纸模式' }}
         </div>
@@ -139,6 +164,8 @@
       :duration="duration"
       :paused="paused"
       :listType="listType"
+      :busy="netBusy"
+      :qualityBusy="qualityBusy"
       @videoControl="videoControl"
       @changeTime="changeTime"
       @changeVolume="changeVolume"
@@ -199,6 +226,25 @@
     <!-- 设置 -->
     <SettingsDialog v-model="settingsVisible" />
 
+    <!--
+      定时暂停 / 定时关闭面板
+
+      纯展示组件：时长、剩余时间、三个选项都由这里传下去，
+      它只上报「+/- 改成什么」「勾了什么」「确认/取消」。
+    -->
+    <SleepTimerPanel
+      v-model="sleepPanelVisible"
+      :active="sleepState.active"
+      :pending="sleepState.pending"
+      :remain-text="sleepRemainText"
+      :action-text="sleepActionText"
+      :hours="sleepHours"
+      :minutes="sleepMinutes"
+      :options="sleepOptions"
+      @apply="applySleepTimer"
+      @cancel="cancelSleepTimer"
+    />
+
     <!-- 关于 -->
     <AboutDialog v-model="aboutVisible" />
   </div>
@@ -208,7 +254,7 @@
 import { defineComponent, markRaw } from 'vue';
 import type { AppSetting } from '@common/types/app_setting';
 import defaultSetting from '@common/defaultSetting';
-import { PLAY_LOOP_MODES } from '@common/constants';
+import { PLAY_LOOP_MODES, VIDEO_QUALITY_OPTIONS, findQualityOption } from '@common/constants';
 import biliVideoControls from './components/biliVideoControls.vue';
 import showList from './components/showList.vue';
 import AddVideoDialog from './components/AddVideoDialog.vue';
@@ -216,14 +262,17 @@ import PlaylistPanel from './components/PlaylistPanel.vue';
 import PlaylistManager from './components/PlaylistManager.vue';
 import SettingsDialog from './components/SettingsDialog.vue';
 import AboutDialog from './components/AboutDialog.vue';
+import SleepTimerPanel from './components/SleepTimerPanel.vue';
 import electronApi from './api/electron';
 import { useSettingStore } from './stores/setting';
 import { usePlaylistStore } from './stores/playlists';
-import { toSearchKey } from '@common/types/playlist';
+import { toCacheKey } from '@common/types/playlist';
 import type { PlaylistSong as StructuredSong, SyncResult } from '@common/types/playlist';
 import { normalizeImageUrl } from './utils/image';
 import { qualityLabelOf } from './utils/videoQuality';
 import { DashSession } from './utils/dashPlayer';
+import { SleepTimer, formatRemain } from './utils/sleepTimer';
+import type { SleepTimerOptions, SleepTimerState } from './utils/sleepTimer';
 import type { DashStreamsPayload, QualityOptionsPayload } from '@common/types/ipc';
 
 /**
@@ -245,10 +294,31 @@ const PREFETCH_AHEAD_S = 15;
 /**
  * 播放位置停住多久算「这条流不行了」
  *
- * 取 12 秒：正常网络波动、CDN 换节点都不会连着 12 秒一个字节都不来；
- * 而用户手动点下一首的忍耐时间大概也就这么长。命中后先重解析一次，再不行才跳歌。
+ * 取 **8 秒**：正常网络波动、CDN 换节点都不会连着 8 秒一个字节都不来。
+ * 命中后按分级链恢复（见 `recoverFromStall`）：换备用源 → 降清晰度 → 降 durl → 提示检查网络。
  */
-const STALL_MS = 12000;
+const STALL_MS = 8000;
+/**
+ * 卡顿恢复链里「降几档清晰度」之后就不降了，直接降到 durl
+ *
+ * 用户定的是 3 档：再往下降画面已经没法看了，不如直接退混流并提示检查网络。
+ */
+const MAX_QUALITY_DROPS = 3;
+/**
+ * 手动改过**清晰度 / 音质**之后的冷却时间（毫秒）
+ *
+ * 用户要求 3 秒。切换清晰度会 `changeVideo(skipCache: true)` **重新解析地址**
+ * （发请求），连点几下就是连着几个请求 —— 除了「请求期间禁用」之外，
+ * 再加一道固定冷却，把「刚改完就想再改」这条路径也堵掉。
+ */
+const QUALITY_COOLDOWN_MS = 3000;
+/**
+ * 「正在加载，先别点」这条提示的**节流间隔**（毫秒）
+ *
+ * 用户连点切歌时，每次都会走 `notifyNetBusy()` —— 不节流的话
+ * toast 会一条接一条往外冒。2 秒内只提示一次足够表达「它在忙」。
+ */
+const NET_BUSY_HINT_MS = 2000;
 /**
  * 预热失败后的重试次数与间隔
  *
@@ -280,6 +350,7 @@ export default defineComponent({
     SettingsDialog,
     AboutDialog,
     AddVideoDialog,
+    SleepTimerPanel,
   },
   setup() {
     // Pinia 只做渲染进程的响应式副本；真正的持久化在主进程。
@@ -290,6 +361,40 @@ export default defineComponent({
     return { settingStore, playlistsStore };
   },
   computed: {
+    /**
+     * 定时暂停：剩余时间的可读文本（按钮上和面板顶部都用它）
+     *
+     * 有小时 `H:MM:SS`，没有小时 `MM:SS`（用户明确要求）。
+     */
+    sleepRemainText(): string {
+      return formatRemain(this.sleepState.remainMs);
+    },
+    /** 定时暂停：到点后做什么的可读文本 */
+    sleepActionText(): string {
+      return this.sleepState.action === 'quit' ? '停止播放并关闭程序' : '停止播放';
+    },
+    /**
+     * 定时暂停：面板里的「时」（来自 settings 的记忆值）
+     *
+     * ⚠️ 面板里显示的是 **settings 里记住的值**，不是"剩余时间拆成时分"——
+     * 用户要求如此：倒计时中点开面板，看到的是上次设的「1 时 0 分」，
+     * 而不是「还剩 0 时 43 分」，这样改起来才知道自己在原来基础上调。
+     */
+    sleepHours(): number {
+      return Number(this.settingStore.setting['common.sleepTimerHours']) || 0;
+    },
+    sleepMinutes(): number {
+      return Number(this.settingStore.setting['common.sleepTimerMinutes']) || 0;
+    },
+    /** 定时暂停：三个复选框的状态（存在 settings 里，下次打开自动勾上） */
+    sleepOptions(): SleepTimerOptions {
+      const raw = this.settingStore.setting['common.sleepTimerOptions'];
+      return {
+        pauseCountdown: Boolean(raw?.pauseCountdown),
+        waitVideoEnd: Boolean(raw?.waitVideoEnd),
+        closeApp: Boolean(raw?.closeApp),
+      };
+    },
     /**
      * 当前这首歌收藏的 bvid 列表（视频列表里显示实心爱心）
      *
@@ -306,6 +411,33 @@ export default defineComponent({
      * `tagBonus()` 打分，而打分现在在主进程（`@common/utils/videoRank`，
      * 直接读主进程的设置）。渲染层不再需要这份配置。
      */
+    /**
+     * ★ **有网络请求在飞**（传给控制栏禁用「会发请求」的控件）
+     *
+     * 见 `_netBusyCount` 的注释。这里只做 `> 0` 的转换，
+     * 真正的加减在 `beginNet()` / `endNet()` 里。
+     *
+     * ⚠️ 它**不含**清晰度冷却 —— 那个单独由 `qualityBusy` 表达，
+     * 因为「切歌按钮」没必要因为「刚改过清晰度」被禁 3 秒。
+     */
+    netBusy(): boolean {
+      return this._netBusyCount > 0;
+    },
+    /**
+     * ★ **清晰度 / 音质下拉是否该禁用**
+     *
+     * 两个来源任一成立就禁：
+     *  - `netBusy`：正在解析地址（切换本来就要重新解析，等它做完）；
+     *  - **固定 3 秒冷却**：`_qualityCooldownUntil` 还没到
+     *    （改动完成后 3 秒内不许再改，防止连点打出一串解析请求）。
+     *
+     * ⚠️ 冷却**到点时有 `setTimeout` 把它清成 0**（见 `startQualityCooldown`）——
+     * 光靠「现在时间 < 截止时间」这个比较，时间流逝本身不会触发重渲染，
+     * 3 秒后界面会一直卡在禁用状态。
+     */
+    qualityBusy(): boolean {
+      return this.netBusy || Date.now() < this._qualityCooldownUntil;
+    },
     /** 当前播放歌曲的结构化信息（供详情弹窗右侧与 SMTC 使用） */
     currentSong(): StructuredSong | null {
       return this.songs[this.currentIndex] ?? null;
@@ -364,7 +496,7 @@ export default defineComponent({
       songs: [],
       videoList: [],
       /**
-       * `videoList` 属于哪一首歌（搜索键）
+       * `videoList` 属于哪一首歌（缓存键）
        *
        * `changeSong` 会立刻把 `songName` 切成新歌，但 `videoList` 要等搜索
        * 回来才换。用这个字段标明列表的归属，避免拿上一首的视频干新歌的事。
@@ -460,6 +592,15 @@ export default defineComponent({
       aboutVisible: false,
       /** 「添加视频」弹窗（视频列表右上角的加号） */
       addVideoVisible: false,
+      /** 定时暂停面板是否展开 */
+      sleepPanelVisible: false,
+      /**
+       * 定时器状态快照（由 `SleepTimer` 每秒推一次）
+       *
+       * `markRaw` 不适用于这里（它是纯数据对象），但计时器实例本身
+       * 在 `created` 里用普通字段存（不放 data，避免被 Vue 代理 —— 它有自己的 ticker）
+       */
+      sleepState: { active: false, remainMs: 0, pending: false, action: 'stop' } as SleepTimerState,
       /** 视频请求竞态令牌（切视频时防乱序覆盖） */
       _videoToken: 0,
       /** 同一个视频的连续失败次数，达到上限就跳过该曲，避免无限重试 */
@@ -501,6 +642,15 @@ export default defineComponent({
       _syncKey: '',
       /** 片尾看门狗：每秒检查一次「缓冲到底但没触发 ended」 */
       _endWatchTimer: null as ReturnType<typeof setInterval> | null,
+      /**
+       * 定时暂停实例（`created` 里创建）
+       *
+       * 放 `data` 里是为了让 TS 认得它（`_` 前缀表示内部字段，模板不直接用）；
+       * 但它自带 `setInterval`，被 Vue 响应式代理没有好处 —— 见 `setupSleepTimer`。
+       */
+      _sleepTimer: null as SleepTimer | null,
+      /** `SleepTimer` 的订阅取消函数（`beforeUnmount` 里调） */
+      _sleepUnsub: null as (() => void) | null,
       /** 换源时延迟显示缓冲提示的定时器 */
       _bufferOverlayTimer: null as ReturnType<typeof setTimeout> | null,
       /** 预热槽位：上一首 / 下一首各一个 */
@@ -545,11 +695,123 @@ export default defineComponent({
       _stallRecoveries: 0,
       /** 单曲歌单下反复停滞：已放弃这条流，不再周期性告警 */
       _stallGivenUp: false,
+      /**
+       * 「所有源都卡住」那条**常驻**通知当前是不是还开着
+       *
+       * 它 `duration: 0`（要手动关），所以必须保证同时只有一条 ——
+       * 详见 `recoverFromStall` 步骤 ④ 的说明。
+       */
+      _stallNoticeOpen: false,
+      /** 卡顿恢复链：当前试到第几个备用源（0 = 主地址） */
+      _stallUrlIndex: 0,
+      /** 卡顿恢复链：已经降了几档清晰度（最多 3 档） */
+      _stallQualityDrops: 0,
       /** 当前这次锁定是「进全屏自动锁的」，退出全屏时要跟着解开（手工锁的不动） */
       _lockedByFullscreen: false,
+      /**
+       * ★ **当前有几个网络请求在飞**（搜索 / 解析播放地址）
+       *
+       * 用于把控制栏里**会再发请求**的控件禁掉（切歌、清晰度/音质切换）——
+       * 用户狂点切歌会让请求成倍打出去，B站直接 412 风控。
+       *
+       * 用**计数器**而不是布尔：搜索和解析会并发（切歌时先搜索、再解析地址），
+       * 布尔会被先结束的那个提前清掉，于是「解析还没完」时按钮已经解禁了。
+       */
+      _netBusyCount: 0,
+      /**
+       * ★ **清晰度 / 音质切换后的冷却截止时间戳**（毫秒）
+       *
+       * 切换清晰度会 `changeVideo(skipCache: true)` **重新解析地址**（发请求），
+       * 所以它本来就被 `_netBusyCount` 盖住。但那个计数在请求结束时立刻归零，
+       * 用户马上又能点下一次 —— 连点几下就是连着几个重新解析请求。
+       *
+       * 所以额外加一道**固定 3 秒冷却**：改完清晰度/音质的 3 秒内，
+       * 那两个下拉保持禁用（`0` = 没有冷却）。
+       */
+      _qualityCooldownUntil: 0,
+      /** 上面那个冷却的定时器句柄（重复调用时先清掉旧的，避免堆定时器） */
+      _qualityCooldownTimer: null as ReturnType<typeof setTimeout> | null,
+      /**
+       * 上次提示「正在加载，先别点」的时间戳（毫秒）
+       *
+       * 用于给 `notifyNetBusy()` 节流 —— 连点时别让 toast 刷屏。
+       */
+      _lastNetBusyHintAt: 0,
     };
   },
   methods: {
+    /**
+     * ★ 标记「开始一个网络请求」（会让控制栏里发请求的控件禁用）
+     *
+     * ## 为什么必须配对使用
+     *
+     * `beginNet()` / `endNet()` 用**计数器**而不是布尔：
+     * 切歌时「搜索 → 解析地址」是两段连续的请求，中间还可能并发别的。
+     * 用布尔会被先结束的那个提前清掉，于是「解析还没完」时按钮已经解禁，
+     * 用户又能点下一首 —— 正是我们要拦掉的场景。
+     *
+     * ## 用法（务必 try/finally）
+     *
+     * ```ts
+     * this.beginNet()
+     * try { await electronApi.searchSong(...) } finally { this.endNet() }
+     * ```
+     *
+     * `finally` 是必须的：请求抛错时如果不减，计数器永远 > 0，
+     * **控制栏会一直禁着**（比风控还糟）。所以下面所有调用点都写成
+     * `try/finally` 而不是「成功后 endNet」。
+     */
+    beginNet(): void {
+      this._netBusyCount += 1;
+    },
+    /** 标记「一个网络请求结束」（配对 `beginNet`，必须在 finally 里调） */
+    endNet(): void {
+      this._netBusyCount = Math.max(0, this._netBusyCount - 1);
+    },
+    /**
+     * ★ 包住一个**会发网络请求**的调用：期间禁用控制栏里发请求的控件
+     *
+     * ```ts
+     * const res = await this.withNet(() => electronApi.searchSong(song, singer))
+     * ```
+     *
+     * 为什么不每处手写 `try/finally`：调用点有近十个，漏一个 `endNet`
+     * 就会让**控制栏永久禁着**（比风控还糟）。收成一个包装器，
+     * 所有调用点写法一致，`finally` 只在这一个地方出现。
+     *
+     * 泛型保留原返回值类型（`electronApi` 那些方法的返回值形状不变）。
+     */
+    async withNet<T>(fn: () => Promise<T>): Promise<T> {
+      this.beginNet();
+      try {
+        return await fn();
+      } finally {
+        this.endNet();
+      }
+    },
+    /**
+     * ★ 启动「清晰度 / 音质」改完后的**3 秒冷却**
+     *
+     * 期间那两个下拉保持禁用，防止连点 —— 每点一次都会
+     * `changeVideo(skipCache: true)` 重新解析地址，连点就是连着几个请求。
+     *
+     * ## 为什么用 `setTimeout` 清标记，而不是每次渲染时算
+     *
+     * 光判「`Date.now() < 截止时间`」的话，时间流逝**不会触发 Vue 重渲染** ——
+     * 3 秒后界面会一直停在禁用状态，直到别的原因让它重渲染一次。
+     * `setTimeout` 到点把标记清成 0，那个赋值本身就会触发重渲染，界面自然解锁。
+     *
+     * 重复调用是安全的：前一个定时器会被记下来并清掉（`_qualityCooldownTimer`），
+     * 所以不会堆一串定时器。
+     */
+    startQualityCooldown(): void {
+      this._qualityCooldownUntil = Date.now() + QUALITY_COOLDOWN_MS;
+      if (this._qualityCooldownTimer !== null) clearTimeout(this._qualityCooldownTimer);
+      this._qualityCooldownTimer = setTimeout(() => {
+        this._qualityCooldownTimer = null;
+        this._qualityCooldownUntil = 0;
+      }, QUALITY_COOLDOWN_MS);
+    },
     /**
      * 取 <video> 元素
      *
@@ -559,9 +821,33 @@ export default defineComponent({
     videoEl(): VideoElement | null {
       return (this.$refs.video as VideoElement | undefined) ?? null;
     },
-    /** 统一把 unknown 类型的 catch 错误转成可读文案 */
+    /**
+     * 统一把 unknown 类型的 catch 错误转成**可读文案**
+     *
+     * ## ⚠️ 这里是「所有错误显示给用户」的**收口**，所以要做一道过滤
+     *
+     * 主进程抛的 message 多半是人话（我们各处都在注意措辞），但**不能假设**：
+     * 将来任何一处 `throw new Error('HTTP 500')` / 接口原文透传，都会经这里
+     * 显示到界面上 —— 用户看不懂，而且可能把内部实现写进截图里。
+     *
+     * 所以这里做一次**兜底替换**：认出「明显是技术文案」的就换成通用人话，
+     * 原文只进控制台。判定故意写得宽松（宁可多换一次，也别漏出去）。
+     */
     errMsg(err: unknown): string {
-      return err instanceof Error ? err.message : String(err);
+      const raw = err instanceof Error ? err.message : String(err ?? '');
+      /**
+       * 技术文案的特征：状态码 / 全大写错误码 / 常见内部术语。
+       * 命中就替换成通用文案（真实内容打进控制台，排查不受影响）。
+       */
+      const looksTechnical =
+        /^(HTTP|ERR_|NAV_FAILED|AUTH_FAILED)/.test(raw) ||
+        /SourceBuffer|MediaSource|SetParent|WorkerW|fnval|wbi|SourceBuffer/i.test(raw) ||
+        /\b(4\d{2}|5\d{2})\b/.test(raw);
+      if (looksTechnical) {
+        console.warn('[ui] 错误文案含技术细节，已替换为通用提示。原文：', raw);
+        return '操作失败，请稍后再试';
+      }
+      return raw;
     },
     async init(): Promise<void> {
       // 用主进程下发（Pinia 中）的配置初始化本地播放状态
@@ -780,7 +1066,7 @@ export default defineComponent({
       this.songName = songName;
 
       try {
-        const res = await electronApi.searchSong(parts.song, parts.singer);
+        const res = await this.withNet(() => electronApi.searchSong(parts.song, parts.singer));
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         /**
          * 顺序已经是最终顺序 —— 主进程 `rankVideos` **在写库之前**排好的
@@ -1035,6 +1321,9 @@ export default defineComponent({
       this._endStallHandled = false;
       this._stallSince = 0;
       this._stallRecoveries = 0;
+      /** 恢复链的两个计数器同理：没有在播的流了，谈「试到第几个源」没有意义 */
+      this._stallUrlIndex = 0;
+      this._stallQualityDrops = 0;
       this._progressPos = 0;
       this._lastProgressAt = Date.now();
       /**
@@ -1082,6 +1371,109 @@ export default defineComponent({
     winClose(): void {
       electronApi.winClose();
     },
+    // #region 定时暂停 / 定时关闭
+    /**
+     * 创建定时器实例（`created` 里调一次）
+     *
+     * 为什么实例不放 `data`：它自己持有 `setInterval`，被 Vue 代理没有好处，
+     * 而且 `data` 里的对象会被深度响应式化（每帧都走一遍 Proxy 没意义）。
+     * 状态通过 `subscribe` 推回 `sleepState`，界面只看那份快照。
+     */
+    setupSleepTimer(): void {
+      this._sleepTimer = new SleepTimer({
+        /**
+         * 「停止播放」：只暂停，不退出
+         *
+         * 不用 `next()` / `changeSong` —— 定时暂停的语义就是「停下来」，
+         * 不是「换下一首」。暂停后用户回来点播放就能接着听。
+         */
+        stop: () => {
+          this.videoEl()?.pause();
+          this.paused = true;
+          this.$message.success('定时暂停：已停止播放');
+        },
+        /** 「关闭程序」：走 `win:quit`（不是 `winClose`，那个会被"关闭到托盘"拦下） */
+        quit: () => {
+          this.$message.success('定时暂停：正在关闭程序…');
+          void electronApi.winQuit();
+        },
+        /** 定时真的执行了 → 这时才关弹窗 */
+        fired: () => {
+          this.onSleepTimerFired();
+        },
+        /**
+         * 读当前播放位置与暂停态
+         *
+         * 没有视频元素时返回 `null` —— 定时器据此**不判定**「播到 1-3 秒」，
+         * 也不冻结倒计时（当作在播）。
+         */
+        readVideo: () => {
+          const el = this.videoEl();
+          if (!el) return null;
+          return { currentTime: el.currentTime, paused: el.paused };
+        },
+      });
+      this._sleepUnsub = this._sleepTimer.subscribe((state) => {
+        this.sleepState = state;
+        /**
+         * ⚠️ **不要在这里根据 `state.active` 关面板**
+         *
+         * 踩过：原来写了 `if (!state.active) 关面板`，结果**点 `+` / 勾复选框就关掉弹窗**。
+         * 原因：那会儿面板还是「编辑时立刻上报」的写法 —— 改一下就触发 `emit()`，
+         * 此刻定时还没启动，`active` 自然是 false，于是面板被误关。
+         *
+         * 现在面板是**草稿模式**（编辑只改本地 draft，点确认才 `apply`），
+         * 定时器那边也没有 `setOptions()` 这条路径，所以这个误关根本不会发生；
+         * 而且改成「只有真的执行了动作才关」——由 `onSleepTimerFired` 兜住。
+         */
+      });
+    },
+    /** 定时到点、动作执行完（关面板 + 收尾提示由 `fire` 那边给） */
+    onSleepTimerFired(): void {
+      this.sleepPanelVisible = false;
+    },
+    /**
+     * 点「确认」/「更新定时」—— **只有这一步才写 settings 和启动定时器**
+     *
+     * `payload` 是面板里的**草稿**（编辑过程中不落盘、不影响定时器）。
+     * 0 时 0 分 = 不设定时（面板那边也不会让你点，这里兜一层）。
+     */
+    applySleepTimer(payload: {
+      hours: number;
+      minutes: number;
+      options: SleepTimerOptions;
+    }): void {
+      const { hours, minutes, options } = payload;
+      if (hours === 0 && minutes === 0) {
+        this.$message.warning('时和分都是 0，等于不设定时');
+        return;
+      }
+      /**
+       * 先落 settings（记忆下次打开直接显示），再启动定时器
+       *
+       * 两者都放这里是有意的：编辑过程中不写盘，避免「只是按了下加号」也改配置。
+       */
+      void this.settingStore.update({
+        'common.sleepTimerHours': hours,
+        'common.sleepTimerMinutes': minutes,
+        'common.sleepTimerOptions': options,
+      });
+      const started = this._sleepTimer?.start(hours, minutes, options) ?? false;
+      if (!started) return;
+      this.sleepPanelVisible = false;
+      const action = options.closeApp ? '停止播放并关闭程序' : '停止播放';
+      this.$message.success(
+        `已设定时：${formatRemain((hours * 60 + minutes) * 60000)} 后${action}`,
+      );
+    },
+    /** 点「取消定时」（只对正在跑的定时有效；未定时时面板上没有这个按钮） */
+    cancelSleepTimer(): void {
+      this._sleepTimer?.cancel();
+      this.sleepPanelVisible = false;
+      this.$message.success('已取消定时');
+    },
+    // #endregion
+
     onTitlebarMouseDown(e: MouseEvent): void {
       if (e.button !== 0 || this.wallpaperEnabled) return;
       this.isDragging = true;
@@ -1347,63 +1739,171 @@ export default defineComponent({
       // 记一次恢复尝试，并把计时重置为「再看一个 STALL_MS」
       this._stallSince = Date.now();
       this._stallRecoveries += 1;
-      const video = this.videoList[this.currentVideoIndex];
       console.warn(
-        `[video] 播放停滞 ${STALL_MS}ms（t=${v.currentTime.toFixed(1)} duration=${d} readyState=${v.readyState} 第 ${this._stallRecoveries} 次恢复）`,
+        `[video] 播放停滞 ${STALL_MS}ms（t=${v.currentTime.toFixed(1)} duration=${d} readyState=${v.readyState} 第 ${this._stallRecoveries} 次恢复，源 ${this._stallUrlIndex + 1}，已降 ${this._stallQualityDrops} 档）`,
       );
 
-      if (this._stallRecoveries === 1) {
+      this.recoverFromStall();
+    },
+    /**
+     * ★ 卡顿恢复链（分级推进，每命中一次 `STALL_MS` 走一步）
+     *
+     * ```
+     * ① 换同一清晰度的**备用源**（backupUrl）        ← 无条件自动
+     * ② 备用源试完还卡 → 降一档清晰度（回到 ①）      ← ★ 只看「自动降清晰度」开关
+     * ③ 降了 3 档还卡 → 降 durl                      ← 无条件自动
+     * ④ durl 还卡 → 暂停 + notify「检查网络连接」
+     * ```
+     *
+     * ## 开关只影响第 ② 步
+     *
+     * 「换源」和「降 durl」不损失清晰度体验（还是同一档画面 / 只是换封装），
+     * 所以**无条件做**；只有「降清晰度」是画面变糊，才让用户决定：
+     *  - **开**：自动降 + `message` 告知「已自动降低清晰度为 XXX」
+     *  - **关**：不降，`message` 提示「建议降到 XXX」让用户自己点
+     *
+     * ## 关掉自动降时**不一级级降**
+     *
+     * 用户明确要求：关的时候换完备用源还卡就**直接降 durl**（不是一级级降下来）。
+     * 因为"不自动降"意味着用户想保住当前清晰度，那就别拿一串中间档位烦他。
+     */
+    recoverFromStall(): void {
+      /** 换源要保留播放位置（换 src 会清零） */
+      this.rememberSeekPoint();
+
+      const dash = this.dashSource;
+      /**
+       * ① 还有没用过的备用源 → 换下一个
+       *
+       * `_stallUrlIndex` 记着「当前试到第几个」；换源时递增。
+       */
+      if (dash && this._stallUrlIndex + 1 < dash.videoUrls.length) {
+        this._stallUrlIndex += 1;
+        const nextUrl = dash.videoUrls[this._stallUrlIndex];
         this.$message.warning(
-          noDuration ? '这条视频没能加载出来，正在重新解析…' : '缓冲停住了，正在重新解析这条视频的地址…',
+          `网络不稳定，正在切换备用源（${this._stallUrlIndex + 1}/${dash.videoUrls.length}）`,
         );
-        /**
-         * 重新解析的是**同一个视频**，所以要把当前位置记下来接着播
-         *
-         * 换 `src` 会把播放位置清零，不记的话就是「重新解析成功后从头开始」——
-         * 用户正听到一半，突然回到 0:00。
-         */
-        this.rememberSeekPoint();
-        /**
-         * dash（MSE）卡住时**优先退回 durl**
-         *
-         * 重新解析同一个 dash 地址往往还是卡在同一个环节（分片拉不动 / MSE 没数据），
-         * 白等 12 秒再跳歌。durl 是单文件直链，能立刻绕开这一层 —— 用户要的是"能看"。
-         */
-        if (this.dashSource) {
-          this.fallbackToDurl();
-          return;
-        }
-        if (video && this.videoListKeyword === this.songName) {
-          void this.changeVideo(video.bvid, this.videoListKeyword, { skipCache: true });
-        } else {
-          void this.videoError();
-        }
+        this.switchDashUrl(nextUrl);
         return;
       }
 
-      this._stallRecoveries = 0;
       /**
-       * ⚠️ 提示里要用**显示名**（`歌名-歌手`），不能用 `this.songName`
+       * ② 备用源试完了
        *
-       * `songName` 现在是**缓存键**（形如 `tx_002dNLgZ2dk7sy`），
-       * 直接贴进提示会变成「《tx_002dNLgZ2dk7sy》这条视频拉不动」。
+       * - 自动降清晰度**开** → 降一档（最多 3 档）
+       * - **关** → 跳过这一步，直接进 ③ 降 durl
        */
-      const label = `《${this.songName || '当前歌曲'}》`;
-      if (this.songs.length > 1) {
-        this.$message.warning(`${label}这条视频拉不动，已跳过`);
-        this.next();
+      if (dash && this.settingStore.setting['player.autoDowngradeOnStall']) {
+        if (this._stallQualityDrops < MAX_QUALITY_DROPS) {
+          const lower = this.nextLowerQuality();
+          if (lower) {
+            this._stallQualityDrops += 1;
+            this.$message.warning(`网络不稳定，已自动降低清晰度为 ${lower.label}`);
+            void this.switchQuality('video', lower.id);
+            return;
+          }
+        }
+      }
+
+      /**
+       * ③ 降 durl（混流 720P）
+       *
+       * 只有 dash 才需要这一步（已经在 durl 上就没什么可降的了）。
+       */
+      if (dash) {
+        /**
+         * ⚠️ 提示文案不要出现「已切换到 720P 混流，可以切换到 720P 试试」这种废话
+         * （用户明确吐槽过）。分两种情况：
+         *  - 当前清晰度**不是** 720P → 告知降到了 720P，并建议他试试**下一级**
+         *  - 当前**就是** 720P（甚至更低）→ 只说「已切换到混流」，不提清晰度
+         */
+        const curLabel = this.currentQualityLabel();
+        const lower = this.nextLowerQuality();
+        if (lower && lower.label !== curLabel) {
+          this.$message.warning(
+            `网络不稳定，已切换到 720P，可以试试 ${lower.label}`,
+          );
+        } else {
+          this.$message.warning('网络不稳定，已切换到 720P');
+        }
+        this.fallbackToDurl();
         return;
       }
+
       /**
-       * 单曲歌单没有「下一首」可跳
+       * ④ durl 也卡 → 暂停 + 常驻提示（用户要「一直显示」，所以用 `$notify`）
        *
-       * 原来这里只把计数归零、照样弹提示 —— 于是每 12 秒刷一次同样的告警，
-       * 永远不恢复也不停。改成只提示一次并**放弃这条流**，别再空转。
+       * 不跳下一首：用户说过「那样下一首也会卡的」，跳了没意义。
+       *
+       * ## ⚠️ 常驻通知必须**只留一条**（踩过）
+       *
+       * 这个通知 `duration: 0`（不自动消失，要手动关）。而 `_stallGivenUp`
+       * 会在**每次换源**时被复位（`applyVideoSource`）—— 于是用户手动切个清晰度
+       * 或再 fallback 一次之后，8 秒又能弹一条**同样的**常驻通知，
+       * 旧的那条还挂在屏幕右上角 → **通知叠加**。
+       *
+       * 所以这里自己记着「那条通知还开着没有」：还开着就**不再新弹**，
+       * 由用户在关闭时（`onClose`）把标记清掉。这样「同时最多一条」是硬保证，
+       * 不再依赖 `_stallGivenUp` 的复位时机。
        */
       if (!this._stallGivenUp) {
         this._stallGivenUp = true;
-        this.$message.warning(`${label}这条视频一直拉不动，可以换个视频源试试`);
+        this.videoEl()?.pause();
+        this.paused = true;
+        if (!this._stallNoticeOpen) {
+          this._stallNoticeOpen = true;
+          this.$notify({
+            title: '播放已暂停',
+            message: '网络连接不稳定，所有播放源都卡住了，请检查网络状况',
+            type: 'warning',
+            duration: 0,
+            onClose: () => {
+              this._stallNoticeOpen = false;
+            },
+          });
+        }
+        console.warn('[video] 所有源都卡顿，已暂停并提示用户检查网络');
       }
+    },
+    /**
+     * 换到**同一个清晰度**的另一个源（不重新解析，只换 URL）
+     *
+     * 为什么值得做：卡顿往往是某个 CDN 节点的问题，B 站每条流都给了
+     * `baseUrl` + 多个 `backupUrl`（不同 CDN）。换一个通常立刻就好，
+     * 比降清晰度 / 重新解析都快。
+     */
+    switchDashUrl(videoUrl: string): void {
+      const dash = this.dashSource;
+      if (!dash) return;
+      const el = this.videoEl();
+      if (!el) return;
+      /**
+       * 只换视频轨的地址，音频轨保持不变 —— 卡顿通常是视频带宽吃紧
+       * （音频只有几十 KB/s，很少成为瓶颈），换音频源收益小、风险大。
+       */
+      this.dashSource = { ...dash, videoUrl };
+      this.applyVideoSource();
+    },
+    /** 当前清晰度的可读名（`1080P60` 这种） */
+    currentQualityLabel(): string {
+      const qn = this.currentVideoQn;
+      if (qn == null) return '720P';
+      return findQualityOption(VIDEO_QUALITY_OPTIONS, qn)?.label ?? String(qn);
+    },
+    /**
+     * 比当前低一档的清晰度
+     *
+     * 按 `VIDEO_QUALITY_OPTIONS` 的顺序（从高到低）找当前档位的**下一个**。
+     * 找不到（已经在最低档）返回 `null`。
+     */
+    nextLowerQuality(): { id: number; label: string } | null {
+      const qn = this.currentVideoQn;
+      if (qn == null) return null;
+      const list = VIDEO_QUALITY_OPTIONS;
+      const idx = list.findIndex((o) => o.id === qn);
+      if (idx < 0) return null;
+      const next = list[idx + 1];
+      return next ? { id: next.id, label: next.label } : null;
     },
     /**
      * 预热「上一首 / 下一首」
@@ -1453,6 +1953,21 @@ export default defineComponent({
       // 已经彻底失败过：不再重试，等换歌 / 换歌单时由 clearWarm 重置
       if (this._warmFailed[dir]) return;
       /**
+       * ★ **有别的请求在飞时不要凑热闹**（预热自己让路）
+       *
+       * 预热是「后台悄悄准备下一首」，用户并不着急 —— 而它同样要打两个请求
+       * （搜索 + 解析）。如果主流程正在搜索/解析（`netBusy`），再叠上来
+       * 就是在同一时刻往上堆请求，正是 B站 412 的成因。
+       *
+       * 所以这里**让路**：等主流程忙完，下一跳心跳（每秒一次）再试。
+       *
+       * ⚠️ 注意预热**不参与 `netBusy`**（不把它算进 `_netBusyCount`）：
+       * 它是后台行为，用户什么都没点，不该因此看到按钮变灰。
+       * 下面的 `electronApi` 调用因此**不套 `withNet`** —— 它有自己这套
+       * `_warming` / `_warmTries` / `_warmRetryAt` 节流。
+       */
+      if (this.netBusy) return;
+      /**
        * 失败后的重试节流：心跳是每秒一次，光看 `_warmTries` 做不到「间隔 3 秒」——
        * 三次会在 3 秒内打完。所以还要看上次失败的时间戳。
        */
@@ -1467,6 +1982,11 @@ export default defineComponent({
       if (this._warm[dir]?.song === songName) return; // 已经是热的
       this._warming[dir] = true;
       try {
+        /**
+         * ⚠️ 预热**不套 `withNet`**（不参与 `netBusy`，理由见函数开头那段）——
+         * 它是后台行为，用户什么都没点，不该因此看到按钮变灰。
+         * 防叠加靠入口处的「有请求在飞就让路」+ 它自己的 `_warming` 标记。
+         */
         const res = await electronApi.searchSong(parts.song, parts.singer);
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         const list = videos;
@@ -1492,7 +2012,7 @@ export default defineComponent({
            * **每秒发一次真网络请求，永不停止**。
            *
            * 症状：控制台同一个关键词刷几十行「搜索结果为空」，
-           * 界面变卡（尤其是「歌名-歌手」很长的搜索键，B 站必然搜不到）。
+           * 界面变卡（尤其是「歌名-歌手」很长的缓存键，B 站必然搜不到）。
            *
            * 现在按「重试 3 次、间隔 3 秒」处理：没到上限就等下一轮心跳
            * （心跳本身是 1 秒一次，所以额外加一个 3 秒的节流由 `_warmTries` 的时间戳控制）。
@@ -1505,18 +2025,21 @@ export default defineComponent({
             console.warn(
               `[prefetch] ${dir === 'next' ? '下一首' : '上一首'}《${songName}》预热失败 ` +
                 `${WARM_MAX_TRIES} 次（搜不到视频），不再重试。` +
-                (this.isLoggedIn ? '' : '（未登录时 B 站只返回部分结果，登录后可能就能找到了）'),
+                (this.isLoggedIn ? '' : '（未登录，登录后可能就能找到了）'),
             );
             /**
              * 提示用户 —— 但**只在未登录时**弹，因为那才是他能采取行动的情况。
              *
              * 已登录还搜不到，多半是这首歌本身在 B 站没有对应视频（歌名太长、
              * 多歌手用「、」连起来那种），提示「请登录」是误导。
+             *
+             * ⚠️ 文案**不描述 B 站的返回机制**（别说「未登录时只返回部分结果」）——
+             * 那是内部行为，写进用户可见的提示里没必要。
              */
             if (!this.isLoggedIn) {
               this.$notify({
                 title: '有歌曲预热失败',
-                message: `《${songName}》搜不到视频。未登录时 B 站只返回部分结果，登录后可能就能找到了。`,
+                message: `《${songName}》搜不到视频。登录后再试一次，通常就能找到了。`,
                 type: 'warning',
                 duration: 6000,
               });
@@ -1754,7 +2277,7 @@ export default defineComponent({
        */
       if (this.dashSource) {
         this._videoErrorCount = 0;
-        this.$message.warning('高清（dash）流播放失败，已自动切回 720P');
+        this.$message.warning('高清流播放失败，已自动切回 720P');
         this.fallbackToDurl();
         return;
       }
@@ -1822,6 +2345,15 @@ export default defineComponent({
         this._endStallHandled = false;
         this._stallSince = 0;
         this._stallRecoveries = 0;
+        /**
+         * 卡顿恢复链的两个计数器也要归零
+         *
+         * ⚠️ **只在这里归零**（新视频真正开始播），不在 `applyVideoSource` 里：
+         * 那个函数在「换备用源 / 降 durl」时也会被调用 —— 如果在那里归零，
+         * 换源后计数器清零，就会**永远在第一个备用源上打转**，降级链走不下去。
+         */
+        this._stallUrlIndex = 0;
+        this._stallQualityDrops = 0;
         this._progressPos = 0;
         this._lastProgressAt = Date.now();
         // 如果这次切进来的正是预热过的那首，对应槽位就作废了
@@ -1846,6 +2378,15 @@ export default defineComponent({
       // 用户第一次点播放键只是把它翻成 true（pause 空操作），要点第二次才真的重播。
       const v = this.videoEl();
       if (v) this.paused = v.paused;
+      /**
+       * ★ 立刻同步定时器状态（不要等下一秒的 tick）
+       *
+       * 踩过：冻结判断只在每秒 tick 里做，于是**点暂停后倒计时还会多跑一秒**
+       * —— 用户在 `xx:59.1` 暂停，下一次 tick 在 `xx:00.0` 才切成冻结，
+       * 那一刻剩余时间已经从 59 掉到 58。
+       * 在 `play` / `pause` 事件里直接同步，冻结就发生在事件那一刻。
+       */
+      this._sleepTimer?.syncNow();
       this.syncTrayState();
       this.updateMediaSession();
     },
@@ -1917,6 +2458,13 @@ export default defineComponent({
         this._progressPos = 0;
         this._lastProgressAt = Date.now();
         this._stallSince = 0;
+        /**
+         * 恢复链的两个计数器也复位：这一圈是**新的一次播放**，
+         * 从主地址重新试起，降清晰度的额度也重新给满。
+         * （跟 `onVideoLoaded` 里那处是同一个道理，只是单曲循环走不到那里。）
+         */
+        this._stallUrlIndex = 0;
+        this._stallQualityDrops = 0;
         this.paused = false;
         this.syncTrayState();
         this.updateMediaSession();
@@ -1925,6 +2473,17 @@ export default defineComponent({
       }
     },
     videoControl(event: VideoControlAction): void {
+      /*
+       * ⚠️ 这里**不需要**再判 `netBusy`
+       *
+       * 「会发请求」的只有 `before` / `next` 两个动作，而它们最终都会走到
+       * `prev()` / `next()` —— 那两个函数**内部**已经统一守住了 `netBusy`
+       * （见 `next()` 的注释）。在这里再判一次是重复的，而且容易让人误以为
+       * 「守卫只在这个入口有效」。
+       *
+       * 模板里的 `@click="busy ? null : ..."` 是**另一回事**：那儿只负责
+       * 给用户「点不动」的视觉反馈（灰掉 + not-allowed），不承担拦截职责。
+       */
       switch (event) {
         case 'list':
         case 'vList':
@@ -2116,7 +2675,7 @@ export default defineComponent({
        * - `videoListKeyword` **不能**在这里就跟成新歌：`videoError` 靠
        *   「`videoListKeyword` 是否等于 `songName`」判断这个错误是不是当前这首歌的，
        *   提前改掉会让「上一首的视频报错」被算到新歌头上。
-       *   换清晰度 / 退 durl 需要关键字时统一用 `this.songName`（它就是搜索键）。
+       *   换清晰度 / 退 durl 需要关键字时统一用 `this.songName`（它就是缓存键）。
        * - 标题回退成歌名（见模板的 `videoName || songName`），等搜索回来再换成真标题。
        */
       this.videoListKeyword = '';
@@ -2140,6 +2699,26 @@ export default defineComponent({
       this._lastProgressAt = Date.now();
       this._stallSince = 0;
       this._stallRecoveries = 0;
+      /**
+       * ★ 卡顿**恢复链的两个计数器**也必须在这里归零（踩过）
+       *
+       * 它们是「当前这条流试到第几个备用源 / 降了几档清晰度」，而切歌意味着
+       * **换了一条全新的流** —— 旧计数对新的流没有任何意义。
+       *
+       * 原来只在 `onVideoLoaded`（真正开始播）里复位，于是有个盲区：
+       * 新歌若在 `loadeddata` **之前**就卡住（`checkPlaybackStall` 的
+       * `neverStarted` 分支正是为这个场景写的），那次复位永远不会发生。
+       * 带着上一首的旧计数执行恢复链的后果：
+       *
+       * ```
+       * _stallUrlIndex=1     → 直接跳到第 3 个备用源，跳过本首歌自己的第 2 个候选
+       * _stallQualityDrops=3 → 已到 MAX_QUALITY_DROPS，自动降清晰度对本首**永不生效**
+       * ```
+       *
+       * 也就是「第二首新歌的表现莫名比第一首差很多」。
+       */
+      this._stallUrlIndex = 0;
+      this._stallQualityDrops = 0;
       // 进度也属于上一首：不复位的话 playCurrent 会把上一首的秒数写进 resumeTime，
       // 键盘 / SMTC 拖进度还会拿它去定位新歌
       this.currentTime = 0;
@@ -2159,7 +2738,7 @@ export default defineComponent({
        */
 
       try {
-        const res = await electronApi.searchSong(parts.song, parts.singer);
+        const res = await this.withNet(() => electronApi.searchSong(parts.song, parts.singer));
         if (token !== this._songToken) return;
         // searchSong 的 data 形状由搜索接口决定，这里收敛成 BiliVideo
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
@@ -2167,8 +2746,8 @@ export default defineComponent({
          * 主进程在「过滤后一条不剩」时会带 `filtered: true`
          *
          * 那表示**搜索本身成功了**，只是所有结果都被过滤规则（标题不含歌名 /
-         * 时长对不上 / 命中屏蔽词）挡掉了 —— 这时**不能重试**：
-         * 重试只会拿到同样的一批、再被同样地挡掉，白打 3 次请求、白等两秒。
+         * 时长对不上 / 命中屏蔽词）挡掉了 —— 这和「搜不到」是两回事，
+         * 提示也得分开说（见下面 `notifyFilteredEmpty` / `notifySearchEmpty`）。
          */
         const filteredEmpty = Boolean((res.data as { filtered?: boolean } | null)?.filtered);
         /**
@@ -2181,37 +2760,19 @@ export default defineComponent({
          */
         let list = videos;
 
-        /**
-         * 一首都没搜到 -> 重试几次（最多 3 次）
+        /*
+         * ⚠️ 这里**不再重试**（原来最多重试 3 次，已删除）
          *
-         * 空结果现在已经**不会写进缓存**了（见 `api:searchSong`），所以重试一定是真联网。
-         * 之所以还要重试：单次搜索为空往往只是偶发（网络抖动、风控、接口抽风），
-         * B 站搜索本身很稳，连着 3 次都搜不到才值得怀疑是环境问题。
+         * 用户明确要求：「别搞什么重试了，搜索结果为空就提醒用户不要切歌太频繁，
+         * B站不会返回空结果的」。
          *
-         * 每次都用 `skipCache`，避免上一次的空结果又被读出来。
-         *
-         * ⚠️ `filteredEmpty` 时**跳过重试**（见上面的说明）—— 那是合法结果，不是失败。
+         * 理由很硬：**B站搜索不会对一首正常存在的歌返回 0 条** ——
+         * 第 1 轮就空几乎只有一种解释：**被风控了**。
+         * 而重试恰恰是在风控状态下继续打请求，只会让封禁更久
+         * （原来「4 轮降级 × 3 次重试」最坏能打出二十多个请求，
+         * 正是被 412 的元凶）。现在由主进程直接抛 `RateLimitError`，
+         * 下面 catch 分支给用户一句准确的提示。
          */
-        if (list.length === 0 && !filteredEmpty) {
-          const MAX_RETRY = 3;
-          for (let attempt = 1; attempt <= MAX_RETRY && list.length === 0; attempt++) {
-            if (token !== this._songToken) return;
-            console.warn(
-              `[search] 《${songName}》搜索结果为空，第 ${attempt}/${MAX_RETRY} 次重试`,
-            );
-            const retry = await electronApi.searchSong(parts.song, parts.singer, true);
-            if (token !== this._songToken) return;
-            const retryVideos = (retry.data as { result?: BiliVideo[] } | null)?.result ?? [];
-            list = retryVideos;
-            if (list.length > 0) {
-              console.log(`[search] 《${songName}》第 ${attempt} 次重试成功，找到 ${list.length} 个视频`);
-              res.data = retry.data as never;
-              break;
-            }
-            // 还有下一次的话，稍等一下再试 —— 连着打三次反而更容易被风控
-            if (attempt < MAX_RETRY) await new Promise((r) => setTimeout(r, 800));
-          }
-        }
 
         this.videoList = list;
         this.videoListKeyword = songName;
@@ -2255,8 +2816,58 @@ export default defineComponent({
         this.videoList = [];
         this.currentVideoIndex = -1;
         this.clearNowPlaying();
-        this.$message.error(`《${songName}》${this.errMsg(err)}`);
+        /**
+         * 提示要区分「被风控」和「其它失败」—— 两者**解决办法完全不同**
+         *
+         * 主进程遇到 B站的 **HTTP 412**（或「第 1 轮就返回 0 条」）会抛
+         * `RateLimitError`，错误消息里已经写明「切歌太快」。那种情况
+         * 说「网络有问题」会把用户引到完全错误的方向 —— 他需要的是**等一会儿**，
+         * 而不是去检查网络或重新登录。
+         */
+        if (this.isRateLimitErr(err)) {
+          this.$notify({
+            /**
+             * ⚠️ 文案**不能出现技术细节**（「限流」/「412」/「请求被拦」）
+             *
+             * 用户会把界面截图发出去。写成「被 B 站限流了」「B 站把请求拦下来了」，
+             * 等于把「我们在按接口规则大量请求」这件事写在屏幕上 —— 没必要，
+             * 而且对用户也毫无帮助（他只想知道「怎么办」）。
+             *
+             * 所以只说**用户能观察到的现象** + **该怎么办**：
+             * 「暂时搜不到」+「等一会儿」+「别连点」。
+             */
+            title: '暂时搜不到结果',
+            message:
+              `《${songName}》没搜到结果。这通常是切歌切得太频繁导致的，` +
+              '过一两分钟再试就好；期间尽量别连续切歌。',
+            type: 'warning',
+            duration: 0,
+          });
+        } else {
+          this.$message.error(`《${songName}》${this.errMsg(err)}`);
+        }
       }
+    },
+    /**
+     * 这个错误是不是「操作太频繁，暂时搜不到」
+     *
+     * ## 为什么只能按 message 判断（不能按类型）
+     *
+     * 主进程抛的 `RateLimitError` 经 IPC 传过来**只剩 message**
+     * （Error 被序列化，`name` / 原型链 / 自定义字段全丢），
+     * 所以渲染层拿不到那个类 —— 只能比 message。
+     *
+     * ## 为什么匹配的是一句**中性文案**
+     *
+     * 匹配 **主进程那份固定的中性文案**（`RATE_LIMIT_MESSAGE`）——
+     * 它同时也是用户可能看到的那句，所以不能写「风控」「412」这类词
+     * （用户会截图）。两边用**同一句话**比对，既准确又不带敏感信息。
+     *
+     * ⚠️ 改主进程那句文案时，这里要同步改 —— 所以两边都留了注释互相指向。
+     */
+    isRateLimitErr(err: unknown): boolean {
+      const msg = err instanceof Error ? err.message : String(err ?? '');
+      return msg.includes('暂时搜不到结果');
     },
     /**
      * **结果被过滤规则全部挡掉**时的提示
@@ -2276,12 +2887,16 @@ export default defineComponent({
       });
     },
     /**
-     * 搜索彻底失败（重试 3 次仍没有结果）时的提示
+     * 搜索没结果时的提示
      *
      * 分两种情况说，因为**解决办法完全不同**：
-     *  - 未登录：B 站对未登录用户只放出一部分搜索结果，提示去登录；
-     *  - 已登录：连着 3 次都搜不到，基本不是 B 站的问题了（它没那么拉），
-     *    更可能是本地网络 / 代理 / 风控，让用户检查网络。
+     *  - 未登录：提示去登录（登录后能搜到的确实更多）；
+     *  - 已登录：更可能是本机网络 / 代理的问题，提示检查网络。
+     *
+     * ⚠️ 文案里**不要提「重试了几次」**（现在的代码根本不重试，
+     * 说重试过是假话）；也**不要描述 B 站的返回机制**
+     * （「只返回部分结果」这种说法把内部行为写在用户屏幕上，没必要）——
+     * 只说「登录后通常能找到」就够了。
      *
      * 用 `$notify`（右上角浮层）而不是 `$message`（一闪而过的 toast）：
      * 这两句话都带操作指引，用户需要时间读，而且要点右上角头像去登录。
@@ -2290,17 +2905,15 @@ export default defineComponent({
       if (!this.isLoggedIn) {
         this.$notify({
           title: `《${songName}》没有找到视频`,
-          message:
-            '未登录时 B 站只会返回部分搜索结果。点右上角头像登录后再试，通常就能找到了。',
+          message: '登录后再试一次，通常就能找到了。点右上角头像登录。',
           type: 'warning',
           duration: 8000,
         });
         return;
       }
       this.$notify({
-        title: `《${songName}》搜索失败`,
-        message:
-          '已经重试了 3 次都没有结果。请检查一下网络连接（或代理 / VPN）是否正常，稍后再试。',
+        title: `《${songName}》没有找到视频`,
+        message: '请检查一下网络连接（或代理 / VPN）是否正常，稍后再试。',
         type: 'error',
         duration: 8000,
       });
@@ -2323,14 +2936,22 @@ export default defineComponent({
     ): Promise<void> {
       const token = ++this._videoToken;
       try {
-        const res = await electronApi.resolveVideoUrl(
-          bvid,
-          keyword,
-          opts.skipCache ?? false,
-          opts.noDash || this._dashDisabled,
-          // 本次会话里手动选过的优先；没选过就交给主进程用设置里的默认值
-          opts.qn ?? this.selectedQn ?? undefined,
-          opts.audioId ?? this.selectedAudioId ?? undefined,
+        /**
+         * ★ 用 `withNet` 包住这次解析 —— 期间禁用控制栏里会发请求的控件
+         *
+         * 解析是**切歌/换清晰度必经的一次网络往返**（除非命中缓存）。
+         * 包住它，用户在这段等待里点不动「上一首 / 下一首」，避免请求叠加。
+         */
+        const res = await this.withNet(() =>
+          electronApi.resolveVideoUrl(
+            bvid,
+            keyword,
+            opts.skipCache ?? false,
+            opts.noDash || this._dashDisabled,
+            // 本次会话里手动选过的优先；没选过就交给主进程用设置里的默认值
+            opts.qn ?? this.selectedQn ?? undefined,
+            opts.audioId ?? this.selectedAudioId ?? undefined,
+          ),
         );
         if (token !== this._videoToken) return; // 已有更新的请求，丢弃本次结果
         /**
@@ -2364,6 +2985,59 @@ export default defineComponent({
           normalizeImageUrl(res.pic ?? null) ||
           normalizeImageUrl(video?.pic ?? null) ||
           '';
+        /**
+         * ★ 这条视频**正在播**，但列表里它的时长可能是空的 —— 补上
+         *
+         * 原因：B 站搜索接口**有些结果压根不带 `duration`**，缓存就存成 NULL，
+         * 列表那一行显示空秒数。可这条视频明明已经在播了
+         * （用户看到「正在播的视频没有时长」就是这里缺的）。
+         *
+         * 两个来源，按可靠度取：
+         *  1. 主进程解析时回传的 `res.duration`（view 响应里的权威值）；
+         *  2. 兜底用 `<video>` 元素自己的 `duration`
+         *     （分片 MP4 的 mvhd 常是 0，所以 0 / NaN / Infinity 都要过滤掉）。
+         *
+         * 补完**顺手回写库** —— 不然下次重开还是空的，每次都要重新补一遍。
+         *
+         * ## ⚠️ 判据不能是 `video && !video.duration`
+         *
+         * `video` 是 `findIndex` 的结果，而这段代码上面的注释自己就写着
+         * 「`selectedBvid` 是历史选择，**可能不在本次搜索结果里** → 置 -1」。
+         * 那种情况下 `video` 是 `undefined`，原来的写法会把整段直接跳过：
+         * 界面不补、库里也永远是 NULL —— 而 `res.duration` 其实**已经在手上**，
+         * 正是这个功能要处理的「搜索没给时长」的那类视频，等于白拿到了。
+         *
+         * 所以判据改成「**时长确实还缺**」：列表项不存在时也照样回写库；
+         * 列表项存在且缺时才顺带就地赋值（响应式列表立刻显示出来）。
+         */
+        const needFill = !video || !video.duration;
+        if (needFill) {
+          const el = this.videoEl();
+          const fromEl =
+            el && Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
+          const fromRes =
+            typeof res.duration === 'number' &&
+            Number.isFinite(res.duration) &&
+            res.duration > 0
+              ? res.duration
+              : null;
+          const filled = fromRes ?? fromEl;
+          if (filled) {
+            const sec = Math.round(filled);
+            /** 列表里有这一条时**就地改**：`videoList` 是响应式的，立刻显示出来 */
+            if (video) video.duration = sec;
+            /**
+             * 回写库：只更新这一条的时长，不动顺序、不动其它字段
+             *
+             * 失败不影响播放（只是下次还要再补一次），所以静默。
+             */
+            if (this.songName) {
+              void electronApi.fillVideoDuration(this.songName, bvid, sec).catch(() => {
+                /* 补时长失败不影响播放 */
+              });
+            }
+          }
+        }
         // 清晰度 / 音质只认 playurl 响应自己报的档位（不是请求参数里的 qn）
         this.videoQuality = res.quality ?? '';
         this.videoQualityDesc = res.qualityDesc ?? '';
@@ -2406,6 +3080,26 @@ export default defineComponent({
      * 选择只作用于**当前这一首**（`selectedQn` / `selectedAudioId`，换歌时在
      * `changeSong` 里清掉），不改设置里的默认值 —— 默认值在设置界面里改。
      * 重新解析会换掉流地址，所以先把播放进度记下来。
+     *
+     * ## ★ **不传 `skipCache`**（这里改过一次）
+     *
+     * 原来传的是 `skipCache: true`（「我改了清晰度，快重新取」）。但那是**多余**的：
+     * B站给的一条 dash 流里**本来就带全部候选档位**，我们库里存的
+     * `playurl_result` 是**整个 playurl 响应**。所以换清晰度只需要
+     * `extractDashStreams(缓存的 playurl, 新qn, 新audioId)` —— 从同一份响应里
+     * 按新档位重新挑一条流，**根本不用联网**。
+     *
+     * 主进程那边（`api:resolveVideo`）的判断链已经覆盖了所有该联网的情况：
+     *
+     * ```
+     * 地址有效 且 缓存里有目标档位 → 用缓存（不联网）      ← 换清晰度走这条
+     * 地址**已过期**              → 自动重新解析（联网）  ← 日志会打「缓存地址已过期」
+     * 缓存里没有那个档位          → 自动重新解析（联网）  ← needDashUpgrade
+     * 登录态变了（解锁更高档）      → 自动重新解析（联网）  ← loginChanged
+     * ```
+     *
+     * 也就是说：**该联网的时候它自己会联**。`skipCache` 只是把「地址明明还没过期」
+     * 这条快路径也一起废掉，白打一次请求 —— 而每一次多余的请求都在推高被 412 的概率。
      */
     async switchQuality(kind: 'video' | 'audio', id: number): Promise<void> {
       if (kind === 'video') this.selectedQn = id;
@@ -2413,14 +3107,20 @@ export default defineComponent({
 
       const bvid = this.currentBvid;
       if (!bvid) return;
+      /**
+       * ★ 冷却 3 秒：刚改完清晰度/音质，两个下拉先禁用一会儿
+       *
+       * 放在**解析之前**（不是之后）：这样「解析期间 + 解析完成后 3 秒」
+       * 连起来是禁用的，中间没有可连点的空窗。
+       */
+      this.startQualityCooldown();
       const resumeAt = this.currentTime;
       if (resumeAt > 1) {
         this.seekAfterLoad = resumeAt;
         this.seekAfterLoadFor = this.songName;
       }
-      await this.changeVideo(bvid, this.videoListKeyword || this.songName, {
-        skipCache: true,
-      });
+      /** 不传 skipCache —— 见上面那段说明（该联网时主进程自己会联） */
+      await this.changeVideo(bvid, this.videoListKeyword || this.songName);
     },
     /**
      * 把当前的 dash / durl 结果挂到 `<video>` 上
@@ -2643,7 +3343,7 @@ export default defineComponent({
       if (!parts || !songName) return;
       const token = this._songToken;
       try {
-        const res = await electronApi.searchSong(parts.song, parts.singer, true);
+        const res = await this.withNet(() => electronApi.searchSong(parts.song, parts.singer, true));
         if (token !== this._songToken) return;
         const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
         this.videoList = videos;
@@ -2668,7 +3368,7 @@ export default defineComponent({
       const songName = this.songName;
       const isFav = this.favoriteBvids.includes(bvid);
       try {
-        const { favorites } = await electronApi.setFavorite(songName, bvid, !isFav);
+        const { favorites } = await this.withNet(() => electronApi.setFavorite(songName, bvid, !isFav));
         /**
          * 用返回值刷新收藏标记（而不是本地取反）：主进程可能因为
          * 「这条已经不在候选列表里」而新建一行，本地取反就与它不一致了。
@@ -2721,7 +3421,7 @@ export default defineComponent({
          * 主进程会在库里补插这一行（搜索没搜到的 bvid 本来不在 videos 表里），
          * 并把它挪到第一位 —— 与收藏完全同一条路径，不需要另写一套。
          */
-        const { favorites } = await electronApi.setFavorite(songName, info.bvid, true);
+        const { favorites } = await this.withNet(() => electronApi.setFavorite(songName, info.bvid, true));
         const favSet = new Set(favorites);
         this.videoList = this.videoList.map((v) => ({
           ...v,
@@ -2936,7 +3636,7 @@ export default defineComponent({
     getSongName(index: number): string | null {
       if (!this.songs || this.songs.length === 0) return null;
       const song = this.songs[index];
-      return song ? toSearchKey(song) : null;
+      return song ? toCacheKey(song) : null;
     },
     /** 取第 index 首歌的结构化信息（供界面展示封面/专辑） */
     getSong(index: number): StructuredSong | null {
@@ -2949,11 +3649,47 @@ export default defineComponent({
      */
     next(): void {
       if (!this.songs || this.songs.length === 0) return;
+      /**
+       * ★ **`netBusy` 时忽略切歌**（统一守卫，所有入口都受保护）
+       *
+       * 放在 `next()` / `prev()` **内部**而不是每个调用点：
+       * 会调它们的有控制栏按钮、托盘菜单、系统媒体键、将来的快捷键 ——
+       * 逐个补漏迟早会漏。放在这里，**任何**入口在请求在飞时都点不动。
+       *
+       * 为什么必须拦：切歌 = 重新搜索 + 解析地址（两个请求）。
+       * 连点就是请求成倍叠加，B站直接 412 风控。
+       */
+      if (this.netBusy) {
+        this.notifyNetBusy();
+        return;
+      }
       const index =
         this.currentMode === this.MODE.random
           ? this.getRandomNext()
           : (this.currentIndex + 1) % this.songs.length;
       this.changeSong(index);
+    },
+    /**
+     * ★ 提示「正在加载，先别点」——**必须给反馈**，否则用户以为按钮坏了
+     *
+     * 请求在飞的时候，控制栏的切歌按钮被灰掉、托盘/媒体键被忽略。
+     * 但「点了没反应」和「按钮坏了」在用户看来是一样的 —— 所以补一条提示。
+     *
+     * 用 `$message`（顶部一闪而过的 toast）而不是 `$notify`（右上角浮层）：
+     *  - 这事**不需要用户做什么**，只是告诉他「等一下，不是坏了」；
+     *  - 而且它可能被连续触发（用户连点），浮层会叠一屏 —— toast 只有一条。
+     *
+     * 加**节流**（`NET_BUSY_HINT_MS`）：连点时别刷屏。
+     */
+    notifyNetBusy(): void {
+      const now = Date.now();
+      if (now - this._lastNetBusyHintAt < NET_BUSY_HINT_MS) return;
+      this._lastNetBusyHintAt = now;
+      /**
+       * ⚠️ 文案**不提技术细节**（别说「限流」「请求被拦」）——
+       * 用户会截图。只说「在加载、等一下」就够，这也是他需要知道的全部。
+       */
+      this.$message.info('正在加载中，请稍候……');
     },
     /**
      * 自绘托盘菜单打开期间吞掉窗口内的鼠标点击（捕获阶段）
@@ -2997,6 +3733,11 @@ export default defineComponent({
     },
     prev(): void {
       if (!this.songs || this.songs.length === 0) return;
+      /** ★ `netBusy` 时忽略切歌（统一守卫，理由见 `next()` 那段） */
+      if (this.netBusy) {
+        this.notifyNetBusy();
+        return;
+      }
       const index =
         this.currentMode === this.MODE.random
           ? this.getRandomPrev()
@@ -3139,9 +3880,22 @@ export default defineComponent({
       this.playControl();
     });
     this.removeTrayPrev = electronApi.onTrayPrev(() => {
+      /**
+       * ★ 托盘切歌也要守 `netBusy`（用户要求「托盘控制栏能 ban 一起 ban」）
+       *
+       * 托盘菜单是个迷你控制台，连点它和连点控制栏的「上一首」是**同一件事**：
+       * 每次都会重新搜索 + 解析地址。请求在飞的时候直接忽略，
+       * 免得和屏幕上的控制栏一样把请求叠加起来。
+       *
+       * ⚠️ 只拦**会发请求**的（上一首 / 下一首）。播放暂停、音量、进度、
+       * 静音这些**本地操作照常** —— 用户不该因为后台在搜歌就不能暂停。
+       */
+      if (this.netBusy) return;
       this.prev();
     });
     this.removeTrayNext = electronApi.onTrayNext(() => {
+      /** 同上：切歌会发请求，`netBusy` 时忽略 */
+      if (this.netBusy) return;
       this.next();
     });
     this.removeTrayToggleMode = electronApi.onTrayToggleMode(() => {
@@ -3184,10 +3938,18 @@ export default defineComponent({
      *
      * 以前这种情况是**完全静默**的（主进程用空 catch 吞掉了原生模块加载失败），
      * 用户点了按钮什么都不发生，无从判断是环境不支持还是程序坏了。
+     *
+     * ⚠️ 主进程给的 `reason` 是**技术原因**（`找不到桌面壁纸层（WorkerW）`、
+     * `SetParent 抛错: ...` 之类），**不能直接显示给用户** ——
+     * 他看不懂，而且没必要把内部实现写在界面上。
+     * 所以界面统一说一句人话，技术原因只进控制台日志（排查用）。
      */
     this.removeWallpaperUnavailable = electronApi.onWallpaperUnavailable(
       (reason) => {
-        this.$message.warning(`壁纸模式不可用：${reason}`);
+        console.warn('[wallpaper] 不可用（技术原因）：', reason);
+        this.$message.warning(
+          '壁纸模式在当前系统上用不了。可以继续用窗口模式，功能不受影响。',
+        );
       },
     );
     this.initWallpaperState();
@@ -3201,6 +3963,14 @@ export default defineComponent({
     this.setupAudioDeviceWatch();
     // 片尾看门狗：常驻一个 1 秒的心跳（内部条件很严，平时几乎不做任何事）
     this.startEndWatch();
+    /**
+     * 定时暂停：创建实例并订阅状态
+     *
+     * 放在这里（而不是 `created`）是因为它的 `readVideo` 回调要读 `<video>`，
+     * 而那个元素要等模板挂载完才拿得到。定时器本身只有 `start()` 之后才
+     * 开始 tick，所以在这里创建完全够用。
+     */
+    this.setupSleepTimer();
     /**
      * 自绘托盘菜单打开期间，把窗口内的点击吞掉。
      *
@@ -3228,6 +3998,11 @@ export default defineComponent({
   beforeUnmount() {
     this.stopDashSession();
     this.stopBufferTicker();
+    // 定时暂停：停掉 ticker 并退订（否则组件没了 interval 还在跑）
+    this._sleepUnsub?.();
+    this._sleepUnsub = null;
+    this._sleepTimer?.dispose();
+    this._sleepTimer = null;
     navigator.mediaDevices?.removeEventListener?.('devicechange', this.onAudioDeviceChange);
     // 自绘托盘菜单的守卫与其他监听一起摘掉
     // （守卫本身已经注释掉，这里同样注释，留着对照）
@@ -3329,6 +4104,13 @@ export default defineComponent({
   --panel-active: rgba(111, 140, 255, 0.35);
   --panel-shadow: 0 10px 32px rgba(0, 0, 0, 0.25);
   --panel-divider: rgba(var(--text-rgb), 0.18);
+  /**
+   * 更淡的次级分隔线（关键词加权下面那条、分值档之间）
+   *
+   * 比 `--panel-divider` 淡一半：这两处是**同一块里的细分**，
+   * 不该和「设置项之间」的线一样重，否则一屏全是横线。
+   */
+  --panel-divider-fine: rgba(var(--text-rgb), 0.09);
 
   /**
    * 浮层未悬停时的不透明度：**固定行为**，鼠标移上去变 1。
@@ -3552,6 +4334,30 @@ html[data-tint='dark'] {
 }
 .titlebar-btn:hover {
   background: var(--glass-bg-strong);
+}
+/**
+ * 定时暂停按钮
+ *
+ * 三种显示：
+ *  · 没定时   —— 「定时」
+ *  · 倒计时中 —— 剩余时间（`1:23:45` / `23:45`），强调色
+ *  · 已归零、在等视频播完 —— `00:00`，**红色**（`--accent-danger`）
+ *
+ * `tabular-nums` 是必须的：倒计时每秒刷新，数字宽度不一样会让按钮左右抖动。
+ */
+.sleep-trigger {
+  font-variant-numeric: tabular-nums;
+}
+.sleep-trigger--active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+/* 计时已结束、正在等视频播完：红色，提示「马上要执行了」 */
+.sleep-trigger--waiting {
+  border-color: var(--accent-danger);
+  color: var(--accent-danger);
+  font-weight: 600;
 }
 
 .user-info {

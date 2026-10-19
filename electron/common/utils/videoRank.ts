@@ -31,15 +31,22 @@
  * 直接累加。代价是「断层分不再有数学上的保证」—— 见下面 `LAYER_BOTH` 的说明。
  */
 
-/** 一首歌的搜索键 `"歌名-歌手"`（已废弃，仅为兼容旧数据保留） */
-export type SearchKey = string
+/** 一首歌的缓存键 `"歌名-歌手"`（已废弃，仅为兼容旧数据保留） */
+export type CacheKey = string
 
 /** 一条候选视频排序与过滤所需的最小形状 */
 export interface RankableVideo {
   bvid?: string
   title?: string
-  /** B 站给的时长，**可能是 `"4:03"` 字符串或秒数**（两种形状都见得到） */
-  duration?: string | number | null
+  /**
+   * 时长**秒数**（`null` / 缺省 = 未知）
+   *
+   * ⚠️ **进来之前就该是秒**：B站搜索给的是 `"4:03"` 字符串，
+   * 那个转换统一在 `biliApi.extract` 里做（唯一入口）。
+   * 这里不再接受字符串 —— 原来 `passHardFilter` 每次判断都要
+   * 解析一遍，既慢又容易漏。
+   */
+  duration?: number | null
   favorites?: boolean
 }
 
@@ -53,7 +60,7 @@ export interface RankOptions {
   /**
    * 歌名（**纯歌名**，不含歌手）
    *
-   * ⚠️ 以前这里是一个 `"歌名-歌手"` 拼串，用的时候再 `splitSearchKey` 拆开 ——
+   * ⚠️ 以前这里是一个 `"歌名-歌手"` 拼串，用的时候再 `splitCacheKey` 拆开 ——
    * 那是「先合并再拆开」的多余往返：歌名和歌手本来就是**两个独立字段**
    * （歌单里、界面上都分开存），只有拼搜索词那一刻才需要放在一起。
    *
@@ -107,6 +114,15 @@ const LAYER_NAME_ONLY = 0
  */
 const LONG_FORM_HINT_RE = /mv|官方|live|现场/i
 const LONG_FORM_FACTOR = 1.7
+
+/**
+ * 时长**下界**的兜底比例（歌长 × 它）
+ *
+ * 只用来防止「容差设得很大时下界变成负数」—— 正常情况由容差决定，
+ * 这个系数只是最后一道防线。**用户指定 0.3**（原来是 0.5，会误杀短版本）。
+ * 详见 `passHardFilter` 里那段说明。
+ */
+const LOWER_BOUND_RATIO = 0.3
 
 /** 去掉 HTML 标签（B 站的 `title` 里带 `<em class="keyword">` 高亮标记） */
 const stripHtml = (s: unknown): string => String(s ?? '').replace(/<[^>]*>/g, '')
@@ -178,77 +194,48 @@ const normalize = (s: unknown): string =>
   toSimplified(stripHtml(s)).toLowerCase().replace(/\s+/g, '')
 
 /**
- * 「规范歌名」：剥掉**括号里的版本标记**
+ * ★ 去掉歌名里**所有**括号及其内容（循环剥到没有括号为止）
  *
  * ```
- * Take Me Hand (吉他版) → Take Me Hand
- * 童话（Live）          → 童话
- * 起风了 (旧版)         → 起风了
+ * 起风了 (Live)          → 起风了
+ * 九重楼 (不敢独上九重楼)   → 九重楼     ← 括号里是副标题，也剥掉
+ * 童话【伴奏】            → 童话
+ * A (B) [C]             → A
  * ```
  *
- * 为什么剥：括号里是**版本修饰**，而 B 站标题里往往不写它 ——
- * 带着 `(吉他版)` 去比对，标题写「Take Me Hand」就匹配不上了。
- * 搜索时也该用剥过的词（`《Take Me Hand》歌曲` 而不是 `《Take Me Hand (吉他版)》歌曲`）。
+ * ## 为什么全剥（而不是只剥"像版本标记"的）
  *
- * ⚠️ **只剥"像版本标记"的括号**：括号里是歌名正文时保留
- * （`(Don't) Stop` / `(Everything I Do)` 这些括号属于歌名本身）。
+ * 原来只剥 `(Live)` / `(伴奏)` 这类版本词，结果是**括号里带副标题的歌全部搜不到**：
+ *
+ * ```
+ * 歌名「九重楼 (不敢独上九重楼)」
+ *   旧逻辑 → want = 九重楼(不敢独上九重楼)   ← 括号里没有版本词，不剥
+ *   B站标题 → 【Hi-Res】指尖笑《九重楼》…    ← 不含完整串
+ *   → 140 条候选全被挡
+ * ```
+ *
+ * ## ⚠️ 剥完没字了 → **那一轮只去掉括号符号、保留内容**
+ *
+ * `(Intro)` 全剥会变成空串，那就搜不了任何东西了。
+ * 所以遇到这种情况退化成「只去括号、留里面的字」：`(Intro)` → `Intro`。
  */
-const VERSION_HINT_RE =
-  /版|live|现场|remix|cover|伴奏|纯享|翻唱|原唱|吉他|钢琴|dj|acoustic|instrumental|demo|ver\.?|remaster|无损|hires|hi-res|高音质|女声|男声|童声|合唱|清唱|独唱/i
-
 export const baseSongName = (name: unknown): string => {
   let out = stripHtml(name).trim()
-  /** 反复剥：`A (Live) (Remaster)` 可能有多层 */
-  for (let round = 0; round < 3; round++) {
-    const next = out.replace(/[（(\[【]([^）)\]】]*)[）)\]】]/g, (m, inner: string) =>
-      VERSION_HINT_RE.test(inner) ? '' : m,
-    )
-    if (next === out) break
+  /**
+   * 上限 20 轮：正常歌名最多两三层括号。
+   * 加这个上限纯粹防御 —— 正则每次至少去掉一对括号，长度必然变短。
+   */
+  for (let round = 0; round < 20; round++) {
+    const re = /[（(\[【〔〖]\s*([^（()）[\]【】〔〖〗]*?)\s*[）)\]】〕〗]/g
+    if (!re.test(out)) break
+    const next = out.replace(re, '').replace(/\s+/g, ' ').trim()
+    /** 这一轮剥完没字了 → 只去括号符号，把内容留下 */
+    if (!next) {
+      return out.replace(/[（()）[\]【】〔〖〗]/g, '').replace(/\s+/g, ' ').trim()
+    }
     out = next
   }
   return out.replace(/\s+/g, ' ').trim()
-}
-
-/**
- * 时长解析成秒
- *
- * `RankableVideo.duration` 有**两种形状**：B 站搜索接口给 `"4:03"`，
- * 而缓存里存的、view 接口给的是秒数。所以两种都要认。
- *
- * 与 `@common/utils/duration` 的 `durationToSeconds` 是同一套规则，
- * 但那个函数的正则更严（`(\d{1,2}):(\d{2})`），而 B 站偶尔给 `"04:03"` 之外的
- * 形态，这里宽松一点、拿不到就返回 `null`（调用方据此**保留**而不是丢弃）。
- */
-export const durationSeconds = (raw: unknown): number | null => {
-  if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? raw : null
-  if (typeof raw !== 'string') return null
-  const s = raw.trim()
-  if (!s) return null
-  const parts = s.split(':').map((x) => Number(x))
-  if (parts.some((n) => !Number.isFinite(n))) return null
-  if (parts.length === 2) return parts[0] * 60 + parts[1]
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
-  const n = Number(s)
-  return Number.isFinite(n) && n > 0 ? n : null
-}
-
-/**
- * 把搜索键拆成歌名 / 歌手（只按**第一个** `-` 切：歌名本身可能带 `-`）
- *
- * ⚠️ **只用于解析旧数据**（`playlists.json` 里遗留的 `"歌名-歌手"` 字符串，
- * 经 `parseSearchKey` 走结构化）。
- *
- * **搜索链路里不要再调它** —— 那是「先拼成 `歌名-歌手` 再拆开」的多余往返：
- * 歌名和歌手本来就是两个独立字段，直接分别传 `song` / `singer`
- * 即可（见 `RankOptions`）。而且拆串天生有歧义（歌名里带 `-` 时）。
- */
-export const splitSearchKey = (searchKey: SearchKey): { song: string; singer: string } => {
-  const idx = searchKey.indexOf('-')
-  if (idx < 0) return { song: searchKey.trim(), singer: '' }
-  return {
-    song: searchKey.slice(0, idx).trim(),
-    singer: searchKey.slice(idx + 1).trim(),
-  }
 }
 
 /**
@@ -452,7 +439,7 @@ export const passHardFilter = (
 ): boolean => {
   const rawTitle = stripHtml(video.title)
   const title = normalize(rawTitle)
-  /** ★ 用**规范歌名**（剥掉 `(吉他版)` 这类版本标记）来判 */
+  /** ★ 用 `baseSongName` 处理过的歌名来判（**去掉所有括号及其内容**） */
   const want = normalize(baseSongName(song))
 
   /** ① 歌名必须**独立出现**（详见 `titleHasSongName`） */
@@ -470,10 +457,34 @@ export const passHardFilter = (
     Number.isFinite(songDurationSec) &&
     songDurationSec > 0
   ) {
-    const sec = durationSeconds(video.duration)
-    /** 视频时长解析不出来时**保留**（同上：不因缺数据而误杀） */
-    if (sec !== null) {
-      const lo = Math.max(songDurationSec - toleranceSec, songDurationSec * 0.5)
+    /**
+     * 视频时长**已经是秒**（`biliApi.extract` 在入口转好的，
+     * 库里 `videos.duration` 存的也是秒）—— 直接用，不再解析。
+     */
+    const sec = video.duration
+    /** 视频时长未知（`null` / 0）时**保留**（不因缺数据而误杀） */
+    if (typeof sec === 'number' && Number.isFinite(sec) && sec > 0) {
+      /**
+       * 下界 = `max(歌长 - 容差, 歌长 × LOWER_BOUND_RATIO)`
+       *
+       * 两个条件各管一件事：
+       *  - `歌长 - 容差`：正常的「允许比歌短多少」，由用户设的容差决定；
+       *  - `歌长 × 系数`：**兜底下限**，防止容差设得很大时下界变成负数
+       *    （那样任意短的视频都能过）。
+       *
+       * ## ⚠️ 系数原来是 0.5，用户改成 0.3
+       *
+       * 踩过：歌长 258 秒、容差 300 秒时
+       * ```
+       * 歌长 - 容差 = -42        ← 负数，被兜底顶掉
+       * 歌长 × 0.5  = 129        ← 实际生效的下界
+       * ```
+       * 于是「设了 300 秒的大容差」**完全没起作用**，下界还是 129 ——
+       * 把一条 117 秒的《歌颂》（标题正确、只是内容短）挡掉了。
+       *
+       * 改成 0.3 后同一个例子下界 = `258 × 0.3 = 77`，117 秒就能通过。
+       */
+      const lo = Math.max(songDurationSec - toleranceSec, songDurationSec * LOWER_BOUND_RATIO)
       /**
        * 上限：MV/Live/现场 类放宽 `×1.7`（降级轮次无条件放宽）
        *

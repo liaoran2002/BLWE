@@ -15,7 +15,8 @@ import {
 } from '@common/constants'
 import type { QualityOption } from '@common/constants'
 import type { UserInfo } from '@common/types/ipc'
-import { rankVideos } from '@common/utils/videoRank'
+import { rankVideos, baseSongName } from '@common/utils/videoRank'
+import { durationToSeconds } from '@common/utils/duration'
 
 const SEARCH_API = 'https://api.bilibili.com/x/web-interface/wbi/search/type'
 const NAV_API = 'https://api.bilibili.com/x/web-interface/nav'
@@ -317,13 +318,65 @@ async function biliHeaders(): Promise<Record<string, string>> {
   }
 }
 
+/**
+ * ★ **被风控**时抛出的专用错误
+ *
+ * B站的风控返回的是 **HTTP 412**（「请求被拦截」，响应体是一整页 HTML
+ * 而不是 JSON）。它和「网络断了 / 接口抽风」是**完全不同**的性质：
+ *
+ *  - 网络错误：等一下重试是合理的；
+ *  - **风控 412**：再发请求只会让封禁时间更长 —— 必须**立刻停手**，
+ *    并且让用户知道「暂时搜不到，等一下」，而不是傻等着重试。
+ *
+ * 所以单独定义这个错误类型，让上层能一眼分辨。
+ *
+ * ## ⚠️ `message` 用**中性措辞**（`RATE_LIMIT_MESSAGE`）
+ *
+ * 这个 message 可能经 `errMsg(err)` 漏到界面上（用户能截图）——
+ * 里面**不能**出现「风控」「限流」「412」这类词。
+ * 所以它只表达「现象 + 怎么办」，识别靠**类型**（`instanceof`）而不是靠文案。
+ */
+export const RATE_LIMIT_MESSAGE =
+  '暂时搜不到结果，通常是操作太频繁导致的，请稍等一会儿再试'
+
+export class RateLimitError extends Error {
+  constructor(message = RATE_LIMIT_MESSAGE) {
+    super(message)
+    this.name = 'RateLimitError'
+  }
+}
+
+/**
+ * 判断一个错误是不是「被风控」
+ *
+ * ⚠️ 只认**类型**（`instanceof`）+ 主进程自己写的那个 message，
+ * 不要在这里匹配「风控 / 412」之类的词 —— 那些词不会出现在 message 里了。
+ */
+export const isRateLimitError = (err: unknown): boolean =>
+  err instanceof RateLimitError ||
+  (err instanceof Error && err.message === RATE_LIMIT_MESSAGE)
+
 async function biliGet(url: string): Promise<BiliResponse> {
   const response = await net.fetch(url, {
     method: 'GET',
     headers: await biliHeaders(),
   })
+  /**
+   * 412 = 风控拦截（响应体是 HTML 拦截页，不是 JSON）—— 单独识别
+   *
+   * 其它非 2xx（500/502/超时等）当作普通网络错误，交上层决定。
+   */
+  if (response.status === 412) {
+    throw new RateLimitError()
+  }
+  /**
+   * ⚠️ **不要把 `HTTP xxx` 原文抛给用户**（会经 `errMsg` 显示在界面上）
+   *
+   * 用户看不懂状态码。所以这里抛一句人话，**真实状态码只打日志**（排查用）。
+   */
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`)
+    console.warn(`[bili] 请求失败，HTTP ${response.status}: ${url.slice(0, 120)}`)
+    throw new Error('网络请求失败，请稍后再试')
   }
   return (await response.json()) as BiliResponse
 }
@@ -394,54 +447,116 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  * 这里只保留**搜索 + 翻页**（网络部分），过滤与打分的判据全部由 `videoRank` 决定。
  */
 
+/**
+ * B站搜索分区代码（`tids`）
+ *
+ *  - `''` / `'0'`  → **全站**搜索（不限制分区，音乐视频可能发在任意区）
+ *  - `'3'`        → **音乐**区
+ *
+ * 为什么两种都要试：音乐区里大多是"正经 MV / 官方投稿"，但**翻唱、饭制、
+ * 动态歌词排版**这类常发在别的区（生活 / 鬼畜 / 影视）。只搜音乐区会漏掉它们，
+ * 只搜全站又容易被无关视频淹没 —— 所以**各搜一轮，取并集**。
+ */
+const TIDS_ALL = ''
+const TIDS_MUSIC = '3'
+
+/**
+ * 两次搜索请求之间**强制**的间隔（毫秒）
+ *
+ * ## 为什么必须有
+ *
+ * 一首歌要搜 4 轮（全站 / 音乐区 / MV / 括号内容），每次切歌就是 4 个请求；
+ * 用户连点几首就是十几个请求打出去 —— B站**很快就返回 412 风控**。
+ *
+ * 实测（用最朴素的裸请求验证过）：同一个 IP 前后两个请求，
+ * 一个正常返回 200、下一个直接 412。**请求密度**就是触发条件。
+ *
+ * 500ms 是「用户几乎无感、但足以显著降低被拦概率」的折中：
+ * 一整首歌 4 轮 ≈ 1.5 秒额外等待，而切歌本来就要等解析地址。
+ */
+const SEARCH_THROTTLE_MS = 500
+
+/** 上一次真正发出搜索请求的时间戳（模块级，跨调用共享） */
+let lastSearchAt = 0
+
+/**
+ * 遵守节流：距上次请求不足 `SEARCH_THROTTLE_MS` 就等够再走
+ *
+ * 放在**发请求之前**调用，所以「第一个请求」不需要等（`lastSearchAt` 初值 0）。
+ */
+const throttleSearch = async (): Promise<void> => {
+  const wait = lastSearchAt + SEARCH_THROTTLE_MS - Date.now()
+  if (wait > 0) await sleep(wait)
+  lastSearchAt = Date.now()
+}
+
+/**
+ * 搜 B站（**单次请求**，不含降级逻辑）
+ *
+ * ## ★ 没有重试（这是刻意的）
+ *
+ * 原来失败会递归重试 2 次（各等 1 秒）。那是**有害**的：
+ *  - 风控 412 时重试只会加重封禁 —— B站要的是「停下来」；
+ *  - 真网络错误时，上层（渲染层）本来就会重搜，重试是重复劳动；
+ *  - 一首歌 4 轮 × 每轮重试 2 次 = 最坏 12 个请求，正是被风控的元凶。
+ *
+ * 现在**单次尝试，失败就抛**（`RateLimitError` 单独标记 412），
+ * 由上层决定「是提示用户别切太快，还是当作网络错误重搜」。
+ *
+ * ## ★ 也**不翻页**（`page` 参数保留但调用方只传 1）
+ *
+ * 翻页会成倍放大请求数。四轮降级本来就覆盖了「换词再找」的需求，
+ * 再叠加翻页就太密了。
+ *
+ * @param keyword 搜索词
+ * @param page 页码（**调用方只传 1**；保留参数是为了签名与可读性）
+ * @param tids 分区代码；**缺省 = 全站**（`''` 时不会往请求里塞 `tids`）
+ */
 export async function searchSong(
   keyword: string,
-  retryCount = 0,
   page = 1,
+  tids: string = TIDS_ALL,
 ): Promise<BiliResponse> {
+  /** 节流：与上一个请求至少隔 `SEARCH_THROTTLE_MS` */
+  await throttleSearch()
+
   const mixinKey = await getMixinKeyCached()
 
   if (mixinKey) {
     const params = buildSearchParams(keyword, page)
-    params.tids = '3'
+    /**
+     * `tids` 必须在**算签名之前**设好
+     *
+     * WBI 签名覆盖所有参数。先签名后改参数 → 请求串里带了 `tids` 但 `w_rid`
+     * 没覆盖它 → 服务端重算对不上 → 风控拒绝（踩过：改了 tids 之后搜索全挂）。
+     */
+    if (tids) params.tids = tids
     const query = encWbi(params, mixinKey)
     const url = `${SEARCH_API}?${query}`
     try {
       return await biliGet(url)
-    } catch (innerErr) {
-      clearMixinKey()
-      if (retryCount < 2) {
-        await sleep(1000)
-        return searchSong(keyword, retryCount + 1, page)
-      }
-      throw innerErr
+    } catch (err) {
+      /**
+       * WBI 签名失效（mixin key 过期）时清掉缓存，让**下一次**调用重新拉 key
+       *
+       * ⚠️ 但**不在这里重试** —— 见上面「没有重试」那段。
+       * 风控 412 直接往上抛，绝不能重发。
+       */
+      if (!isRateLimitError(err)) clearMixinKey()
+      throw err
     }
   }
 
   const params = buildSearchParams(keyword, page)
-  /**
-   * `tids` 必须**先**设好再算签名。
-   *
-   * 上面走 WBI 的分支就是先 `params.tids = '3'` 再 `encWbi(params, ...)`；
-   * 这里原来顺序反了（先签名后加 tids），请求串里带了 tids 但 w_rid 没覆盖它，
-   * 服务端按收到的参数重算就会对不上 —— 也就是「拿不到 mixin key 时搜索全挂」。
-   */
-  params.tids = '3'
+  /** 同上：**先**设 tids 再算签名 */
+  if (tids) params.tids = tids
   params.w_rid = oldGetW_rid(params)
   const queryString = Object.entries(params)
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join('&')
   const url = `${SEARCH_API}?${queryString}`
 
-  try {
-    return await biliGet(url)
-  } catch (err) {
-    if (retryCount < 2) {
-      await sleep(1000)
-      return searchSong(keyword, retryCount + 1, page)
-    }
-    throw err
-  }
+  return biliGet(url)
 }
 
 /**
@@ -456,100 +571,174 @@ export interface SearchVideoItem {
   title?: string
   pic?: string
   author?: string
-  duration?: number | string | null
+  /**
+   * 时长**秒数**（`extract` 里已经把 B 站的 `"4:03"` 转成秒）
+   *
+   * `null` / 缺省 = 时长未知（过滤时这种会被保留，不因缺数据而误杀）。
+   */
+  duration?: number | null
   [key: string]: unknown
 }
 
 /**
- * 搜索结果太少时的**降级搜索词**
+ * ★ **搜索降级流程**（用户定的四轮）
  *
- * ## 四级搜索词（用户定的）
+ * | 轮 | 搜索词 | 分区（tids） |
+ * | :--- | :--- | :--- |
+ * | 1 | `歌名 歌手` | **全站**（不给 / `0`）|
+ * | 2 | `歌名 歌手` | **音乐区**（`3`）|
+ * | 3 | `歌名 歌手 MV` | 音乐区 |
+ * | 4 | `歌名 歌手 <括号内容>`；没括号则 `歌名 歌手 可视化` | 音乐区 |
  *
- * | 级别 | 搜索词 | 说明 |
- * | --- | --- | --- |
- * | 1 | `《歌名》歌曲 歌手` | 正常搜索（最精确） |
- * | 2 | `《歌名》歌曲 MV` | 降级 |
- * | 3 | `《歌名》歌曲 可视化` | 兜底 |
- * | 4 | `《歌名》` | ★ 最后兜底：**不带任何后缀**，直接搜歌名 |
+ * ## 形态约定
  *
- * **书名号是字面量**（不是占位符）—— B站上音乐视频的标题大量写作
- * `《歌名》`，带上它能显著提高相关度。
+ * **不带引号、不带书名号**，纯空格分隔（用户明确要求）。
+ * 用空格就是普通的「与」语义，几个词都要命中。
  *
- * ## ⚠️ 为什么第 1 级不用 `《歌名》歌曲 - 歌手`
+ * ## ⚠️ 不要用 `-`
  *
- * 原来是 `歌名 歌手`，用户要求改成 `《歌名》歌曲 - 歌手` 这种形态 ——
- * 但那个 `-` **去掉了**：B站搜索把 `-` 当**排除语法**
- * （"A -B" = 搜 A 并排除含 B 的结果），写成 `- 胡夏` 会变成
- * 「搜《那些年》歌曲、**排除**胡夏」，正好和意图相反。
- * 用空格分隔就是普通的「与」语义，三个词都要命中。
+ * B站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 并排除含 B 的结果）——
+ * 写成 `歌名 - 歌手` 会变成「搜歌名、**排除**这个歌手」，正好和意图相反。
  *
- * ## 为什么降级词不带歌手名
+ * ## 为什么前两轮搜同一句话、只换分区
  *
- * 硬过滤只要求「标题含歌名」，带歌手名会把「原唱但标题没写歌手」的候选挡掉。
+ * 音乐区（`tids=3`）里是"正经 MV / 官方投稿"，但**翻唱、饭制、
+ * 动态歌词排版**这类常发在别的区。只搜音乐区会漏掉它们，
+ * 只搜全站又容易被无关视频淹没 —— 所以**各搜一轮，取并集**。
  *
- * ## ★ 为什么还要第 4 级（`《歌名》`）
+ * ## 为什么第 4 轮用「括号里的内容」
  *
- * 前三级的搜索词都带后缀（`歌曲` / `歌曲 MV` / `歌曲 可视化`），
- * 而 B站的相关性排序会把**带这些词的**排在前面 —— 于是**其他形式的好视频**
- * 排在两页之外，永远搜不到。
- *
- * 实测（用户反馈）：《无见》排骨教主 的「动态歌词排版」版本，
- * 用前三级都搜不到；**直接搜 `《无见》` 才出得来**。
- *
- * 第 4 级**只搜歌名本身**，覆盖「动态歌词排版 / 饭制 / 混剪」这类标题里
- * 不写 `歌曲` 或 `MV` 的视频。
- *
- *  */
-const FALLBACK_SUFFIXES = ['MV', '可视化'] as const
-/** 最后一级：直接 `《歌名》`（无后缀）—— 单独列出因为它没有 suffix */
+ * 括号里往往是**副标题**（`九重楼 (不敢独上九重楼)`）或版本说明。
+ * 拿它当独立关键词搜一次，能捞到标题里只写副标题、不写正名的视频。
+ * 没有括号时退回 `可视化`（覆盖「动态歌词排版 / 可视化」这类标题）。
+ */
+/** 最后一级在歌名**没有括号**时用的兜底后缀 */
+const LAST_FALLBACK_SUFFIX = '可视化'
 
 /**
- * 拼「第 1 级」搜索词：`《歌名》歌曲 歌手`
+ * 拼搜索词：`歌名 歌手`
  *
- * @param songName 歌名（**不要带书名号**，这里会加）
- * @param singer   歌手名；空则不拼（只有歌名时退化成 `《歌名》歌曲`）
+ * ## 形态（用户定的）
+ *
+ *  - **不带引号、不带书名号**，纯空格分隔
+ *  - 歌手拼在后面（空则不拼，只留歌名）
+ *
+ * ```
+ * buildPrimaryKeyword('修炼爱情', '林俊杰')  →  修炼爱情 林俊杰
+ * buildPrimaryKeyword('晴天', '')            →  晴天
+ * ```
+ *
+ * @param songName 歌名
+ * @param singer   歌手名；空则不拼
  */
 export const buildPrimaryKeyword = (songName: string, singer: string): string => {
-  const parts = [`《${songName}》歌曲`]
+  const parts = [songName.trim()]
   const a = singer.trim()
   if (a) parts.push(a)
-  return parts.join(' ')
+  return parts.join(' ').trim()
 }
 
 /**
- * 拼「降级轮」搜索词：`《歌名》歌曲 <后缀>`
+ * 拼「降级轮」搜索词：`歌名 歌手 <后缀>`
  *
- * 刻意**不带歌手名**（理由见 `FALLBACK_SUFFIXES` 上方那段）。
+ * ⚠️ 与主搜索词的区别只有**末尾多的那个后缀** —— 歌手**要带上**
+ * （早期版本刻意不带歌手，但实测带着更准：`歌名 MV` 会搜出一堆
+ * 同名不同歌的合集，带上歌手能显著收窄）。
  */
-export const buildFallbackKeyword = (songName: string, suffix: string): string =>
-  `《${songName}》歌曲 ${suffix}`
+export const buildFallbackKeyword = (
+  songName: string,
+  singer: string,
+  suffix: string,
+): string => {
+  const parts = [songName.trim()]
+  const a = singer.trim()
+  if (a) parts.push(a)
+  parts.push(suffix.trim())
+  return parts.join(' ').trim()
+}
 
 /**
- * 拼「最后一级」搜索词：`《歌名》`（**不带任何后缀**）
+ * 从歌名里取出**括号中的内容**（多段**直接拼接**，去重）
  *
- * 见 `FALLBACK_SUFFIXES` 上方那段 —— 前三级都带后缀，
- * 而 `动态歌词排版` / `饭制` / `混剪` 这类标题里既不写 `歌曲` 也不写 `MV`，
- * 只有直接搜歌名才排得上来。
+ * ```
+ * 九重楼 (不敢独上九重楼)                  →  不敢独上九重楼
+ * 起风了 (Live)                          →  Live
+ * A (B) [C]                             →  B C
+ * Going Home (回家) (萨克斯版)            →  回家 萨克斯版
+ * Going Home (回家) (萨克斯版) (萨克斯版)  →  回家 萨克斯版   ← 重复的只留一次
+ * 晴天                                   →  ''（没有括号）
+ * ```
+ *
+ * ## 多段**全部拼进去**（用户明确要求）
+ *
+ * 早期版本只取第一段，于是 `Going Home (回家) (萨克斯版)` 的第 4 轮
+ * 只搜 `回家`，丢掉了「萨克斯版」这个有效信息。
+ * 现在把**每一段**都拼上（空格连接），搜索词更完整。
+ *
+ * ## 但**去重**是必要的
+ *
+ * 歌单里出现过「同一个后缀写两遍」的数据：
+ * `Going Home (回家) (萨克斯版) (萨克斯版)` —— 不去重的话搜索词会变成
+ * `… 回家 萨克斯版 萨克斯版`。重复词既不增加信息量，
+ * 又让搜索词变长变怪（搜索词越长，B站越可能匹配不到）。
+ *
+ * 用途：搜索流程的**最后一轮** —— 括号里往往是副标题 / 版本说明，
+ * 拿它当独立关键词搜一次，能捞到标题里只写副标题的那些视频。
  */
-export const buildBareKeyword = (songName: string): string => `《${songName}》`
+export const bracketContentOf = (name: string): string => {
+  const out: string[] = []
+  const re = /[（(\[【〔〖]\s*([^（()）[\]【】〔〖〗]*?)\s*[）)\]】〕〗]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(name)) !== null) {
+    const inner = m[1].trim()
+    /** 去重：同一段出现多次只留一次（见上面 `(萨克斯版) (萨克斯版)` 那个例子） */
+    if (inner && !out.includes(inner)) out.push(inner)
+  }
+  return out.join(' ')
+}
+
+/**
+ * 搜索流程里**一轮**的原始结果（dev dump / 排查用）
+ *
+ * 「一轮」= 用一个搜索词 + 一个分区搜一次（含它内部的翻页）。
+ * 降级是**多轮**：`歌名 歌手`（全站）→ `歌名 歌手`（音乐区）→ 加 `MV` → 加括号内容。
+ */
+export interface SearchRoundDetail {
+  /** 这一轮发给 B 站的完整搜索词 */
+  keyword: string
+  /** 这一轮用的分区代码（`''` = 全站，`'3'` = 音乐区） */
+  tids: string
+  /** 降级后缀；主搜索词那轮是 `null` */
+  suffix: string | null
+  /** 这一轮是否放宽了时长上限（降级轮是 `true`） */
+  relaxed: boolean
+  /** 这一轮采了几页 */
+  pages: number
+  /** ★ 这一轮**原样**的结果（还没跟别的轮次去重） */
+  items: SearchVideoItem[]
+  /** 是不是降级轮（`false` = 主搜索词） */
+  isFallback: boolean
+}
 
 /**
  * 搜索 + **降级重搜**
  *
- * ## 流程
+ * ## 流程（四轮，见下面 `plan` 处的详细表格）
  *
- *  1. 用主搜索词搜，取第 1 页；
- *  2. 若结果条数 `< minResults`（设置项 `player.minSearchResults`），再查第 2 页；
- *  3. 仍不够 → 换降级词再搜（最多两轮兜底词）。
+ *  1. `歌名 歌手`，**全站**（不给 tids）→ 第 1 页，不够再查第 2 页；
+ *  2. `歌名 歌手`，**音乐区**（`tids=3`）→ 同样「一页不够就两页」；
+ *  3. `歌名 歌手 MV` → 同上；
+ *  4. `歌名 歌手 <括号内容>`（没括号则 `可视化`）→ 同上。
  *
- * ## ⚠️ 这里的过滤是「粗略过滤」，精确过滤在调用方
+ * 每轮结果**累加**（按 bvid 去重），不是替换。
+ * 每轮之前都会判「过滤后够不够 `minResults`」，够了就不再往下走。
  *
- * 这一层只做**时长**过滤（用来判断"够不够多、要不要降级"），
- * 因为「标题是否含歌名」「命中屏蔽词」要读**当前的设置**，
- * 而设置是在 IPC 层拿的（这个函数是纯网络层，不该依赖 setting 模块）。
+ * ## ⚠️ 这里的过滤判据与调用方**完全一致**
  *
- * 真正的判据统一由 `@common/utils/videoRank` 在 IPC 层执行 ——
- * 两处若各写一份，迟早漂移。
+ * 「够不够」用的是 `rankVideos` 那一套（歌名 + 屏蔽词 + 时长），
+ * 不是只做时长 —— 否则数字虚高，降级永远不触发（踩过）。
+ * 它需要 `filterKeywords` / `tagBonus`，所以由调用方从设置里读好传进来
+ * （这个函数是纯网络层，不依赖 setting 模块）。
  *
  * @param song 歌名（**纯歌名**，不含歌手）
  * @param singer 歌手（空串 = 未知）；与歌名**分开传**，不再拼成 `歌名-歌手` 再拆
@@ -595,14 +784,61 @@ export const searchSongFiltered = async (
    * 「按放宽的规则数出 40 条、按严格规则只剩 5 条」—— 白降级一场。
    */
   relaxed: boolean
+  /**
+   * ★ 本次**实际用过的搜索词**（主搜索词 + 降级词，按使用顺序）
+   *
+   * 调用方打日志 / 写 dev dump 时要它：`歌名-歌手` 是缓存键，
+   * 看不出"到底搜了什么"（歌名带括号时真正发出去的是剥过括号的版本）。
+   */
+  keywords: string[]
+  /**
+   * ★ **每一轮的原始结果**（主搜索词一轮 + 每个降级词各一轮）
+   *
+   * 与 `items` 的区别：`items` 是**去重合并后**的结果池（能用的候选），
+   * 而这一个记的是「每一轮**各自**网到了什么」—— 排查搜索问题时要看的是后者：
+   * 「哪个降级词多搜到了东西」「哪些条目在合并时被去重掉了」。
+   */
+  roundsDetail: SearchRoundDetail[]
 }> => {
   /** 从响应里取出视频条目（`result` 里可能混着番剧/专栏，只要 `type === 'video'`） */
+  /**
+   * 从响应里取出视频条目（`result` 里可能混着番剧/专栏，只要 `type === 'video'`）
+   *
+   * ## ★ `duration` 在这里**一次性转成秒**
+   *
+   * B 站搜索接口给的是 `"4:03"` 这种**时分秒字符串**，而下游（过滤、排序、
+   * 写库、渲染）全都按**秒数**工作。所以在**进入我们代码的第一道门**就转好，
+   * 之后**永远不再解析**。
+   *
+   * 原来下游到处调 `durationToSeconds`（`videoRank.passHardFilter`、
+   * `cache.save`、渲染层 `durationText` 各一份），等于把同一个字符串
+   * 反复解析好几遍；而且任何一处忘了转，就会拿字符串跟秒数比大小（静默出错）。
+   *
+   * 转不了的（空串 / 脏数据）存 `null` = 「时长未知」，
+   * 过滤时那种条目会被**保留**（不因缺数据而误杀）。
+   *
+   * ## `...item` 是**必须**的（别改成只挑几个字段）
+   *
+   * 这里靠 `...item` 把 B站原始条目**整个**接住，只覆盖 `duration` 一个字段。
+   *
+   * 踩过：曾经改成「只挑 `bvid`/`title`/`pic`/`author`/`duration`」，
+   * 结果把 `type` 也丢了 —— 而 `api:searchSong` 里**还有一处**
+   * `filter(item => item.type === 'video')`（它拿到的是本函数的产物），
+   * 于是那个过滤**恒为空**，日志一路喊「搜索结果为空」、缓存永远写不进去。
+   *
+   * 保留全部原始字段就没这个问题：`type` 还在，下游那处过滤照常有效。
+   * 代价只是多存了几个用不到的字段（内存里的临时对象，不写库）。
+   */
   const extract = (res: BiliResponse): SearchVideoItem[] => {
     const list = res.data?.result
     if (!Array.isArray(list)) return []
-    return (list as SearchVideoItem[]).filter(
-      (item) => (item as { type?: string }).type === 'video',
-    )
+    return (list as SearchVideoItem[])
+      .filter((item) => (item as { type?: string }).type === 'video')
+      .map((item) => ({
+        ...item,
+        /** ★ 秒数（不再是 `"4:03"`）；`null` = 时长未知 */
+        duration: durationToSeconds(item.duration),
+      }))
   }
 
   /**
@@ -654,17 +890,19 @@ export const searchSongFiltered = async (
    *
    * 所以这里显式把 `favorites` 置为 `false`（搜索结果**一律不是**收藏，
    * 「收藏」是 `mergeWithFavorites` 之后才有的概念）。
-   */
-  /**
-   * 三级搜索词（发给 B站的）
    *
-   * - `primaryKeyword` = `《歌名》歌曲 歌手`
-   * - 降级词 = `《歌名》歌曲 MV` / `《歌名》歌曲 可视化`
+   * ---
    *
-   * 歌名与歌手是**两个独立入参**，直接用（以前是拼成 `歌名-歌手` 再 `splitSearchKey`
-   * 拆回来 —— 那个往返已经删掉了）。
+   * ★ 搜索用的歌名：**去掉所有括号及其内容**
+   *
+   * 必须和硬过滤用**同一套规则**（`rankVideos` 内部也走 `baseSongName`）：
+   * 搜索用「九重楼 (不敢独上九重楼)」、过滤却要求标题含「九重楼」时，
+   * 两边不一致会出现「搜到了但一条都不通过」（踩过：140 条全灭）。
+   *
+   * 剥完为空时 `baseSongName` 会退化成「只去括号留内容」，不会变成空搜索词。
    */
-  const primaryKeyword = buildPrimaryKeyword(song, singer)
+  const searchSongName = baseSongName(song)
+  const primaryKeyword = buildPrimaryKeyword(searchSongName, singer)
 
   const countPassing = (items: SearchVideoItem[], relax: boolean): number =>
     rankVideos(
@@ -681,67 +919,106 @@ export const searchSongFiltered = async (
     ).length
 
   /**
-   * 搜一轮：第 1 页，不够则追加第 2 页
+   * 搜一轮：**只搜第 1 页**
    *
-   * 只翻到第 2 页（不循环）：B 站音乐搜索的相关性排序，第 3 页以后
-   * 基本是无关结果，再翻等于用噪声凑数。
+   * ## ★ 不再翻页（用户明确要求，也是风控的主要来源）
    *
-   * ★ 每一级都是「**一页不够就两页**」—— 这是**统一**行为，
-   * 不是某一级的特例（用户明确说过：一页不够就两页，两页不够就降级，
-   * 下一级同样一页不够就两页，依此类推）。
+   * 原来「第 1 页过滤后不够 `minResults` 就再翻第 2 页」。
+   * 但一首歌要跑 4 轮，每轮再翻页 = 最多 8 个请求 ——
+   * 而渲染层在搜索为空时还会重搜，实际密度远超 B站能接受的范围。
    *
-   * @param relax 是否放宽时长上限（**降级轮次传 true**，理由见 `FALLBACK_SUFFIXES`）
+   * 四轮降级本来就覆盖了「换词再找」的需求，**翻页的边际收益不值得**。
+   * 所以现在每轮**只取第 1 页**（B站一页 42 条，够用）。
+   *
+   * 正因为不翻页，原来那个「这一轮够不够、要不要翻第二页」的判断
+   * （以及它需要的 `relax` 参数）也一并没有了 —— 函数变简单了。
    */
   const searchRounds = async (
     kw: string,
-    relax: boolean,
     /**
      * 这一轮的第 1 页响应（复用调用方已取到的那份）
      *
      * 只在**第一轮**会传 —— 降级轮换了关键词，必须自己搜。
      */
     reusedFirstPage?: BiliResponse,
+    /** 分区代码（`''` = 全站，`'3'` = 音乐区）；不给则用默认（全站） */
+    tids?: string,
   ): Promise<{ items: SearchVideoItem[]; pages: number }> => {
     /**
      * 复用已有响应，避免把第 1 页搜两遍
      *
-     * ⚠️ `api:searchSong` 为了「失败要抛错」先调了一次 `searchSong(keyword)`，
+     * ⚠️ `api:searchSong` 为了「失败要能抛错」先调了一次 `searchSong(keyword)`，
      * 而这里原本又搜了一次第 1 页 —— 每次缓存未命中都白打一次
      * 完整的 WBI 签名 + 网络往返。
      */
-    const first = reusedFirstPage ?? (await searchSong(kw, 0, 1))
-    if (first.code !== 0) throw new Error(first.message ?? '搜索失败')
-    let all = extract(first)
-    let pages = 1
-
+    const first = reusedFirstPage ?? (await searchSong(kw, 1, tids))
     /**
-     * ★ 每一级都是「一页不够就两页」
+     * B站返回非 0 时**不要把它自己的 message 透传给用户**
      *
-     * `minResults <= 0`（用户选了「不补齐」）时只搜一页。
+     * `first.message` 是 B站原文（可能是 `-352`、风控说明之类的技术文案）。
+     * 它经 IPC 抛到渲染层就会被 `$message.error` 显示出来 —— 用户看不懂，
+     * 而且把接口的内部说法写在了界面上。所以**统一换成中性文案**，
+     * 原始 message 只打日志（排查用）。
      */
-    const needSecond = minResults > 0 && countPassing(all, relax) < minResults
-    if (needSecond) {
-      try {
-        await sleep(600) // 错开一点，避免触发风控
-        const second = await searchSong(kw, 0, 2)
-        if (second.code === 0) {
-          const more = extract(second)
-          /** 按 bvid 去重：两页之间可能有重复条目 */
-          const seen = new Set(all.map((x) => String(x.bvid ?? '')))
-          const add = more.filter((x) => x.bvid && !seen.has(String(x.bvid)))
-          all = [...all, ...add]
-          pages = 2
-        }
-      } catch (err) {
-        /** 第二页失败**不影响**已有结果（拿第 1 页的照样能用） */
-        console.warn(`[search] 《${kw}》第 2 页失败（用第 1 页结果继续）:`, err)
-      }
+    if (first.code !== 0) {
+      console.warn(`[search] 搜索接口返回非 0（code=${first.code}）：${first.message ?? ''}`)
+      throw new Error('搜索失败，请稍后再试')
     }
-    return { items: all, pages }
+    return { items: extract(first), pages: 1 }
   }
 
-  /** 第一轮：主搜索词（**不放宽**上限，按标题里有没有 MV/Live 决定） */
-  const first = await searchRounds(primaryKeyword, false, firstPage)
+  /** 第一轮：主搜索词（**全站**，复用调用方已取到的那份响应） */
+  const first = await searchRounds(primaryKeyword, firstPage)
+
+  /**
+   * ★ **第一轮返回 0 条 = 被风控**，不要再往下跑（用户明确要求）
+   *
+   * 判断依据很硬：**B站搜索不会对一首正常存在的歌返回「0 条」**。
+   * 只要搜索词里有歌名，它总能搜到点东西（哪怕不相关）。
+   * 所以「第 1 轮就是 0 条」几乎只有一种解释：**请求被风控拦了** ——
+   * 要么返回了 412（那会更早抛 `RateLimitError`），
+   * 要么风控给了个「成功但空」的响应。
+   *
+   * ## 为什么必须在这里停手
+   *
+   * 原来的行为是「不够就继续跑第 2、3、4 轮」—— 在风控状态下
+   * **每一轮都会被打回**，等于对着风控连打 3 次，只会让封禁更久。
+   * 用户的原话：「被风控就不要再发请求出去了，直接提醒用户切歌太快太频繁」。
+   *
+   * 抛 `RateLimitError` 让上层能给出**准确的提示**（而不是「搜不到这首歌」）。
+   *
+   * ⚠️ 抛的是**默认 message**（`RATE_LIMIT_MESSAGE`，中性措辞）——
+   * 这里不自己传字符串，免得再写出一句带技术细节的文案。
+   */
+  if (first.items.length === 0) {
+    throw new RateLimitError()
+  }
+
+  /**
+   * ★ **每一步的原始结果**（dev dump 用）
+   *
+   * 记的是「每个搜索词**各自**搜回来什么」，**不去重、不合并** ——
+   * 排查时要看的是「这一轮到底网到了哪些东西」，而不是合并后的池子。
+   *
+   * 每一项：
+   *  - `keyword`   ：这一轮用的搜索词
+   *  - `suffix`    ：降级后缀（主词那轮是 `null`）
+   *  - `relaxed`   ：这一轮是否放宽了时长上限
+   *  - `pages`     ：采了几页
+   *  - `items`     ：**该轮的原样结果**（还没跟别的轮次去重）
+   *  - `isFallback`：是不是降级轮
+   */
+  const roundsDetail: SearchRoundDetail[] = [
+    {
+      keyword: primaryKeyword,
+      tids: TIDS_ALL,
+      suffix: null,
+      relaxed: false,
+      pages: first.pages,
+      items: first.items,
+      isFallback: false,
+    },
+  ]
   /**
    * ★ **累加合并**的结果池（降级是「补充」，不是「替换」）
    *
@@ -757,13 +1034,20 @@ export const searchSongFiltered = async (
    * 正确：10 + 36 去重合并 = 46 条（降级是为了**多搜一些补进来**）
    * ```
    *
-   * 降级词搜出来的往往是**另一批**视频（`《歌名》歌曲 MV` vs `《歌名》歌曲 歌手`），
-   * 两批的重合度并不高，合起来才是「能挑的候选」。
+   * 降级词搜出来的往往是**另一批**视频，两批的重合度并不高，
+   * 合起来才是「能挑的候选」。
    */
   const merged: SearchVideoItem[] = [...first.items]
   const seenBvid = new Set(merged.map((x) => String(x.bvid ?? '')))
   /** 用过的搜索词（第一轮 + 降级轮），只用于日志 */
   const usedKeywords: string[] = [primaryKeyword]
+  /**
+   * 已搜过的**「搜索词 + 分区」组合**（判重用）
+   *
+   * 为什么不用 `usedKeywords` 判重：第 1、2 轮搜索词相同、只有分区不同，
+   * 只比搜索词会把第 2 轮当成重复跳过。
+   */
+  const usedKeys = new Set<string>([`${primaryKeyword}@${TIDS_ALL}`])
   let pages = first.pages
   let rounds = 1
   /**
@@ -774,7 +1058,25 @@ export const searchSongFiltered = async (
   let relaxed = false
 
   /**
-   * 不够 → 依次试降级词（**累加**到结果池，不替换）
+   * ★ **四轮降级流程**（用户定的）
+   *
+   * | 轮 | 搜索词 | 分区（tids） |
+   * | :--- | :--- | :--- |
+   * | 1 | `歌名 歌手` | **全站**（不给 / `0`）|
+   * | 2 | `歌名 歌手` | **音乐区**（`3`）|
+   * | 3 | `歌名 歌手 MV` | 音乐区 |
+   * | 4 | `歌名 歌手 <括号内容>`；没括号则 `歌名 歌手 可视化` | 音乐区 |
+   *
+   * ## 为什么第 1、2 轮搜同一个词、只换分区
+   *
+   * 音乐区（`tids=3`）里是"正经 MV / 官方投稿"，但**翻唱、饭制、
+   * 动态歌词排版**这类常发在别的区。只搜音乐区会漏，只搜全站又容易被
+   * 无关视频淹没 —— 所以**同一句话各搜一轮，取并集**。
+   * 全站那轮排在前面（相关性更宽，先拿到基础候选）。
+   *
+   * ## 每一轮都是「一页不够就两页」
+   *
+   * 由 `searchRounds` 内部统一处理，这里不为某一轮加特例。
    *
    * ## 「够不够」判的是**过滤之后**的条数
    *
@@ -788,25 +1090,53 @@ export const searchSongFiltered = async (
    */
   if (minResults > 0) {
     /**
-     * 降级词序列 = 前三级（`歌曲 MV` / `歌曲 可视化`）+ 最后一级（裸歌名 `《歌名》`）
+     * 第 4 轮的词：优先取**括号里的副标题**，没有括号就用 `可视化`
      *
-     * 用 `undefined` 表示"裸歌名"那一级，因为它没有后缀
-     * （`buildBareKeyword` 而不是 `buildFallbackKeyword`）。
+     * 括号里往往是副标题（`九重楼 (不敢独上九重楼)` → `不敢独上九重楼`）
+     * 或版本说明（`(Live)` / `(吉他版)`）。拿它当独立关键词搜一次，
+     * 能捞到标题里只写副标题、不写正名的视频。
      */
-    const fallbackLevels: Array<string | undefined> = [...FALLBACK_SUFFIXES, undefined]
+    const bracketText = bracketContentOf(song)
+    const lastSuffix = bracketText || LAST_FALLBACK_SUFFIX
 
-    for (const suffix of fallbackLevels) {
+    /**
+     * 四轮的参数：搜索词 + 分区
+     *
+     * 第 1 轮已经在上面搜过了（`first`），这里从第 2 轮开始列。
+     */
+    const plan: Array<{ kw: string; tids?: string; suffix: string | null; label: string }> = [
+      /** 第 2 轮：同一句话，换成音乐区 */
+      { kw: primaryKeyword, tids: TIDS_MUSIC, suffix: null, label: '音乐区' },
+      /** 第 3 轮：加 MV */
+      {
+        kw: buildFallbackKeyword(searchSongName, singer, 'MV'),
+        tids: TIDS_MUSIC,
+        suffix: 'MV',
+        label: 'MV',
+      },
+      /** 第 4 轮：括号内容（没有则可视化） */
+      {
+        kw: buildFallbackKeyword(searchSongName, singer, lastSuffix),
+        tids: TIDS_MUSIC,
+        suffix: lastSuffix,
+        label: bracketText ? '括号内容' : '可视化',
+      },
+    ]
+
+    for (const step of plan) {
       /** 够了吗？够了就不再加了（`countPassing` 跑的是完整规则） */
       if (countPassing(merged, relaxed) >= minResults) break
-
       /**
-       * 降级词：
-       *  - 有 suffix → `《歌名》歌曲 <后缀>`（**不带歌手名**，理由见上面那段）
-       *  - 无 suffix → `《歌名》`（最后一级，见 `FALLBACK_SUFFIXES`）
+       * ⚠️ 判重必须用**搜索词 + 分区**的组合键，不能只看搜索词
+       *
+       * 第 1、2 轮**搜索词完全相同**（`歌名 歌手`），只有分区不同。
+       * 只比搜索词的话第 2 轮会被当成"重复"直接跳过 ——
+       * 那整个"全站 + 音乐区各搜一轮"的设计就白做了。
        */
-      const fallbackKeyword =
-        suffix === undefined ? buildBareKeyword(song) : buildFallbackKeyword(song, suffix)
-      if (!fallbackKeyword || usedKeywords.includes(fallbackKeyword)) continue
+      const stepTids = step.tids ?? TIDS_ALL
+      const stepKey = `${step.kw}@${stepTids}`
+      if (!step.kw || usedKeys.has(stepKey)) continue
+      usedKeys.add(stepKey)
 
       try {
         /**
@@ -818,22 +1148,28 @@ export const searchSongFiltered = async (
          * ⚠️ 这里以前传的是写死的 `false` —— `relaxUpperBound` 这个参数
          * **声明了、注释了，却从来没有被传成 `true`**，等于那条规则根本没生效。
          * 是代码审查时靠全仓 grep 才发现的：它是个**永远走不到的分支**。
-         *
-         * 每一级都是「**一页不够就两页**」—— 由 `searchRounds` 内部统一处理，
-         * 这里不需要为某一级加特例（用户明确说过：一页不够就两页，两页不够
-         * 就降级，下一级同样一页不够就两页，依此类推）。
          */
-        const round = await searchRounds(fallbackKeyword, true)
+        const round = await searchRounds(step.kw, undefined, stepTids)
         rounds++
-        usedKeywords.push(fallbackKeyword)
+        usedKeywords.push(step.kw)
+
+        /** ★ 记下这一轮的**原样结果**（去重合并之前的） */
+        roundsDetail.push({
+          keyword: step.kw,
+          tids: stepTids,
+          suffix: step.suffix,
+          relaxed: true,
+          pages: round.pages,
+          items: round.items,
+          isFallback: true,
+        })
 
         /**
          * ★ 按 bvid 去重后**追加**到结果池
          *
-         * 去重是必须的：降级词与主搜索词的结果**一定会重合**
-         * （`《歌名》歌曲 MV` 搜出来的东西里，有相当一部分
-         * `《歌名》歌曲 歌手` 也能搜到）。同一 bvid 只留第一次出现的 ——
-         * 那批是主搜索词的结果，元数据（带 `<em>` 高亮的标题）更贴合。
+         * 去重是必须的：降级词与主搜索词的结果**一定会重合**。
+         * 同一 bvid 只留第一次出现的 —— 那批是更靠前那轮的结果，
+         * 元数据（带 `<em>` 高亮的标题）更贴合。
          */
         let added = 0
         for (const item of round.items) {
@@ -852,11 +1188,23 @@ export const searchSongFiltered = async (
         relaxed = true
 
         console.log(
-          `[search] ${song}-${singer} 降级「${fallbackKeyword}」+${added}（累计 ${merged.length}）`,
+          `[search] ${song}-${singer} 降级「${step.kw}」（${step.label}` +
+            `${stepTids === TIDS_ALL ? '，全站' : ''}）+${added}（累计 ${merged.length}）`,
         )
       } catch (err) {
+        /**
+         * ★ **被风控（412）时立刻整个中止，绝不继续下一轮**（用户明确要求）
+         *
+         * 风控状态下「继续试下一个降级词」是最坏的做法：每一轮都会被拦，
+         * 等于对着风控连打三次，只会让封禁更久。所以这里**重新抛出去**，
+         * 由 IPC 层转成给用户的提示（「切歌太快了」）。
+         *
+         * 其它错误（网络抖动、接口抽风）才当作「这一轮没成」继续往下 ——
+         * 已经有结果的话还能用。
+         */
+        if (isRateLimitError(err)) throw err
         console.warn(
-          `[search] ${song}-${singer} 降级搜索「${fallbackKeyword}」失败（继续用已有结果）:`,
+          `[search] ${song}-${singer} 降级搜索「${step.kw}」失败（继续用已有结果）:`,
           err,
         )
       }
@@ -869,6 +1217,10 @@ export const searchSongFiltered = async (
     rounds,
     /** ★ 本次结果是否按放宽后的时长上限取的（调用方排序时要跟着放宽） */
     relaxed,
+    /** ★ 实际用过的搜索词（主词 + 降级词，按顺序） */
+    keywords: usedKeywords,
+    /** ★ 每一轮的原始结果（dev dump 用） */
+    roundsDetail,
   }
 }
 
@@ -939,6 +1291,15 @@ interface DashItem {
 export interface DashStreams {
   videoUrl: string
   audioUrl: string
+  /**
+   * ★ **视频轨的全部候选地址**（主地址 + 所有 `backupUrl`，常规 CDN 优先）
+   *
+   * 第一个就是 `videoUrl`。卡顿时渲染层按这个列表**换源**（同一清晰度换 CDN），
+   * 而不是干等降清晰度 —— 见 `dashUrlsOf`。
+   */
+  videoUrls: string[]
+  /** ★ 音频轨的全部候选地址（第一个就是 `audioUrl`） */
+  audioUrls: string[]
   /** SourceBuffer 用的 MIME，例如 `video/mp4; codecs="avc1.640032"` */
   videoMime: string
   audioMime: string
@@ -1014,9 +1375,24 @@ export const pickNormalCdnUrl = (
   return all.find((u) => isNormalCdn(u)) ?? all[0]
 }
 
-const dashUrlOf = (item: DashItem | undefined): string | null => {
-  if (!item) return null
-  return pickNormalCdnUrl(item.baseUrl || item.base_url, item.backupUrl ?? item.backup_url)
+/**
+ * ★ 取**全部**可用地址（主地址 + 所有备用），常规 CDN 排前面
+ *
+ * 为什么要它：卡顿时要能「换同一个清晰度的备用源」。
+ * 只挑一个地址的话，备用源全丢了，卡顿只能干等降 durl。
+ *
+ * 返回顺序：常规 CDN 域优先，其余兜底；**去重**（B站有时同一地址
+ * 既放 `baseUrl` 又放 `backupUrl`）。
+ */
+export const dashUrlsOf = (item: DashItem | undefined): string[] => {
+  if (!item) return []
+  const primary = item.baseUrl || item.base_url
+  const backups = item.backupUrl ?? item.backup_url ?? []
+  const all = [primary, ...backups].filter(
+    (u): u is string => typeof u === 'string' && u.length > 0,
+  )
+  const unique = [...new Set(all)]
+  return [...unique.filter((u) => isNormalCdn(u)), ...unique.filter((u) => !isNormalCdn(u))]
 }
 
 const dashMimeOf = (item: DashItem): string | null => {
@@ -1048,8 +1424,11 @@ export const extractDashStreams = (
   const video = pickDashVideo(videos, qn)
   const audio = pickDashAudio(audios, audioId)
 
-  const videoUrl = dashUrlOf(video)
-  const audioUrl = dashUrlOf(audio)
+  /** ★ 取**全部**候选地址（不止一个）—— 卡顿时渲染层要靠它换源 */
+  const videoUrls = dashUrlsOf(video)
+  const audioUrls = dashUrlsOf(audio)
+  const videoUrl = videoUrls[0] ?? null
+  const audioUrl = audioUrls[0] ?? null
   const videoMime = dashMimeOf(video)
   const audioMime = dashMimeOf(audio)
   if (!videoUrl || !audioUrl || !videoMime || !audioMime) return null
@@ -1057,6 +1436,8 @@ export const extractDashStreams = (
   return {
     videoUrl,
     audioUrl,
+    videoUrls,
+    audioUrls,
     videoMime,
     audioMime,
     duration: typeof dash?.duration === 'number' ? dash.duration : null,
@@ -1239,7 +1620,11 @@ export const parseVideoInput = async (input: string): Promise<ParsedVideoInfo> =
   if (!bvid) throw new Error('没有识别出 BV 号，请粘贴 B 站视频链接或 BV 号')
 
   const view = await biliGet(`${VIEW_API}?bvid=${bvid}`)
-  if (view.code !== 0) throw new Error(view.message ?? '获取视频信息失败')
+  /** 同上：不透传接口原文（用户看不懂），原文只打日志 */
+  if (view.code !== 0) {
+    console.warn(`[parseVideo] view 接口返回非 0（code=${view.code}）：${view.message ?? ''}`)
+    throw new Error('获取视频信息失败，请确认链接是否正确')
+  }
   const data = view.data as
     | { title?: string; pic?: string; owner?: { name?: string }; duration?: number }
     | undefined
@@ -1259,12 +1644,17 @@ export async function resolveVideoUrl(
   const qn = options.qn ?? DEFAULT_VIDEO_QN
   const audioId = options.audioId ?? DEFAULT_AUDIO_ID
   const viewData = await biliGet(`${VIEW_API}?bvid=${bvid}`)
+  /** 同上：不透传接口原文 */
   if (viewData.code !== 0) {
-    throw new Error(viewData.message ?? '获取视频信息失败')
+    console.warn(
+      `[resolveVideo] view 接口返回非 0（code=${viewData.code}）：${viewData.message ?? ''}`,
+    )
+    throw new Error('获取视频信息失败')
   }
   const cid = viewData.data?.cid
   if (!cid) {
-    throw new Error('无法获取视频CID')
+    /** `cid` 是接口术语，用户看不懂 —— 只说「这个视频暂时放不了」 */
+    throw new Error('这个视频暂时无法播放')
   }
 
   const mixinKey = await getMixinKeyCached()

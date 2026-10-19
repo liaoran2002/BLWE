@@ -235,7 +235,7 @@ import { defineComponent } from 'vue';
 import { ElMessage } from 'element-plus';
 import { SOURCE_LABELS, SYNC_INTERVAL_OPTIONS } from '@common/constants';
 import type { PlaylistRecord, PlaylistSong } from '@common/types/playlist';
-import { parseSearchKey } from '@common/types/playlist';
+import { parseCacheKey } from '@common/types/playlist';
 // 库里存的是**秒**（schema v2 起统一），展示要转回 mm:ss；反向转换在解析音源时用
 import { formatDuration } from '@common/utils/duration';
 import api from '../api/electron';
@@ -434,7 +434,7 @@ export default defineComponent({
         .split('\n')
         .map((l) => l.trim())
         .filter((l) => l.length > 0)
-        .map((l) => parseSearchKey(l));
+        .map((l) => parseCacheKey(l));
 
       if (!url && manual.length === 0 && !this.editingId) {
         ElMessage.warning('请填写歌单链接，或手动填入歌曲');

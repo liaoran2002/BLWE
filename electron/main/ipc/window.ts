@@ -1,6 +1,7 @@
 /**
  * 窗口控制 IPC
  */
+import { app } from 'electron'
 import { mainHandle } from '@common/mainIpc'
 import type { IpcContext } from '../ipcHandlers'
 
@@ -11,6 +12,19 @@ export const registerWindowHandlers = (context: IpcContext): void => {
 
   mainHandle('win:close', () => {
     context.getMainWindow()?.close()
+  })
+
+  /**
+   * ★ **真正退出应用**（不受「关闭到托盘」影响）
+   *
+   * `win:close` 走的是窗口的 `close` 事件，而那个事件在 `common.closeToTray`
+   * 打开时会被拦下来变成「隐藏到托盘」—— 用来做「定时关闭」会**关不掉**。
+   *
+   * 这里直接 `app.quit()`：`before-quit` 会把 `isQuitting` 置位，
+   * 于是那个拦截逻辑自动放行（见 `main/index.ts` 的 `mainWindow.on('close')`）。
+   */
+  mainHandle('win:quit', () => {
+    app.quit()
   })
 
   mainHandle('win:maximize', () => {

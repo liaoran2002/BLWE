@@ -32,7 +32,6 @@
  *     DELETE 会把地址一起删掉 —— 必须先从旧行读出来再写回去，见那里的注释。
  */
 import type { CacheStats } from '@common/types/cache_stats'
-import { durationToSeconds } from '@common/utils/duration'
 import { pickNormalCdnUrl } from '../biliApi'
 import { getSetting } from './setting'
 import { getDb, tx } from './db'
@@ -51,7 +50,7 @@ export interface PlayUrlLike {
 
 /** `videos` 表的一行（对外的形状；列名用 camelCase 给渲染层） */
 export interface VideoRow {
-  searchKey: string
+  cacheKey: string
   bvid: string
   /** 列表顺序（越小越靠前）；收藏项永远在最前面 */
   ord: number
@@ -143,7 +142,13 @@ interface CachedSearchItem {
   title?: string
   pic?: string
   author?: string
-  duration?: number | string | null
+  /**
+   * 时长**秒数**（`null` / 缺省 = 未知）
+   *
+   * 上游（`biliApi.extract`）已经把 B站的 `"4:03"` 转成秒了，
+   * 写库直接存这个值。
+   */
+  duration?: number | null
   favorites?: boolean
   [key: string]: unknown
 }
@@ -219,7 +224,7 @@ const toPlayUrlLike = (row: VideoDbRow): PlayUrlLike | null => {
  * 需要地址的调用方走 `getVideoAddress()`。
  */
 const toVideoRow = (row: VideoMetaDbRow): VideoRow => ({
-  searchKey: row.search_key,
+  cacheKey: row.search_key,
   bvid: row.bvid,
   ord: row.ord,
   title: row.title ?? '',
@@ -300,11 +305,11 @@ const extractPlayurlColumns = (playurl: unknown): PlayurlColumns => {
   }
 }
 
-/** 该搜索键下现有的最大 ord（空表返回 -1，方便 +1 得到 0） */
-const maxOrdOf = (searchKey: string): number => {
+/** 该缓存键下现有的最大 ord（空表返回 -1，方便 +1 得到 0） */
+const maxOrdOf = (cacheKey: string): number => {
   const row = getDb()
     .prepare(`SELECT MAX(ord) AS maxOrd FROM videos WHERE search_key = ?`)
-    .get(searchKey) as { maxOrd: number | null } | undefined
+    .get(cacheKey) as { maxOrd: number | null } | undefined
   return row?.maxOrd ?? -1
 }
 
@@ -314,10 +319,10 @@ const maxOrdOf = (searchKey: string): number => {
  * 这是**唯一**会读地址列的内部读取点 —— 地址列约 27 KB/行，
  * 其它地方一律走 `videos_meta` 视图（见 `db.ts` 里视图的注释）。
  */
-const getVideoRow = (searchKey: string, bvid: string): VideoDbRow | undefined =>
+const getVideoRow = (cacheKey: string, bvid: string): VideoDbRow | undefined =>
   getDb()
     .prepare(`SELECT ${VIDEO_COLUMNS} FROM videos WHERE search_key = ? AND bvid = ?`)
-    .get(searchKey, bvid) as VideoDbRow | undefined
+    .get(cacheKey, bvid) as VideoDbRow | undefined
 
 /**
  * 取某个 bvid 的**播放地址信息**（给 `api:resolveVideo` 判断能不能直接用缓存）
@@ -331,7 +336,7 @@ const getVideoRow = (searchKey: string, bvid: string): VideoDbRow | undefined =>
  * 没解析过（三个地址列全空）时为 null。
  */
 export const getVideoAddress = (
-  searchKey: string,
+  cacheKey: string,
   bvid: string,
 ): {
   durlUrl: string | null
@@ -340,9 +345,9 @@ export const getVideoAddress = (
   dashTried: boolean
   playurlAt: number | null
 } | null => {
-  if (!searchKey || !bvid) return null
+  if (!cacheKey || !bvid) return null
   try {
-    const row = getVideoRow(searchKey, bvid)
+    const row = getVideoRow(cacheKey, bvid)
     if (!row) return null
     return {
       durlUrl: row.durl_url,
@@ -359,7 +364,7 @@ export const getVideoAddress = (
 }
 
 /**
- * 读一个搜索键下的所有视频（按 ord 排序，**只有元数据**）
+ * 读一个**缓存键**下的所有视频（按 ord 排序，**只有元数据**）
  *
  * `ord` 里已经蕴含了「收藏在最前 + 收藏的相对顺序 + 其余保持搜索结果顺序」，
  * 所以调用方**直接按返回顺序用**即可，不要再按收藏过滤重排。
@@ -367,11 +372,11 @@ export const getVideoAddress = (
  * 走 `videos_meta` 视图：这里的调用方（合并收藏项、判断某条在不在）都只要元数据，
  * 读上 dash 大 JSON 纯属浪费（实测快 15 倍）。
  */
-export const listVideos = (searchKey: string): VideoRow[] => {
-  if (!searchKey) return []
+export const listVideos = (cacheKey: string): VideoRow[] => {
+  if (!cacheKey) return []
   const rows = getDb()
     .prepare(`SELECT ${META_COLUMNS} FROM videos_meta WHERE search_key = ? ORDER BY ord ASC`)
-    .all(searchKey) as VideoMetaDbRow[]
+    .all(cacheKey) as VideoMetaDbRow[]
   return rows.map(toVideoRow)
 }
 
@@ -558,7 +563,11 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
           item.title ?? old?.title ?? '',
           item.pic ?? old?.pic ?? null,
           item.author ?? old?.author ?? null,
-          durationToSeconds(item.duration) ?? old?.duration ?? null,
+          /**
+           * 时长**已经是秒**（`biliApi.extract` 在入口转好），不再解析。
+           * 拿不到就沿用旧值。
+           */
+          item.duration ?? old?.duration ?? null,
           old?.favorites ?? 0,
           old,
         )
@@ -635,19 +644,19 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
  *        现在从写入侧就不会产生了）。
  */
 export const updateVideoResult = (
-  searchKey: string,
+  cacheKey: string,
   bvid: string,
   playurl: unknown | undefined,
   playurlLoginState: boolean | null,
   noDash: boolean,
   meta?: { title?: string; pic?: string | null; author?: string | null; duration?: number | null },
 ): void => {
-  if (!searchKey || !bvid) return
+  if (!cacheKey || !bvid) return
   try {
     const db = getDb()
     const setPlayurl = playurl !== undefined
     tx(() => {
-      const old = getVideoRow(searchKey, bvid)
+      const old = getVideoRow(cacheKey, bvid)
 
       /**
        * 地址列只在真的重新解析过时写；`extractPlayurlColumns` 是整包响应
@@ -690,7 +699,7 @@ export const updateVideoResult = (
           dashTried,
           // 地址与时间是**一起**写的：只写地址会让下一轮清理把新地址当成老数据删掉
           Date.now(),
-          searchKey,
+          cacheKey,
           bvid,
         )
       }
@@ -723,7 +732,7 @@ export const updateVideoResult = (
           meta?.pic ?? null,
           meta?.author ?? null,
           meta?.duration ?? null,
-          searchKey,
+          cacheKey,
           bvid,
         )
         return
@@ -736,9 +745,9 @@ export const updateVideoResult = (
             playurl_login_state, dash_tried, playurl_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        searchKey,
+        cacheKey,
         bvid,
-        maxOrdOf(searchKey) + 1,
+        maxOrdOf(cacheKey) + 1,
         meta?.title ?? '',
         meta?.pic ?? null,
         meta?.author ?? null,
@@ -847,72 +856,105 @@ export const clearAll = async (): Promise<boolean> => {
 /**
  * 收藏 / 取消收藏
  *
- * **收藏时把该条挪到第一位**（用户明确要求）：实现是「原来排在它前面的 `ord` 各 +1，
- * 自己置 0」，两条 UPDATE 在一个事务里完成 —— 详见函数内注释。
+ * ## 收藏 → 置顶（用户明确要求）
+ *
+ * 实现：**其余所有条目的 `ord` 各 +1，自己占住 `ord = 0`**。
+ * 不分「库里有没有这一行」两种情况 —— 要做的事本来就完全一样。
  *
  * 这样 `ord` 保持 **0..n-1 连续** 这个不变量。
  * ⚠️ 曾经用过「取当前最小值 - 1」，那会让 `ord` 变成负数且不连续，
  * 而且 `save()` 按下标从 0 重写，负数活不过一次重新搜索 —— 已废弃。
  *
- * **取消收藏只把 favorites 置 0，位置不动**（同样是用户明确要求）：
+ * ## 取消收藏 → **只把 `favorites` 置 0，位置不动**（同样是用户明确要求）
+ *
  * 取消完它还在原地，不会突然跳回搜索结果中间。
  *
- * 该 bvid 不在 `videos` 里时（比如用户「添加视频」加了一个搜索没搜到的）
- * 就补插一行：只写 bvid + 收藏标记，标题封面留给 `api:parseVideo` 的结果
- * （见 handler 里的 `upsertVideoMeta`）。
+ * ## 该 bvid 不在 `videos` 里时（用户「添加视频」加了个搜索没搜到的）
+ *
+ * 也走同一套置顶：先给其余项 +1，再**新插一行** `ord = 0`。
+ * 标题 / 封面 / 时长先留空，由 handler 里的 `upsertVideoMeta` 用
+ * `api:parseVideo` 的结果补上。
+ *
+ * ## 事务
+ *
+ * 整个函数体在 `tx()` 里；写操作要么全成要么全回滚 —— 中途进程被杀
+ * 不会留下「其他都 +1 了、自己还没置 0」的中间态（那会出现两个 `ord = 0`）。
  */
-export const setFavorite = (searchKey: string, bvid: string, favorite: boolean): void => {
-  if (!searchKey || !bvid) return
+export const setFavorite = (cacheKey: string, bvid: string, favorite: boolean): void => {
+  if (!cacheKey || !bvid) return
   try {
     tx(() => {
       const db = getDb()
-      const existing = getVideoRow(searchKey, bvid)
+      const existing = getVideoRow(cacheKey, bvid)
 
-      if (!existing) {
-        if (!favorite) return
-        /**
-         * 库里没有这一行（用户「添加视频」加了个搜索结果里没有的 BV 号）：
-         * 插到**收藏区之后**（`ord` = 当前最大值 + 1），不要直接插到 0 ——
-         * 那会把已有的收藏项挤下去，而用户并没有要求改它们的顺序。
-         */
-        db.prepare(
-          `INSERT INTO videos (search_key, bvid, ord, title, pic, author, duration, favorites)
-           VALUES (?, ?, ?, '', NULL, NULL, NULL, 1)`,
-        ).run(searchKey, bvid, maxOrdOf(searchKey) + 1)
-        return
-      }
-
+      /** ① 取消收藏：**只改标记，位置不动**（用户明确要求：不跳回搜索结果中间） */
       if (!favorite) {
-        // 取消收藏：**只改标记，位置不动**（用户明确要求）
+        /** 库里没这一行就没什么可取消的（新行只可能是"添加视频"，必然已收藏） */
+        if (!existing) return
         db.prepare(`UPDATE videos SET favorites = 0 WHERE search_key = ? AND bvid = ?`).run(
-          searchKey,
+          cacheKey,
           bvid,
         )
         return
       }
 
-      if (existing.favorites === 1) return // 已经收藏了，幂等
+      /** ② 已经收藏了，幂等（不动位置） */
+      if (existing?.favorites === 1) return
 
       /**
-       * 收藏置顶：**原来排在它前面的那些 `ord` 各 +1，自己置 0**。
+       * ③ **收藏置顶** —— 不管这行在不在库里，都走同一套动作
        *
-       * 这个写法保证 `ord` 永远是 **0..n-1 连续**（不是「取最小值 -1」那种递减方案）：
-       *  - 递减方案会让 `ord` 变成负数且不连续（来回收藏几十次就到 -50），
-       *    `SELECT` 出来根本看不出「哪个是第几」；
-       *  - 而且 `save()` 是按下标从 0 重写的，那些负数**活不过一次重新搜索** ——
-       *    等于说那种编码只在两次搜索之间有意义的。
+       * 「其他所有条目的 `ord` 各 +1，自己占住 `ord = 0`」。
        *
-       * 两条 UPDATE 放在同一个事务里：中间态（前面的都 +1 了、自己还没置 0）如果被
-       * 别处读到，会出现「有两个 ord=0」的瞬时重复，排序结果不确定。
+       * 为什么**不区分在不在**：两种情况要做的事本来就完全一样 ——
+       * 置顶 = 把自己放第一位、其余整体后移一格。分两条路写只会写出两种行为：
        *
-       * 已经在第一位（`ord = 0`）时第一条命中 0 行，第二条把它置 0 是幂等的。
+       * ```
+       * 已有行 → 置 0、前面各 +1        （正确）
+       * 新行   → 插到 max+1 = 末尾       （错误，与渲染层「添加后显示在第一位」相反）
+       * ```
+       *
+       * ⚠️ 这里踩过：原来「库里没有这一行」的分支插到 `maxOrdOf + 1`（末尾），
+       * 于是「添加视频」加进来的条目**界面上在第一、库里在最后** ——
+       * 任何按 `ord` 重取列表的地方（收藏后刷新、切歌重搜）都会把它甩到末尾。
+       *
+       * ## 为什么是「+1 / 置 0」而不是「取最小值 -1」
+       *
+       * 递减方案会让 `ord` 变成负数且不连续（来回收藏几十次就到 -50），
+       * `SELECT` 出来看不出「哪个是第几」；而且 `save()` 按下标从 0 重写，
+       * 那些负数**活不过一次重新搜索**。`+1` 方案保持 `ord` 恒为 `0..n-1` 连续。
+       *
+       * ## 事务
+       *
+       * 整个 `setFavorite` 体都在 `tx()` 里，两条写操作同一事务：
+       * 中途进程被杀 → SQLite 回滚，**不会**留下「其他都 +1 了、自己还没置 0」
+       * 那种中间态（那会让列表里出现两个 `ord = 0`，顺序不确定）。
+       * 已经在第一位时第一条命中 0 行、第二条置 0，整体幂等。
        */
-      db.prepare(
-        `UPDATE videos SET ord = ord + 1 WHERE search_key = ? AND ord < ?`,
-      ).run(searchKey, existing.ord)
-      db.prepare(
-        `UPDATE videos SET favorites = 1, ord = 0 WHERE search_key = ? AND bvid = ?`,
-      ).run(searchKey, bvid)
+      const bound = maxOrdOf(cacheKey) + 1
+      db.prepare(`UPDATE videos SET ord = ord + 1 WHERE search_key = ? AND ord < ?`).run(
+        cacheKey,
+        bound,
+      )
+
+      if (existing) {
+        /** 已有行：只改标记 + 挪位置（标题封面等原样保留） */
+        db.prepare(
+          `UPDATE videos SET favorites = 1, ord = 0 WHERE search_key = ? AND bvid = ?`,
+        ).run(cacheKey, bvid)
+      } else {
+        /**
+         * 库里没有这一行（「添加视频」加了个搜索没搜到的 BV 号）：
+         * 在这里**新插一行**并把 `ord` 直接写成 0。
+         *
+         * 标题 / 封面 / 时长先留空 —— 调用方（`api:setFavorite`）会先用
+         * `api:parseVideo` 拿到的信息调 `upsertVideoMeta` 补上。
+         */
+        db.prepare(
+          `INSERT INTO videos (search_key, bvid, ord, title, pic, author, duration, favorites)
+           VALUES (?, ?, 0, '', NULL, NULL, NULL, 1)`,
+        ).run(cacheKey, bvid)
+      }
     })
   } catch (err) {
     console.error('[cache] 设置收藏失败:', err)
@@ -923,19 +965,22 @@ export const setFavorite = (searchKey: string, bvid: string, favorite: boolean):
  * 写入 / 更新一条视频的元数据（不改收藏标记、不改顺序、**不碰地址列**）
  *
  * 给「添加视频」用：用户粘贴的 BV 号可能不在搜索结果里，
- * 这时需要先把它插成一行（收藏时才有东西可收藏）。
- * 顺序上放在收藏区之后（`favorites` 决定，`ord` 用当前最大值 + 1），
- * 避免它插进收藏项中间。
+ * 这时先把它插成一行（`favorites = 0`、`ord` 用当前最大值 + 1 = 暂时排末尾），
+ * 紧接着 `setFavorite(..., true)` 会把它**置顶**。
+ *
+ * 为什么先插末尾再置顶、而不是一步到位插到 0：
+ * 这个函数只管"把元数据写进去"，置顶是收藏语义、该由 `setFavorite` 决定 ——
+ * 一个函数只做一件事（它也用于"更新已存在行的信息"，那时完全不该动顺序）。
  */
 export const upsertVideoMeta = (
-  searchKey: string,
+  cacheKey: string,
   video: { bvid: string; title?: string; pic?: string | null; author?: string | null; duration?: number | null },
 ): void => {
-  if (!searchKey || !video?.bvid) return
+  if (!cacheKey || !video?.bvid) return
   try {
     tx(() => {
       const db = getDb()
-      const existing = getVideoRow(searchKey, video.bvid)
+      const existing = getVideoRow(cacheKey, video.bvid)
       const title = video.title || existing?.title || ''
       const pic = video.pic ?? existing?.pic ?? null
       const author = video.author ?? existing?.author ?? null
@@ -945,7 +990,7 @@ export const upsertVideoMeta = (
         db.prepare(
           `UPDATE videos SET title = ?, pic = ?, author = ?, duration = ?
             WHERE search_key = ? AND bvid = ?`,
-        ).run(title, pic, author, duration, searchKey, video.bvid)
+        ).run(title, pic, author, duration, cacheKey, video.bvid)
         return
       }
 
@@ -953,7 +998,7 @@ export const upsertVideoMeta = (
         `INSERT INTO videos
            (search_key, bvid, ord, title, pic, author, duration, favorites)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-      ).run(searchKey, video.bvid, maxOrdOf(searchKey) + 1, title, pic, author, duration)
+      ).run(cacheKey, video.bvid, maxOrdOf(cacheKey) + 1, title, pic, author, duration)
     })
   } catch (err) {
     console.error('[cache] 写入视频元数据失败:', err)
@@ -961,14 +1006,14 @@ export const upsertVideoMeta = (
 }
 
 /** 该歌收藏的 bvid 列表（按 ord 排序，第一个就是「最重要的」） */
-export const getFavorites = (searchKey: string): string[] => {
-  if (!searchKey) return []
+export const getFavorites = (cacheKey: string): string[] => {
+  if (!cacheKey) return []
   try {
     const rows = getDb()
       .prepare(
         `SELECT bvid FROM videos WHERE search_key = ? AND favorites = 1 ORDER BY ord ASC`,
       )
-      .all(searchKey) as Array<{ bvid: string }>
+      .all(cacheKey) as Array<{ bvid: string }>
     return rows.map((r) => r.bvid)
   } catch (err) {
     console.error('[cache] 读取收藏失败:', err)
@@ -977,12 +1022,12 @@ export const getFavorites = (searchKey: string): string[] => {
 }
 
 /** 上次播的是哪个视频（没有记录就返回 null，调用方回落到搜索结果第一条） */
-export const getSelectedBvid = (searchKey: string): string | null => {
-  if (!searchKey) return null
+export const getSelectedBvid = (cacheKey: string): string | null => {
+  if (!cacheKey) return null
   try {
     const row = getDb()
       .prepare(`SELECT selected_bvid FROM song_meta WHERE search_key = ?`)
-      .get(searchKey) as { selected_bvid: string | null } | undefined
+      .get(cacheKey) as { selected_bvid: string | null } | undefined
     return row?.selected_bvid ?? null
   } catch (err) {
     console.error('[cache] 读取选中视频失败:', err)
@@ -999,8 +1044,8 @@ export const getSelectedBvid = (searchKey: string): string | null => {
  * 注意**不碰 `search_login_state`**：那是「搜索结果是在什么登录态下取的」，
  * 与「用户选了哪个视频」毫无关系，顺手写一遍只会互相覆盖。
  */
-export const setSelectedBvid = (searchKey: string, bvid: string): void => {
-  if (!searchKey || !bvid) return
+export const setSelectedBvid = (cacheKey: string, bvid: string): void => {
+  if (!cacheKey || !bvid) return
   try {
     getDb()
       .prepare(
@@ -1010,7 +1055,7 @@ export const setSelectedBvid = (searchKey: string, bvid: string): void => {
            selected_bvid = excluded.selected_bvid,
            updated_at    = excluded.updated_at`,
       )
-      .run(searchKey, bvid, Date.now())
+      .run(cacheKey, bvid, Date.now())
   } catch (err) {
     console.error('[cache] 记录选中视频失败:', err)
   }
@@ -1027,12 +1072,12 @@ export const setSelectedBvid = (searchKey: string, bvid: string): void => {
  * 刻意与 `videos.playurl_login_state` 分开：两者是不同时刻、不同请求的登录态快照 ——
  * 搜索可能几小时前就做了，而播放地址是刚刚解析的。合并成一个字段必然互相覆盖。
  */
-export const getSearchLoginState = (searchKey: string): boolean | null => {
-  if (!searchKey) return null
+export const getSearchLoginState = (cacheKey: string): boolean | null => {
+  if (!cacheKey) return null
   try {
     const row = getDb()
       .prepare(`SELECT search_login_state FROM song_meta WHERE search_key = ?`)
-      .get(searchKey) as { search_login_state: number | null } | undefined
+      .get(cacheKey) as { search_login_state: number | null } | undefined
     if (!row || row.search_login_state === null) return null
     return row.search_login_state === 1
   } catch (err) {
@@ -1049,13 +1094,13 @@ export const getSearchLoginState = (searchKey: string): boolean | null => {
  * 旧值也没有时才落一个 NULL（表示确实不知道），行本身要建出来 ——
  * `song_meta` 那行还可能承载 `selected_bvid`，缺行不代表没数据。
  */
-export const setSearchLoginState = (searchKey: string, state: boolean | null): void => {
-  if (!searchKey) return
+export const setSearchLoginState = (cacheKey: string, state: boolean | null): void => {
+  if (!cacheKey) return
   try {
     const db = getDb()
     const existing = db
       .prepare(`SELECT search_login_state FROM song_meta WHERE search_key = ?`)
-      .get(searchKey) as { search_login_state: number | null } | undefined
+      .get(cacheKey) as { search_login_state: number | null } | undefined
 
     // 未知 + 已经有一行：什么都不做（连 updated_at 都不动，避免无意义的写盘）
     if (existing && state === null) return
@@ -1066,7 +1111,7 @@ export const setSearchLoginState = (searchKey: string, state: boolean | null): v
        ON CONFLICT(search_key) DO UPDATE SET
          search_login_state = excluded.search_login_state,
          updated_at         = excluded.updated_at`,
-    ).run(searchKey, state === null ? null : state ? 1 : 0, Date.now())
+    ).run(cacheKey, state === null ? null : state ? 1 : 0, Date.now())
   } catch (err) {
     console.error('[cache] 记录搜索登录态失败:', err)
   }

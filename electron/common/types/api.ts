@@ -91,14 +91,20 @@ export interface RendererAPI {
    * 收藏会把该条挪到第一位，取消收藏**位置不动**。
    */
   setFavorite: (
-    searchKey: string,
+    cacheKey: string,
     bvid: string,
     favorite: boolean,
   ) => Promise<{ favorites: string[] }>
-  /** 某首歌收藏的 bvid 列表 */
-  getFavoriteBvids: (searchKey: string) => Promise<string[]>
+  /** 收藏状态跟着搜索结果一起回来，不需要单独查（见 `setFavorite` 的返回值） */
+  /**
+   * ★ 补一条视频的时长（只改 `videos.duration`）
+   *
+   * 搜索接口有些结果不带时长（缓存里是 NULL），等这条视频真的开始播了，
+   * 时长一定拿得到，顺手写回库，下次打开列表就不会缺。
+   */
+  fillVideoDuration: (cacheKey: string, bvid: string, duration: number) => Promise<void>
   /** 某首歌上次播的视频 bvid；没有记录返回 null */
-  getSelectedBvid: (searchKey: string) => Promise<string | null>
+  getSelectedBvid: (cacheKey: string) => Promise<string | null>
   /** 注意：没有 setSelectedBvid —— 写入由 resolveVideoUrl 内部完成 */
   resolveVideoUrl: (
     bvid: string,
@@ -116,6 +122,13 @@ export interface RendererAPI {
     title?: string | null
     /** 正在解析的这个视频的封面 */
     pic?: string | null
+    /**
+     * ★ 视频时长（秒）
+     *
+     * 搜索接口有些结果不带 `duration`（缓存里是 NULL，列表显示空）。
+     * 解析播放地址时一定拿得到，渲染层用它把列表项补上并回写库。
+     */
+    duration?: number | null
     /** 正在解析的这个视频的清晰度短标签，例如 1080P / 4K */
     quality?: string | null
     /** 清晰度完整描述，例如 1080P 高清 / 1080P 60帧 */
@@ -154,6 +167,8 @@ export interface RendererAPI {
   winMinimize: () => Promise<void>
   winMaximize: () => Promise<void>
   winClose: () => Promise<void>
+  /** ★ 真正退出应用（不受「关闭到托盘」影响）—— 定时关闭用它 */
+  winQuit: () => Promise<void>
   winIsMaximized: () => Promise<boolean>
   winToggleFullscreen: () => Promise<boolean>
   winIsFullscreen: () => Promise<boolean>

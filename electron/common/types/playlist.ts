@@ -24,7 +24,7 @@ export interface PlaylistSync {
  *  - 收藏：`videos.favorites` + `videos.ord`（顺带承载列表顺序）
  *  - 上次播的：`song_meta.selected_bvid`
  *
- * 为什么搬走：两者都是**按搜索键**索引、且带「列表顺序」语义的数据，
+ * 为什么搬走：两者都是**按缓存键**索引、且带「列表顺序」语义的数据，
  * 和歌单（按 id 索引、全量覆盖）的写入节奏完全不同。以前塞在歌单记录里，
  * 每次切歌/收藏都要把整个歌单集合 `savePlaylists` 全量覆盖一遍，
  * 同步进行时还会被 `syncingIds` 拦下来（收藏丢了都没人知道）。
@@ -35,7 +35,7 @@ export interface PlaylistSync {
  * 歌单里的一首歌（结构化）
  *
  * 之前 songs 是 `"歌名-歌手"` 字符串数组，没法展示封面/专辑/歌手。
- * 现在改成对象，并用 toSearchKey() 拼出与旧版完全一致的搜索键，
+ * 现在改成对象，并用 toCacheKey() 拼出与旧版完全一致的缓存键，
  * 这样 matchScore / nameBonus / 缓存 key 那条链路一行都不用改。
  */
 export interface PlaylistSong {
@@ -100,17 +100,17 @@ export const sourceOfSongId = (id: string): string | null => {
  * ## ⚠️ 它**只用于 `songs` 表**
  *
  * `videos.search_key` / `song_meta.search_key` 存的是**歌名**
- * （见 `toSearchKey`）—— 那些表要拿键去**搜 B站**，用 id 搜不出任何东西。
+ * （见 `toCacheKey`）—— 那些表要拿键去**搜 B站**，用 id 搜不出任何东西。
  *
  * 这个 id 的唯一用途是让「同一首歌」在两个歌单里只占 songs 表**一行**。
  *
  * ## 没有平台 id 时兜底
  *
- * 手动按「歌名-歌手」添加的歌没有平台 id，退化成 `toSearchKey(song)`。
+ * 手动按「歌名-歌手」添加的歌没有平台 id，退化成 `toCacheKey(song)`。
  */
 export const songId = (song: PlaylistSong): string => {
   const pid = typeof song.platformId === 'string' ? song.platformId.trim() : ''
-  if (!pid) return toSearchKey(song)
+  if (!pid) return toCacheKey(song)
   const src = typeof song.source === 'string' ? song.source.trim() : ''
   return src ? `${src}_${pid}` : pid
 }
@@ -159,21 +159,35 @@ export const platformIdOfSongId = (id: string): string | null => {
 }
 
 /**
- * 把「歌名 + 歌手」拼成缓存键 `"歌名-歌手"`
+ * 把「歌名 + 歌手」拼成**缓存键** `"歌名-歌手"`
+ *
+ * ## ⚠️ 它**不是搜索词**（这两个概念最容易混）
+ *
+ * 真正发给 B 站的是 `歌名 歌手`（见 `buildPrimaryKeyword`，**不带引号**），
+ * 而这个只是数据库里用来标识"哪首歌的搜索结果"的**主键**：
+ * `videos.search_key` / `song_meta.search_key` 的值。
+ *
+ * 两者还会**不一致**：歌名带括号时，搜索词是剥过括号的版本，
+ * 缓存键保持原始歌名 —— 拿缓存键当搜索词看会完全误解。
+ *
+ * 命名约定：
+ *  - **函数名**用 `CacheKey`（`joinCacheKey` / `toCacheKey` / `parseCacheKey`）
+ *  - **变量 / 参数**用 `cacheKey`
+ *  - 库里的列名仍是 `search_key`（改列名要清库），但**代码里一律叫 cacheKey**
  *
  * ⚠️ 参数名统一叫 `singer`（**不是 `artist`**）—— 项目里所有其它地方
  * （`PlaylistSong.singer` / `RankOptions.singer` / `scoreVideo` 的参数）
  * 都是 `singer`，用 `artist` 会让读代码的人以为是另一个概念。
  * （唯一叫 `artist` 的地方是 `MediaMetadata` 的**字段名**，那是它的 API。）
  */
-export const joinSearchKey = (song: string, singer: string): string => {
+export const joinCacheKey = (song: string, singer: string): string => {
   const s = String(song ?? '').trim()
   const a = String(singer ?? '').trim()
   return a ? `${s}-${a}` : s
 }
 
 /**
- * 搜索键 / 缓存键：`"歌名-歌手"`
+ * 取一首歌的**缓存键**：`"歌名-歌手"`
  *
  * ⚠️ 它**不是歌名**，是「歌名 + 歌手」拼起来的。两处用到它：
  *  1. `videos.search_key` / `song_meta.search_key` —— 缓存主键；
@@ -183,11 +197,16 @@ export const joinSearchKey = (song: string, singer: string): string => {
  * `PlaylistSong` 上本来就有 `.name` / `.singer` 两个独立字段，直接取即可
  * （歌名本身还可能含 `-`，拆串是有歧义的）。
  */
-export const toSearchKey = (song: PlaylistSong): string =>
-  joinSearchKey(song.name, song.singer ?? '')
+export const toCacheKey = (song: PlaylistSong): string =>
+  joinCacheKey(song.name, song.singer ?? '')
 
-/** 把旧的 `"歌名-歌手"` 字符串解析成结构化歌曲 */
-export const parseSearchKey = (text: string): PlaylistSong => {
+/**
+ * 把 `"歌名-歌手"` 字符串解析成结构化歌曲
+ *
+ * 只用于**读旧数据**（旧版把曲目存成 `"歌名-歌手"` 字符串数组）。
+ * 新数据走 `PlaylistSong` 对象，不需要解析。
+ */
+export const parseCacheKey = (text: string): PlaylistSong => {
   const raw = String(text ?? '').trim()
   // 只按第一个 '-' 切分：歌名本身可能带 '-'
   const idx = raw.indexOf('-')

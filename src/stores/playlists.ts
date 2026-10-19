@@ -12,7 +12,8 @@
  * **收藏视频与「每首歌选中的视频」不在这里**（`getFavorites` / `addFavorite` /
  * `removeFavorite` / `setVideoForSong` / `getVideoForSong` 都已删除）。
  * 它们搬到了主进程的 `videos` / `song_meta` 表，渲染层直接调
- * `api.setFavorite` / `api.getFavoriteBvids` / `api.getSelectedBvid`。
+ * `api.setFavorite` / `api.getSelectedBvid`。
+ * （收藏状态**不用单独查**：它跟着搜索结果一起回来，`setFavorite` 也会返回最新列表。）
  * 为什么必须搬走：收藏带「列表顺序」语义，而这个 store 的
  * 持久化是**整个歌单集合全量覆盖**——每收藏一次就把所有歌单所有曲目重写一遍，
  * 而且同步进行中还会被主进程的 `syncingIds` 拦下（收藏静默丢失）。

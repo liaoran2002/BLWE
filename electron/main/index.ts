@@ -1000,8 +1000,8 @@ function refreshTray(): void {
    * 用户按提示点了一下，结果窗口直接跳出来 —— 提示与实际不一致比没有提示更糟。
    */
   const tip = wallpaperEnabled
-    ? `BiLiMusicVideo-desktop · 壁纸模式\n${title}\n单击：回到窗口　右键：菜单`
-    : `BiLiMusicVideo-desktop\n${title}\n单击：显示窗口　右键：菜单`
+    ? `BiLiMusicVideo · 壁纸模式\n${title}\n单击：回到窗口　右键：菜单`
+    : `BiLiMusicVideo\n${title}\n单击：显示窗口　右键：菜单`
   if (tip !== lastTrayTip) {
     tray.setToolTip(tip)
     lastTrayTip = tip

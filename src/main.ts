@@ -31,6 +31,11 @@ const bootstrap = async (): Promise<void> => {
   }
   // 界面颜色 / 毛玻璃参数跟着配置走（含后续广播过来的修改）。
   // 放在 mount 之前应用一次，避免先按默认色渲染再跳一下的闪烁。
+  //
+  // ⚠️ 这个数组必须与 `applyUiTheme` **实际读取的键**保持一致。
+  // 漏掉某个键的后果是：那个设置改了不会生效（数字变了、界面没变），
+  // 要等到用户再动数组里别的键时才被顺带应用一次。
+  // 踩过：`common.idleOpacity` 漏在这里 → 「控制栏闲置透明度」拖了没反应。
   watch(
     () => [
       settingStore.setting['common.themeColor'],
@@ -38,6 +43,7 @@ const bootstrap = async (): Promise<void> => {
       settingStore.setting['common.glassTransparency'],
       settingStore.setting['common.glassBlur'],
       settingStore.setting['common.glassShadow'],
+      settingStore.setting['common.idleOpacity'],
     ],
     () => applyUiThemeFromSetting(settingStore.setting),
     { immediate: true },

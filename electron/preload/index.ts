@@ -101,15 +101,16 @@ const api = {
     rendererInvoke('api:parseVideo', { input }),
   /** 收藏 / 取消收藏；返回值是收藏后的完整列表（顺带刷新界面顺序） */
   setFavorite: (
-    searchKey: string,
+    cacheKey: string,
     bvid: string,
     favorite: boolean,
   ): Promise<{ favorites: string[] }> =>
-    rendererInvoke('api:setFavorite', { searchKey, bvid, favorite }),
-  getFavoriteBvids: (searchKey: string): Promise<string[]> =>
-    rendererInvoke('api:getFavoriteBvids', { searchKey }),
-  getSelectedBvid: (searchKey: string): Promise<string | null> =>
-    rendererInvoke('api:getSelectedBvid', { searchKey }),
+    rendererInvoke('api:setFavorite', { cacheKey, bvid, favorite }),
+  /** ★ 补一条视频的时长（搜索接口没给时长时，播放后补上并回写库） */
+  fillVideoDuration: (cacheKey: string, bvid: string, duration: number): Promise<void> =>
+    rendererInvoke('api:fillVideoDuration', { cacheKey, bvid, duration }),
+  getSelectedBvid: (cacheKey: string): Promise<string | null> =>
+    rendererInvoke('api:getSelectedBvid', { cacheKey }),
   resolveVideoUrl: (
     bvid: string,
     keyword?: string,
@@ -142,6 +143,8 @@ const api = {
   winMinimize: (): Promise<void> => rendererInvoke('win:minimize'),
   winMaximize: (): Promise<void> => rendererInvoke('win:maximize'),
   winClose: (): Promise<void> => rendererInvoke('win:close'),
+  /** ★ 真正退出应用（不受「关闭到托盘」影响）—— 定时关闭用它 */
+  winQuit: (): Promise<void> => rendererInvoke('win:quit'),
   winIsMaximized: (): Promise<boolean> => rendererInvoke('win:isMaximized'),
   winToggleFullscreen: (): Promise<boolean> => rendererInvoke('win:toggleFullscreen'),
   winIsFullscreen: (): Promise<boolean> => rendererInvoke('win:isFullscreen'),

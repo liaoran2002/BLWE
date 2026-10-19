@@ -241,7 +241,14 @@ export class DashSession {
         const keep = KEEP_BEHIND_STEPS[Math.min(attempt, KEEP_BEHIND_STEPS.length - 1)]
         const freed = await this.trim(buffer, keep)
         if (!freed) {
-          throw new Error('SourceBuffer 配额超限，且没有可丢弃的已播数据')
+          /**
+           * ⚠️ 文案用**用户能懂的措辞**
+           *
+           * 这个 Error 可能经 `errMsg()` 显示给用户（「视频加载失败：xxx」），
+           * 所以不能写「SourceBuffer 配额超限」这种内部黑话 —— 对用户毫无意义。
+           * 只说现象：「解码器缓存满了」。
+           */
+          throw new Error('播放器缓存已满，需要重新加载')
         }
       }
     }
@@ -261,7 +268,8 @@ export class DashSession {
           { once: true },
         )
       })
-      if (timedOut) throw new Error('SourceBuffer 长时间处于 updating')
+      /** 同上：文案要用户能懂，不写内部黑话 */
+      if (timedOut) throw new Error('播放器等待超时，需要重新加载')
     }
   }
 

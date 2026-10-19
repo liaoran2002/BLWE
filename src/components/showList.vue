@@ -154,6 +154,7 @@
 <script lang="ts">
 import { defineComponent } from 'vue';
 import type { PlaylistSong } from '@common/types/playlist';
+import { formatDuration } from '@common/utils/duration';
 import { normalizeImageUrl } from '../utils/image';
 import { sanitizeTitleHtml, stripTags } from '../utils/title';
 
@@ -170,8 +171,13 @@ export interface VideoListItem {
   pic?: string | null;
   /** UP 主名 */
   author?: string | null;
-  /** 时长（秒）；B 站搜索接口给的是 "4:03" 这种字符串，所以两种都收 */
-  duration?: number | string | null;
+  /**
+   * 时长**秒数**（`null` / 缺省 = 未知）
+   *
+   * B站搜索原始给的是 `"4:03"`，但主进程 `biliApi.extract` 在入口就转成秒了，
+   * 所以到渲染层这里**只可能是数字**。
+   */
+  duration?: number | null;
 }
 
 type ListItem = PlaylistSong | VideoListItem;
@@ -179,34 +185,19 @@ type ListItem = PlaylistSong | VideoListItem;
 const isVideoItem = (item: ListItem): item is VideoListItem =>
   typeof (item as VideoListItem).bvid === 'string';
 
-/** 秒 -> mm:ss */
-const formatSeconds = (sec: number | null | undefined): string | null => {
-  if (typeof sec !== 'number' || !Number.isFinite(sec) || sec <= 0) return null;
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  const p = (n: number): string => (n < 10 ? `0${n}` : String(n));
-  return `${p(m)}:${p(s)}`;
-};
-
 /**
- * 时长文案（两种数据形状都要认）
+ * 时长文案（**秒 -> `mm:ss`**）
  *
- * 踩过：B 站**搜索**接口给的 `duration` 是 `"4:03"` 这种**字符串**，
- * 而 **view** 接口给的是秒数。原来只处理数字，于是「刷新」走真实重搜之后
- * （搜索结果覆盖了缓存里的旧数据），视频列表的时长整列消失。
- * 这里两种都接受：已经是 `mm:ss` 就直接用，是数字（或数字字符串）再格式化。
+ * ⚠️ 数据源头已经统一成**秒**了：
+ *  - B站搜索给的 `"4:03"` 在 `biliApi.extract` 入口就转成了秒；
+ *  - 库里 `videos.duration` 一直是秒；
+ *  - 歌单里的 `PlaylistSong.duration` 也是秒。
+ *
+ * 所以这里**只做一件事**：秒 → `mm:ss`（`formatDuration`）。
+ * 不再需要「两种形状都要认」那套兼容逻辑 —— 那是数据格式没统一时代码，
+ * 留着反而会让「明明已经从源头修好了，却还在下游各写一份解析」的坏习惯延续。
  */
-const durationText = (raw: number | string | null | undefined): string => {
-  if (typeof raw === 'number') return formatSeconds(raw) ?? '';
-  if (typeof raw === 'string') {
-    const s = raw.trim();
-    if (!s) return '';
-    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) return s;
-    const n = Number(s);
-    if (Number.isFinite(n)) return formatSeconds(n) ?? '';
-  }
-  return '';
-};
+const durationText = (raw: number | null | undefined): string => formatDuration(raw)
 
 /*
  * 标题的转义 / 净化（`stripTags` / `sanitizeTitleHtml`）已经抽到 `utils/title.ts`，
@@ -366,8 +357,13 @@ export default defineComponent({
       if (isVideoItem(item)) return normalizeImageUrl(item.pic);
       return normalizeImageUrl(item.cover);
     },
+    /**
+     * 时长文案（两种列表项都存在 `duration` 字段，所以不必分支）
+     *
+     * `VideoListItem.duration` 和 `PlaylistSong.duration` 都是**秒数**
+     * （见各自的类型注释），直接喂给 `durationText` 即可。
+     */
     durationOf(item: ListItem): string {
-      if (isVideoItem(item)) return durationText(item.duration);
       return durationText(item.duration);
     },
     /** 图片挂了就记下这个地址，露出兜底图标（避免一直显示破图） */

@@ -42,8 +42,13 @@ export interface BiliVideo {
   pic?: string | null
   /** UP 主 */
   author?: string | null
-  /** 时长：搜索接口给字符串 "4:03"，view 接口给秒数，两种都可能是 */
-  duration?: number | string | null
+  /**
+   * 时长**秒数**（`null` / 缺省 = 未知）
+   *
+   * 主进程 `biliApi.extract` 在入口就把 B站的 `"4:03"` 转成秒了，
+   * 渲染层拿到的**只有数字**；展示时用 `formatDuration()` 转回 `mm:ss`。
+   */
+  duration?: number | null
   /**
    * 是否已收藏（由主进程写入）
    *
@@ -66,7 +71,7 @@ export interface AppData {
   /** 当前歌单的曲目（结构化：含封面 / 专辑 / 歌手） */
   songs: PlaylistSong[]
   videoList: BiliVideo[]
-  /** `videoList` 属于哪一首歌（搜索键），用于判断列表是否已经跟上当前歌曲 */
+  /** `videoList` 属于哪一首歌（缓存键），用于判断列表是否已经跟上当前歌曲 */
   videoListKeyword: string
   /** 正在播的那个视频的封面（主进程回传，优先于列表里的缩略图） */
   videoPic: string
@@ -176,6 +181,24 @@ export interface AppData {
   aboutVisible: boolean
   /** 「添加视频」弹窗是否可见（视频列表右上角的加号） */
   addVideoVisible: boolean
+  /** 定时暂停面板是否展开 */
+  sleepPanelVisible: boolean
+  /**
+   * 定时暂停的状态快照（由 `SleepTimer` 每秒推一次）
+   *
+   * 类型见 `src/utils/sleepTimer.ts` 的 `SleepTimerState`；这里用结构类型，
+   * 避免 `types/app.ts` 反向依赖 `utils/`。
+   */
+  sleepState: {
+    active: boolean
+    remainMs: number
+    pending: boolean
+    action: 'stop' | 'quit'
+  }
+  /** 定时暂停实例（自带 setInterval，`beforeUnmount` 里 dispose） */
+  _sleepTimer: import('../utils/sleepTimer').SleepTimer | null
+  /** `SleepTimer` 的订阅取消函数 */
+  _sleepUnsub: (() => void) | null
   /** 视频请求竞态令牌（切视频时防乱序覆盖） */
   _videoToken: number
   /** 同一个视频的连续失败次数，达到上限就跳过该曲，避免无限重试 */
@@ -249,8 +272,65 @@ export interface AppData {
   _stallRecoveries: number
   /** 播放停滞看门狗：单曲歌单反复停滞时放弃这条流，不再周期性告警 */
   _stallGivenUp: boolean
+  /**
+   * 「所有源都卡住」那条常驻通知当前是否还开着
+   *
+   * 它 `duration: 0`（要手动关），所以靠这个标记保证**同时只有一条**。
+   */
+  _stallNoticeOpen: boolean
+  /**
+   * 卡顿恢复链：当前试到第几个**备用源**（`0` = 主地址）
+   *
+   * 每次换源 +1（`recoverFromStall` 里）。
+   *
+   * **归零**发生在「换了一条新流」的时候：
+   *  - `onVideoLoaded`（新视频真正开始播）；
+   *  - `changeSong`（切歌，含新歌在 `loadeddata` 之前就卡住的盲区）；
+   *  - `clearNowPlaying`（没有在播的东西了）；
+   *  - 单曲循环的那一圈。
+   *
+   * ⚠️ **换清晰度时不归零**（`applyVideoSource` 里也不归零）—— 这是刻意的：
+   * 降清晰度就是在同一条流的恢复链上往前走，复位会让它在第一档上打转。
+   */
+  _stallUrlIndex: number
+  /**
+   * 卡顿恢复链：已经**降了几档清晰度**（最多 `MAX_QUALITY_DROPS` 档）
+   *
+   * 降到 3 档还卡就直接降 durl，不再继续降（画面已经没法看了）。
+   *
+   * 归零时机与 `_stallUrlIndex` 完全一致（同一件事的两个计数）。
+   */
+  _stallQualityDrops: number
   /** 这次锁定是不是「进全屏时自动锁的」，退出全屏要跟着解开 */
   _lockedByFullscreen: boolean
+  /**
+   * ★ **当前有几个网络请求在飞**（搜索 / 解析播放地址）
+   *
+   * 控制栏据此禁用「会再发请求」的控件（切歌、清晰度/音质切换）——
+   * 用户狂点会让请求成倍打出去，B站直接 412 风控。
+   *
+   * 用**计数器**而不是布尔：切歌时「搜索 → 解析地址」是两段连续的请求，
+   * 布尔会被先结束的那个提前清掉。
+   *
+   * ⚠️ 它参与渲染（`netBusy` 计算属性读它），所以**必须在 data 里**、
+   * 不能只做成普通实例字段。
+   */
+  _netBusyCount: number
+  /**
+   * ★ 清晰度 / 音质切换后的**冷却截止时间戳**（毫秒；`0` = 没有冷却）
+   *
+   * 切换会重新解析地址，`_netBusyCount` 只管到请求结束；
+   * 这个冷却再压 3 秒，防止「请求刚结束就再点一次」。
+   */
+  _qualityCooldownUntil: number
+  /** 上面那个冷却的定时器句柄（重复调用时先清旧的，避免堆定时器） */
+  _qualityCooldownTimer: ReturnType<typeof setTimeout> | null
+  /**
+   * 上次提示「正在加载，先别点」的时间戳（毫秒）
+   *
+   * 用于给 `notifyNetBusy()` 节流 —— 用户连点切歌时别让 toast 刷屏。
+   */
+  _lastNetBusyHintAt: number
 }
 
 /**
@@ -260,7 +340,7 @@ export interface AppData {
  * 真正切歌时主进程直接命中缓存，剩下的只是本地换源。
  */
 export interface WarmInfo {
-  /** 搜索键（toSearchKey），用来判断槽位是不是过期了 */
+  /** 缓存键（toCacheKey），用来判断槽位是不是过期了 */
   song: string
   bvid: string
   videoUrl: string | null

@@ -37,14 +37,18 @@
           <!--
             清晰度 / 音质角标：贴在这一行最右边，点开可以切换
             可选档位由父组件从 playurl 响应里取（不同视频、不同账号能选的档位不一样）
+
+            ⚠️ 切换清晰度**会重新解析播放地址**（发请求）—— 请求进行中禁用（`qualityBusy`），
+            而且改完还有 3 秒冷却（防连点）。禁用时 `title` 说明原因。
           -->
           <el-dropdown
             v-if="quality"
             trigger="click"
             placement="top"
+            :disabled="qualityBusy"
             @command="(id: number) => $emit('selectQuality', 'video', id)"
           >
-            <div class="np-quality" :title="qualityTitle">
+            <div class="np-quality" :title="qualityBusy ? '正在加载中，请稍候……' : qualityTitle">
               {{ quality }}<span v-if="videoChoices.length > 1" class="np-caret">▾</span>
             </div>
             <template #dropdown>
@@ -64,9 +68,10 @@
             v-if="audioQuality"
             trigger="click"
             placement="top"
+            :disabled="qualityBusy"
             @command="(id: number) => $emit('selectQuality', 'audio', id)"
           >
-            <div class="np-quality" :title="audioTitle">
+            <div class="np-quality" :title="qualityBusy ? '正在加载中，请稍候……' : audioTitle">
               {{ audioQuality }}<span v-if="audioChoices.length > 1" class="np-caret">▾</span>
             </div>
             <template #dropdown>
@@ -128,9 +133,16 @@
         @click="$emit('videoControl', 'vList')"
         id="vList"
       ></i>
+      <!--
+        上一首 / 下一首：**会发请求**（重新搜索 + 解析地址），
+        请求进行中禁用 —— 狂点只会让 B站 412 风控（`busy`）。
+
+        `title` 说明**为什么点不动**：只灰掉而不给原因，用户会以为按钮坏了。
+      -->
       <i
-        class="iconfont icon-1_music83"
-        @click="$emit('videoControl', 'before')"
+        :class="['iconfont', 'icon-1_music83', busy ? 'ctrl-disabled' : '']"
+        :title="busy ? '正在加载中，请稍候……' : '上一首'"
+        @click="busy ? null : $emit('videoControl', 'before')"
         id="before"
       ></i>
       <i
@@ -139,8 +151,9 @@
         id="playControls"
       ></i>
       <i
-        class="iconfont icon-1_music82"
-        @click="$emit('videoControl', 'next')"
+        :class="['iconfont', 'icon-1_music82', busy ? 'ctrl-disabled' : '']"
+        :title="busy ? '正在加载中，请稍候……' : '下一首'"
+        @click="busy ? null : $emit('videoControl', 'next')"
         id="next"
       ></i>
       <div class="audio-control">
@@ -268,6 +281,30 @@ export default defineComponent({
     duration: { type: Number, default: 0 },
     paused: { type: Boolean, default: false },
     listType: { type: String, default: '' },
+    /**
+     * ★ **有网络请求在飞**（搜索 / 解析地址）时为 true
+     *
+     * 用于**禁用所有会再发请求的控件**，防止用户狂点造成请求风暴
+     * （B站会返回 412 风控）。
+     *
+     * ⚠️ 只禁「会发请求的」——播放 / 暂停 / 音量 / 进度这些**本地功能**不禁，
+     * 它们在请求期间照常可用（用户不该因为后台在搜歌就不能暂停）。
+     *
+     * 会发请求的有：切歌（上一首 / 下一首）、清晰度 / 音质切换、播放模式
+     * （换模式可能重新解析地址）。
+     * 不该禁的有：播放/暂停、静音、音量、进度条、两个列表开关（纯本地展开收起）。
+     */
+    busy: { type: Boolean, default: false },
+    /**
+     * ★ **清晰度 / 音质下拉是否该禁用**
+     *
+     * 比 `busy` 多一个来源：**刚改过清晰度/音质的 3 秒冷却**
+     * （见 App.vue 的 `startQualityCooldown`）。
+     *
+     * 为什么不干脆用 `busy`：切歌按钮没必要因为「刚改过清晰度」被禁 3 秒 ——
+     * 冷却只针对「再改一次清晰度」这个动作。
+     */
+    qualityBusy: { type: Boolean, default: false },
   },
   methods: {
     formatTime(s: number): string {
@@ -498,6 +535,18 @@ export default defineComponent({
   font-size: 7vh;
   height: 10vh;
   line-height: 1;
+}
+/*
+ * 请求进行中被禁用的控件（切歌按钮 / 清晰度、音质下拉）
+ *
+ * 只做视觉弱化 + `cursor: not-allowed`，**点击已经在模板里拦住了**
+ * （`@click="busy ? null : ..."`）—— 样式只是给用户一个「现在点了没用」的反馈，
+ * 不承担拦截职责（免得有人以为改样式就能解禁）。
+ */
+#controls i.ctrl-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 .audio-control {
   position: relative;

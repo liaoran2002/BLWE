@@ -28,6 +28,31 @@ export interface AppSetting {
    * 而不是只在第一次写。
    */
   'common.autoLaunch': boolean
+  /**
+   * 定时暂停：上次设置的小时数（0-23）
+   *
+   * 打开定时面板时**直接显示这个值**（不是每次归零）—— 用户多半是重复设同一个时长。
+   * 0 时 0 分 = 没有定时（面板里的输入框显示 00:00）。
+   */
+  'common.sleepTimerHours': number
+  /** 定时暂停：上次设置的分钟数（0-59） */
+  'common.sleepTimerMinutes': number
+  /**
+   * 定时暂停：三个复选框的状态（上次的选择，下次打开面板自动勾上）
+   *
+   * 三个选项是**叠加**关系，不是互斥：
+   *  - `pauseCountdown`  —— 视频暂停时倒计时也暂停
+   *  - `waitVideoEnd`    —— 等视频播完再执行（否则到点立刻执行）
+   *  - `closeApp`        —— 执行动作是「关闭程序」（否则只是「停止播放」）
+   *
+   * 存在一个对象里而不是三个布尔字段：它们**总是一起读写**，
+   * 而且以后要加第四个选项时不用再动一次 schema。
+   */
+  'common.sleepTimerOptions': {
+    pauseCountdown: boolean
+    waitVideoEnd: boolean
+    closeApp: boolean
+  }
   /** 点关闭按钮时不退出，最小化到系统托盘 */
   'common.closeToTray': boolean
   /** 在任务栏图标上显示当前视频播放进度 */
@@ -117,6 +142,32 @@ export interface AppSetting {
   'player.videoQuality': number
   /** 默认音质（dash 音频流 id，如 30280 = 192K） */
   'player.audioQuality': number
+  /**
+   * 卡顿**自动降低清晰度**（默认关）
+   *
+   * ## 开关只影响「降清晰度」这一步
+   *
+   * 卡顿时的恢复链是分级的，**换备用源 / 降 durl 是无条件自动做的**
+   * （那两步不会损失清晰度体验，没必要问用户）：
+   *
+   * ```
+   * 卡顿 8 秒
+   *   → ① 换同一清晰度的备用源（backupUrl）      ← 无条件
+   *   → ② 降一档清晰度（重新试它的源）            ← ★ 只在这一步看开关
+   *   → ③ 降了 3 档还卡 → 降 durl                 ← 无条件
+   *   → ④ durl 还卡 → 暂停 + 提示检查网络
+   * ```
+   *
+   * - **开**：按上面整条链自动走，每次降档用 `message` 告知
+   * - **关**：② 不执行 —— 备用源试完直接降到 durl（不一级级降），
+   *   并用 `message` **提示**「建议降到 XXX」（下一级清晰度），让用户自己决定
+   *
+   * ## 为什么默认关
+   *
+   * 降清晰度是**降级体验**（画面变糊），该由用户主动选择；
+   * 而「换源 / 降 durl」是纯恢复手段，不问也该做。
+   */
+  'player.autoDowngradeOnStall': boolean
   /**
    * 标题关键词加权配置：score -> 关键词列表
    *

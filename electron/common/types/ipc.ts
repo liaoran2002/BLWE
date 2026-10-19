@@ -38,6 +38,15 @@ export interface ParsedVideoInfo {
 export interface DashStreamsPayload {
   videoUrl: string
   audioUrl: string
+  /**
+   * ★ 视频轨的**全部候选地址**（主地址 + 所有 `backupUrl`，常规 CDN 优先）
+   *
+   * 第一个就是 `videoUrl`。卡顿时渲染层按它**换源**（同一清晰度换 CDN），
+   * 而不是干等降清晰度 —— 见 `biliApi.ts` 的 `dashUrlsOf`。
+   */
+  videoUrls: string[]
+  /** ★ 音频轨的全部候选地址（第一个就是 `audioUrl`） */
+  audioUrls: string[]
   /** SourceBuffer 的 MIME，例如 `video/mp4; codecs="avc1.640032"` */
   videoMime: string
   audioMime: string
@@ -77,6 +86,13 @@ export interface IpcChannelMap {
   'win:minimize': { params: void; result: void }
   'win:maximize': { params: void; result: void }
   'win:close': { params: void; result: void }
+  /**
+   * ★ **真正退出应用**（不受「关闭到托盘」影响）
+   *
+   * 与 `win:close` 的区别：那个走窗口 `close` 事件，`common.closeToTray` 打开时
+   * 会被拦成「隐藏到托盘」—— 用它做「定时关闭」会关不掉。这个直接 `app.quit()`。
+   */
+  'win:quit': { params: void; result: void }
   'win:isMaximized': { params: void; result: boolean }
   'win:toggleFullscreen': { params: void; result: boolean }
   'win:isFullscreen': { params: void; result: boolean }
@@ -119,13 +135,31 @@ export interface IpcChannelMap {
    * 顺序由主进程的 `videos.ord` 决定，只有它知道权威结果。
    */
   'api:setFavorite': {
-    params: { searchKey: string; bvid: string; favorite: boolean }
+    params: { cacheKey: string; bvid: string; favorite: boolean }
     result: { favorites: string[] }
   }
-  /** 某首歌收藏的 bvid 列表（按收藏顺序，第一个排最前） */
-  'api:getFavoriteBvids': { params: { searchKey: string }; result: string[] }
+  /*
+   * 没有 `api:getFavoriteBvids`（下面这条是另一件事，别混起来读）。
+   *
+   * 收藏状态**跟着搜索结果一起回来**（`favorites` 字段由主进程合并时标注），
+   * 渲染层直接从 `videoList` 读就行；收藏 / 取消收藏后 `api:setFavorite`
+   * 会返回最新的收藏列表。独立查收藏的通道从加进来就没被调用过，已删。
+   */
+  /**
+   * ★ 补一条视频的**时长**（只改 `videos.duration`，不动顺序与其它字段）
+   *
+   * 为什么需要它：B 站搜索接口有些结果**不带 `duration`**，缓存里就是 NULL，
+   * 视频列表那一行显示空秒数。而这条视频一旦真的开始播放，时长一定能拿到
+   * （view 响应 / `<video>` 元素上都有），顺手补进库，下次打开就正常了。
+   *
+   * 不用 `api:setFavorite` 代劳：那个是收藏语义（还会改 `ord` 把条目置顶）。
+   */
+  'api:fillVideoDuration': {
+    params: { cacheKey: string; bvid: string; duration: number }
+    result: void
+  }
   /** 某首歌上次播的视频 bvid；没有记录返回 null（调用方回落到搜索结果第一条） */
-  'api:getSelectedBvid': { params: { searchKey: string }; result: string | null }
+  'api:getSelectedBvid': { params: { cacheKey: string }; result: string | null }
   /*
    * 注意这里**没有** `api:setSelectedBvid`。
    *
@@ -155,6 +189,14 @@ export interface IpcChannelMap {
       title?: string | null
       /** 正在解析的这个视频的封面 */
       pic?: string | null
+      /**
+       * ★ 视频时长（秒）
+       *
+       * 搜索接口**有些结果不带 `duration`**，缓存里就存成 NULL，
+       * 视频列表那一行会显示空秒数。解析播放地址时一定拿得到（view 响应里有），
+       * 所以回传给渲染层，让它补上列表项并回写库。
+       */
+      duration?: number | null
       /** 正在解析的这个视频的清晰度短标签，例如 1080P / 4K */
       quality?: string | null
       /** 清晰度完整描述，例如 1080P 高清 / 1080P 60帧 */

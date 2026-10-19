@@ -98,7 +98,7 @@ const loadSqlite = (): SqliteConstructor => {
  *
  * **解析结果合在 `videos` 里，不再单独开表。**
  *
- * 曾经拆出过一张 `video_details`（按 bvid 唯一），理由是「同一个 bvid 被两个搜索键
+ * 曾经拆出过一张 `video_details`（按 bvid 唯一），理由是「同一个 bvid 被两个缓存键
  * 引用时地址会存两份」。但那个重复**很少见**，而拆表的代价是实打实的：每次查询都要
  * `LEFT JOIN`（还必须用 LEFT，用内连接会把没解析过的候选整批丢掉）、`clearAll` 要清
  * 三张表、补插一条记录要写两张表。解析结果拆成结构化字段之后列本来就多，

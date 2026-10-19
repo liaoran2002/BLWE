@@ -95,6 +95,24 @@
             "
           />
         </div>
+        <!--
+          卡顿自动降低清晰度
+
+          ⚠️ 这个开关**只管「降清晰度」这一步**：
+          卡顿时的「换备用源」和「降 durl」是无条件自动做的（那两步不损失清晰度体验）。
+          关掉时不是什么都不做，而是「不自动降」+ 提示用户自己降。
+        -->
+        <div class="st-row">
+          <div class="st-name">
+            卡顿自动降低清晰度
+          </div>
+          <el-switch
+            :model-value="setting['player.autoDowngradeOnStall']"
+            @update:model-value="
+              (v: string | number | boolean) => setBool('player.autoDowngradeOnStall', v)
+            "
+          />
+        </div>
       </div>
 
       <!-- 界面 -->
@@ -134,7 +152,7 @@
             />
           </div>
         </div>
-        <div class="st-row">
+        <div class="st-row st-row--slider">
           <div class="st-name">透明度</div>
           <div class="st-slider-box">
             <el-slider
@@ -154,10 +172,9 @@
           管的是「鼠标**不**悬停时整个控制栏淡到多透明」（移上去恢复完全不透明）。
           和上面的「透明度」不是一回事：那个管玻璃**底色**，悬停前后都一样。
         -->
-        <div class="st-row">
+        <div class="st-row st-row--slider">
           <div class="st-name">
             控制栏闲置透明度
-            <span class="st-desc">不悬停时淡出的程度</span>
           </div>
           <div class="st-slider-box">
             <el-slider
@@ -171,7 +188,7 @@
             <span class="st-value">{{ setting['common.idleOpacity'] }}%</span>
           </div>
         </div>
-        <div class="st-row">
+        <div class="st-row st-row--slider">
           <div class="st-name">模糊强度</div>
           <div class="st-slider-box">
             <el-slider
@@ -185,7 +202,7 @@
             <span class="st-value">{{ blurPercent }}%</span>
           </div>
         </div>
-        <div class="st-row">
+        <div class="st-row st-row--slider">
           <div class="st-name">阴影强度</div>
           <div class="st-slider-box">
             <el-slider
@@ -287,8 +304,8 @@
               :model-value="expireDays"
               size="small"
               style="width: 130px"
+			  :max="CACHE_EXPIRE_DAYS_MAX"
               :min="CACHE_EXPIRE_DAYS_MIN"
-              :max="CACHE_EXPIRE_DAYS_MAX"
               :step="CACHE_EXPIRE_DAYS_STEP"
               @update:model-value="(v: number | undefined) => setExpireDays(v)"
             />
@@ -360,14 +377,15 @@
         <!--
           ③ 关键词加权（**在过滤关键词之上**，按用户要求）
           ================================================
-          每一档一行：左边是分值，右边是**一个个的标签**（不是一个大输入框）。
-          点 `+` 才出现一个输入框，回车/失焦即提交 —— 和下面过滤关键词同一套交互。
+          每一档两行：
+            · 第一行 `[+] [分值] [−]`   —— 加号在左、减号在右
+            · 第二行 关键词标签 + 「删除」（删除靠最右）
+          这样分值调节和标签各自有空间，不会挤成一团。
         -->
-        <div class="st-sub">
-          关键词加权
-          <span class="st-desc">歌手名命中 +100，之后按这里的分值累加</span>
+        <div class="st-sub st-sub--split">
+          <span class="st-sub-title">关键词加权</span>
           <el-button class="st-add-tier" size="small" text @click="openTierInput">
-            + 分值档
+            添加分值档
           </el-button>
         </div>
         <!-- 新增分值档：点了「+ 分值档」才出现 -->
@@ -382,35 +400,21 @@
               autofocus
               @keyup.enter="addTier"
             />
-            <el-button size="small" @click="addTier">确定</el-button>
-            <el-button size="small" text @click="cancelTierInput">取消</el-button>
+            <!-- 确定：绿色（success）、取消：蓝色（primary）—— 和删除确认那组配色一致 -->
+            <el-button size="small" type="success" @click="addTier">确定</el-button>
+            <el-button size="small" type="primary" @click="cancelTierInput">取消</el-button>
           </div>
         </div>
-        <div v-for="score in tagBonusScores" :key="`tb-${score}`" class="st-row st-row--tags">
-          <div class="st-name st-name--score">
-            <!--
-              分值调节：`←` 减 1 / `→` 加 1
-              键盘的 ←/→ 也能调（见 .st-score 的 tabindex + @keydown）
-            -->
-            <el-button
-              class="st-score-btn"
-              size="small"
-              text
-              title="减小 1 分"
-              @click="shiftTagBonusScore(score, -1)"
-            >
-              ←
-            </el-button>
-            <span
-              class="st-score"
-              :class="Number(score) >= 0 ? 'st-score-pos' : 'st-score-neg'"
-              tabindex="0"
-              :title="'当前 ' + (Number(score) > 0 ? '+' : '') + score + ' 分（左右箭头 / ←→ 按钮可调）'"
-              @keydown.left.prevent="shiftTagBonusScore(score, -1)"
-              @keydown.right.prevent="shiftTagBonusScore(score, 1)"
-            >
-              {{ Number(score) > 0 ? '+' : '' }}{{ score }}
-            </span>
+        <div v-for="score in tagBonusScores" :key="`tb-${score}`" class="st-tier">
+          <!--
+            第一行：`[+] [分值] [−]` …… 「- 删除分值档」
+
+            加号在最左、减号在中、删除按钮**推最右**（`margin-left: auto`）。
+            中间是**数字输入框**，可以直接打字改成任意分值（比如 -50）；
+            输入框失焦/回车时 `applyTagBonusScore` 会把键名换掉
+            （`player.tagBonus` 的**键就是分值**）。
+          -->
+          <div class="st-tier-head">
             <el-button
               class="st-score-btn"
               size="small"
@@ -418,13 +422,73 @@
               title="增加 1 分"
               @click="shiftTagBonusScore(score, 1)"
             >
-              →
+              +
             </el-button>
-            <el-button class="st-tier-del" size="small" text @click="removeTagBonus(score)">
-              删除
+            <el-input-number
+              class="st-score-input"
+              :model-value="Number(score)"
+              :controls="false"
+              :step="1"
+              :min="TAG_BONUS_SCORE_HARD_MIN"
+              :max="TAG_BONUS_SCORE_HARD_MAX"
+              size="small"
+              :class="Number(score) >= 0 ? 'st-score-pos' : 'st-score-neg'"
+              @change="(v: number | undefined) => applyTagBonusScore(score, v)"
+            />
+            <el-button
+              class="st-score-btn"
+              size="small"
+              text
+              title="减小 1 分"
+              @click="shiftTagBonusScore(score, -1)"
+            >
+              −
+            </el-button>
+            <!--
+              删除分值档要**二次确认**
+
+              点「删除分值档」后原地换成「确认删除？」+「确认 / 取消」按钮 ——
+              这一档可能配了很多关键词，误点一次就全没了。
+              确认前记在 `deletingScore` 里，所以同时只会有一档处于待确认状态。
+            -->
+            <template v-if="deletingScore === score">
+              <span class="st-tier-del-ask">确认删除？</span>
+              <!--
+                确认 / 取消 用**实心按钮**（不带 `text`）
+                
+                踩过：原来加了 `text`（文字型按钮），`type="danger"` 只让**文字**变红，
+                而面板底色是半透明玻璃、背后是视频画面 —— 红字常常糊在画面里看不清。
+                实心按钮是"红底白字 / 蓝底白字"，对比度足够，不依赖背景。
+              -->
+              <el-button
+                class="st-tier-del-confirm"
+                size="small"
+                type="danger"
+                @click="confirmRemoveTagBonus(score)"
+              >
+                确认
+              </el-button>
+              <el-button
+                class="st-tier-del-cancel"
+                size="small"
+                type="primary"
+                @click="cancelRemoveTagBonus"
+              >
+                取消
+              </el-button>
+            </template>
+            <el-button
+              v-else
+              class="st-tier-del"
+              size="small"
+              text
+              @click="askRemoveTagBonus(score)"
+            >
+              删除分值档
             </el-button>
           </div>
-          <div class="st-tags">
+          <!-- 第二行：关键词标签（标签多了自动换行） -->
+          <div class="st-tier-tags">
             <el-tag
               v-for="(kw, i) in setting['player.tagBonus'][score] ?? []"
               :key="`tbk-${score}-${i}-${kw}`"
@@ -518,6 +582,9 @@ import {
   IDLE_OPACITY_MAX,
   IDLE_OPACITY_MIN,
   IDLE_OPACITY_STEP,
+  /** 关键词加权分值的输入框安全范围（很宽，防手滑） */
+  TAG_BONUS_SCORE_HARD_MAX,
+  TAG_BONUS_SCORE_HARD_MIN,
   MS_PER_DAY,
   MIN_SEARCH_RESULTS_MAX,
   VIDEO_QUALITY_OPTIONS,
@@ -585,6 +652,9 @@ export default defineComponent({
       IDLE_OPACITY_MIN,
       IDLE_OPACITY_MAX,
       IDLE_OPACITY_STEP,
+      /** 关键词加权分值的输入框安全范围（很宽，防手滑） */
+      TAG_BONUS_SCORE_HARD_MIN,
+      TAG_BONUS_SCORE_HARD_MAX,
       /** 模糊强度 / 阴影强度：滑块是百分比（0-100%，5% 一档），存的却是 0-20px */
       GLASS_BLUR_PERCENT_STEP,
       GLASS_SHADOW_PERCENT_STEP,
@@ -631,6 +701,13 @@ export default defineComponent({
       tierInputVisible: false,
       /** 新增分值档：输入的分值文本 */
       newTierText: '',
+      /**
+       * 正在等确认删除的分值档（`null` = 没有待确认的）
+       *
+       * 存的是分值字符串（`"5"` / `"-2"`），同一时间只会有一档处于待确认状态 ——
+       * 点了别的档的「删除分值档」会把待确认的换成那一档。
+       */
+      deletingScore: null as string | null,
     };
   },
   computed: {
@@ -861,6 +938,7 @@ export default defineComponent({
         | 'player.resumeOnStart'
         | 'player.pauseOnDeviceChange'
         | 'player.lockOnFullscreen'
+        | 'player.autoDowngradeOnStall'
         | 'common.wallpaperMode'
         | 'common.autoLaunch'
         | 'common.closeToTray'
@@ -1035,10 +1113,15 @@ export default defineComponent({
 
     // #region 关键词加权（每一档各自一个标签列表 + 各自的输入框）
 
-    /** 读某一档的关键词数组（拿不到就给空数组，模板里少写判空） */
-    tierKeywords(score: string): string[] {
-      return this.setting['player.tagBonus']?.[score] ?? [];
-    },
+    /*
+     * 注意这里**没有** `tierKeywords(score)`（已删的死方法）。
+     *
+     * 它原来「读某一档的关键词数组、拿不到给空数组」，但**从未被调用** ——
+     * 模板里直接读的是 `tagBonusScores`（带分值的有序数组），
+     * 每个档位的词由 `setting['player.tagBonus']?.[score]` 就地取用，
+     * 不需要再经一层包装。
+     */
+
     /** 展开某一档的输入框 */
     openTagInput(score: string): void {
       this.tagInputs = { ...this.tagInputs, [score]: { visible: true, text: '' } };
@@ -1132,6 +1215,55 @@ export default defineComponent({
      * @param score 当前分值（字符串键）
      * @param delta `+1` 或 `-1`
      */
+    /**
+     * 直接设成某个分值（数字输入框用）
+     *
+     * 和 `shiftTagBonusScore` 是**同一条换键逻辑**：`player.tagBonus` 的**键就是分值**，
+     * 所以「把 +5 改成 +6」= 把键 `"5"` 换成 `"6"`，关键词跟着搬过去。
+     *
+     * 与增量版的区别只是「目标值怎么来」：这里来自输入框，可能是任意整数。
+     *
+     * @param score 当前分值（字符串键）
+     * @param value 输入框给的新值（`undefined` = 清空了，直接忽略，等它失焦时再夹）
+     */
+    applyTagBonusScore(score: string, value: number | undefined): void {
+      if (value == null) return;
+      const from = Number(score);
+      const to = Math.round(Number(value));
+      if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+      const toKey = String(to);
+      /** 没变就什么都不做（否则每次失焦都会重建一次对象） */
+      if (toKey === score) return;
+      const next = { ...(this.setting['player.tagBonus'] ?? {}) };
+      if (toKey in next) {
+        ElMessage.warning(`已经有 ${to > 0 ? '+' : ''}${to} 这一档了`);
+        return;
+      }
+      /** 保持键顺序：新键放在**原位置**，否则这一档会跳到最后一行 */
+      const rebuilt: Record<string, string[]> = {};
+      for (const key of this.tagBonusScores) {
+        if (key === score) rebuilt[toKey] = next[score] ?? [];
+        else rebuilt[key] = next[key] ?? [];
+      }
+      this.set('player.tagBonus', rebuilt);
+      /** 输入框的临时状态也跟着搬（否则正在输的那半截字会丢） */
+      if (this.tagInputs[score]) {
+        const moved = { ...this.tagInputs };
+        moved[toKey] = moved[score];
+        delete moved[score];
+        this.tagInputs = moved;
+      }
+    },
+    /**
+     * 分值调节：`−` 减 1 / `+` 加 1
+     *
+     * 撞到已存在的档就不动并提示 —— 悄悄合并会**丢信息**
+     * （用户本来分了两档不同权重），让他先删掉或改名，
+     * 比悄悄合并不知不觉改变打分结果安全。
+     *
+     * @param score 当前分值（字符串键）
+     * @param delta `+1` 或 `-1`
+     */
     shiftTagBonusScore(score: string, delta: number): void {
       const from = Number(score);
       if (!Number.isFinite(from)) return;
@@ -1164,6 +1296,24 @@ export default defineComponent({
         delete moved[score];
         this.tagInputs = moved;
       }
+    },
+    /**
+     * 点「删除分值档」→ 先进入待确认状态（不真删）
+     *
+     * 那一行会原地换成「确认 / 取消」。之所以要二次确认：
+     * 一档可能配了很多关键词，误点一次就全没了，而且没有撤销。
+     */
+    askRemoveTagBonus(score: string): void {
+      this.deletingScore = score;
+    },
+    /** 取消删除：只退出待确认状态 */
+    cancelRemoveTagBonus(): void {
+      this.deletingScore = null;
+    },
+    /** 确认删除：真删，并清掉待确认状态 */
+    confirmRemoveTagBonus(score: string): void {
+      this.removeTagBonus(score);
+      this.deletingScore = null;
     },
     /** 删掉一整档分值（连同它的关键词） */
     removeTagBonus(score: string): void {
@@ -1331,13 +1481,116 @@ export default defineComponent({
   font-weight: 600;
   opacity: 0.8;
 }
+/*
+ * 小标题行：**标题靠左、按钮靠右**
+ *
+ * 「关键词加权」这一行原来是「标题 + 说明 + 按钮」挤在一起，
+ * 按钮位置随文字长度漂移。改成两端对齐后按钮固定在右边。
+ * （说明文字「歌手名命中 +100…」按用户要求去掉了。）
+ *
+ * 并且**下面加一条细线**，把「关键词加权」这块和上面的搜索项分开 ——
+ * 这条线比普通设置项之间的线**更细**，视觉上属于"次级分隔"。
+ */
+.st-sub--split {
+  justify-content: space-between;
+  margin-bottom: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--panel-divider-fine);
+}
+.st-sub-title {
+  flex: none;
+}
+/*
+ * 一档分值 = 两行
+ *
+ *   第一行：`[+] [分值] [−]` ……………… 「- 删除分值档」（推最右）
+ *   第二行：关键词标签…（+ 添加）
+ *
+ * 拆成两行是因为原来「分值 + 标签 + 删除」全挤一行，
+ * 标签一多就换行错位，删除按钮还会跟着标签跑。
+ */
+.st-tier {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 2px;
+  /* 和「关键词加权」下面那条**同一套细线**（两级都用 fine，比 st-row 淡） */
+  border-bottom: 1px solid var(--panel-divider-fine);
+}
+.st-tier:last-child {
+  border-bottom: none;
+}
+/* 第一行：分值调节靠左，删除推到最右 */
+.st-tier-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.st-tier-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 2px;
+}
+/* 「- 删除分值档」推到最右，和分值调节拉开距离，避免误点 */
+.st-tier-del {
+  margin-left: auto;
+  opacity: 0.65;
+}
+.st-tier-del:hover {
+  opacity: 1;
+}
+/*
+ * 待确认删除时的提示文字「确认删除？」
+ *
+ * 它承担 `margin-left: auto` —— 把「提示 + 确认 + 取消」整组推到最右，
+ * 和平时「删除分值档」的位置一致（不然提示会把按钮挤到左边去）。
+ */
+/* 待确认删除时的提示文字「确认删除？」：只推右 + 字号，**不设颜色**（跟面板文字走） */
+.st-tier-del-ask {
+  margin-left: auto;
+  font-size: 12px;
+  opacity: 0.9;
+}
+/*
+ * 「确认」/「取消」：**用实心按钮，颜色交给 Element Plus**
+ *
+ * 只给间距和紧凑内边距，**不覆盖 color / background / border-color** ——
+ * `type="danger"` / `type="primary"` 自带红/蓝底 + 对应的前景色，
+ * 手动写 `color: #fff` 反而会和主题（`html.dark`）打架。
+ */
+.st-tier-del-confirm {
+  margin-left: 4px;
+  padding: 0 8px !important;
+}
+.st-tier-del-cancel {
+  margin-left: 6px;
+  padding: 0 8px !important;
+}
 .st-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
   padding: 9px 2px;
-  border-bottom: 1px solid var(--panel-divider);
+  /*
+   * 普通设置项之间的线**加粗**
+   *
+   * 比「关键词加权」下面那条（`--panel-divider-fine`）更明显，
+   * 形成「设置项之间 > 子块内部」的层级。
+   */
+  border-bottom: 2px solid var(--panel-divider);
+}
+/*
+ * 滑块行（透明度 / 闲置透明度 / 模糊 / 阴影）的线**要更细**
+ *
+ * 这几行是**同一类参数的连续小项**，行高又矮，2px 的线在它们之间会显得很重。
+ * 用 `--panel-divider-fine` 让它们看起来是"一组"，而不是四个独立设置。
+ */
+.st-row--slider {
+  border-bottom-width: 1px;
+  border-bottom-color: var(--panel-divider-fine);
 }
 /* 标签行要**顶对齐**：标签可能换行，居中会让左标题浮在中间很怪 */
 .st-row--tags {
@@ -1350,12 +1603,29 @@ export default defineComponent({
   font-size: 13px;
   flex: none;
 }
-/* 分值 + 删除按钮横排的那一列 */
-.st-name--score {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  min-width: 118px;
+/* 分值 + 删除按钮横排的那一列（已废弃：分值行和标签行已拆成两行） */
+/*
+ * 分值输入框
+ *
+ * 中间是**数字输入框**（可直接打字改成任意分值，比如 -50），
+ * 两边 `+` / `−` 微调。正负用颜色区分（绿 = 加分、红 = 减分），
+ * 和原来的 `.st-score-pos` / `.st-score-neg` 同一套色值。
+ */
+.st-score-input {
+  width: 62px;
+}
+.st-score-input :deep(.el-input__inner) {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+}
+/* 正负色要作用到内层 input 上（scoped 下够不到子组件内部） */
+.st-score-input.st-score-pos :deep(.el-input__inner) {
+  color: #67c23a;
+}
+.st-score-input.st-score-neg :deep(.el-input__inner) {
+  color: #f56c6c;
 }
 /*
  * ←/→ 加减分按钮
@@ -1372,25 +1642,6 @@ export default defineComponent({
 }
 .st-score-btn:hover {
   opacity: 1;
-}
-/*
- * 分值本身
- *
- * 定宽 + 等宽数字：从 `+9` 变到 `+10` 时宽度不变，右边的 `→` 不会左右跳。
- * `tabindex` 让它可聚焦（键盘 ←/→ 也能调分）。
- */
-.st-score {
-  display: inline-block;
-  min-width: 30px;
-  text-align: center;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-  cursor: default;
-  border-radius: 3px;
-  outline: none;
-}
-.st-score:focus-visible {
-  box-shadow: 0 0 0 2px var(--el-color-primary-light-5);
 }
 .st-score-pos {
   color: #67c23a;

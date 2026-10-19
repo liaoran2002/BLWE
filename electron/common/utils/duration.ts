@@ -21,33 +21,56 @@
 /**
  * 各种形状的时长 -> 秒
  *
- * 支持：数字（秒）/ `"4:03"` / `"1:02:03"` / 数字字符串 `"243"` / null / 其它脏数据。
- * 拿不到有效值（<空串、非法、<= 0）时返回 `null`。
+ * 支持：数字（秒）/ `"4:03"` / `"1:02:03"` / `"100:00"` / 数字字符串 `"243"` / null。
+ * 拿不到有效值（空串、非法、<= 0）时返回 `null`。
+ *
+ * ## 实现：按冒号 `split`，**不用正则**
+ *
+ * 曾经用正则 `^(\d{1,2}):(\d{2})(?::(\d{2}))?$` 去卡「分钟只能 1-2 位」，
+ * 结果 **≥100 分钟的时长解析失败**：
+ *
+ * ```
+ * "100:00"  → 正则不匹配 → 退回 Number("100:00") = NaN → null
+ * ```
+ *
+ * 而平台的时长文案本来就允许总分钟超过 99（长串烧、全场 live 音频），
+ * 我们自己写库用的 `formatPlayTime` 产出的也正是 `"100:00"` 这种形态 ——
+ * 等于**自己写出去的值自己读不回来**。这会让那首歌的时长存成 NULL，
+ * 于是时长过滤整段跳过（5 分钟的歌唱片会放进 50 分钟的合集）。
+ *
+ * 改成 `split(':')` 后，位数多长都认：
+ *
+ * ```
+ * 2 段 → 分:秒        "4:03"    → 243
+ * 3 段 → 时:分:秒     "1:02:03" → 3723
+ * 4 段及以上 → 非法（返回 null）
+ * ```
+ *
+ * 这样做还有个额外好处：**每段必须是纯数字**这个校验是天然成立的
+ * （`Number('')` 是 0 但空段会被下面的 `some` 拦住，见实现）。
  */
 export const durationToSeconds = (raw: unknown): number | null => {
   if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : null
-  if (typeof raw === 'string') {
-    const s = raw.trim()
-    if (!s) return null
-    /**
-     * 冒号形态：`m:ss` 或 `h:mm:ss`
-     *
-     * 时/分都限 1-2 位、秒固定 2 位 —— 和音乐平台与 B 站的文案一致。
-     * 不按「冒号个数」硬切是为了让 `1:2:3` 这种不合规的写法自然掉到下面当数字解析失败
-     * （返回 null），而不是被错解成 1 小时 2 分 3 秒。
-     */
-    const parts = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s)
-    if (parts) {
-      const a = Number(parts[1])
-      const b = Number(parts[2])
-      const c = parts[3] ? Number(parts[3]) : 0
-      return parts[3] ? a * 3600 + b * 60 + c : a * 60 + b
-    }
-    // 纯数字字符串（有的源直接给毫秒之外的秒数文本）
-    const n = Number(s)
-    return Number.isFinite(n) && n > 0 ? Math.round(n) : null
+  if (typeof raw !== 'string') return null
+  const s = raw.trim()
+  if (!s) return null
+
+  /** 冒号形态（2 段或 3 段） */
+  if (s.includes(':')) {
+    const parts = s.split(':')
+    /** 只认「分:秒」和「时:分:秒」两种形态 */
+    if (parts.length !== 2 && parts.length !== 3) return null
+    /** 每段都必须是非空数字串 —— `Number('')` 是 0，会把 "1::3" 错解成合法 */
+    if (parts.some((p) => p.trim() === '' || !/^\d+$/.test(p.trim()))) return null
+    const nums = parts.map((p) => Number(p.trim()))
+    const total =
+      nums.length === 3 ? nums[0] * 3600 + nums[1] * 60 + nums[2] : nums[0] * 60 + nums[1]
+    return total > 0 ? total : null
   }
-  return null
+
+  /** 纯数字字符串（有的源直接给秒数文本） */
+  const n = Number(s)
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : null
 }
 
 /**

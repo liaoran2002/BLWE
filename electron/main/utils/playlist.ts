@@ -29,7 +29,13 @@ import type {
   PlaylistSyncMode,
   SyncResult,
 } from '@common/types/playlist'
-import { parseSearchKey, platformIdOfSongId, songId, sourceOfSongId } from '@common/types/playlist'
+import {
+  parseCacheKey,
+  platformIdOfSongId,
+  songId,
+  sourceOfSongId,
+  toCacheKey,
+} from '@common/types/playlist'
 import { durationToSeconds } from '@common/utils/duration'
 import { getDb, tx } from './db'
 import { resolvePlaylist } from '../music'
@@ -109,7 +115,7 @@ const toSyncMode = (raw: string | null): PlaylistSyncMode =>
  * 归一化一首歌
  *
  * 兼容两种输入：
- *  - 旧版 `["歌名-歌手", ...]` 字符串 → 解析成结构化对象（`parseSearchKey`）
+ *  - 旧版 `["歌名-歌手", ...]` 字符串 → 解析成结构化对象（`parseCacheKey`）
  *  - 结构化的 `{name, singer, album, cover, duration}`
  *
  * 空名字直接丢掉：`playlist_songs.name` 是 NOT NULL，塞一个空串进去
@@ -120,7 +126,7 @@ const toSyncMode = (raw: string | null): PlaylistSyncMode =>
  */
 const normalizeSong = (input: unknown): PlaylistSong | null => {
   if (typeof input === 'string') {
-    const parsed = parseSearchKey(input)
+    const parsed = parseCacheKey(input)
     return parsed.name ? parsed : null
   }
   if (input && typeof input === 'object') {
@@ -348,7 +354,7 @@ const readPlaylistsFromDb = (): PlaylistRecord[] => {
  * upsert 做不到这一点（它无法表达「这一条没了」），还得额外算差集。
  * 一次事务里清空再写回，语义最简单，也不可能留下半份数据。
  *
- * **注意 song_meta / videos 不跟着删**：那两张表按「搜索键」记收藏与播放地址，
+ * **注意 song_meta / videos 不跟着删**：那两张表按「缓存键」记收藏与播放地址，
  * 删歌单不该顺手把用户收藏的视频全清了（重新加回同一个歌单，收藏还在）。
  */
 const writePlaylistsToDb = (store: PlaylistStoreData): void => {
@@ -511,14 +517,23 @@ export const initPlaylists = (): void => {
    * 而 WAL 增长、以及「用户没做任何操作却有磁盘写入」都是没必要的。
    */
   if (dropped > 0) writePlaylistsToDb(data)
-  console.log(`[playlist] 已加载 ${records.length} 个歌单，当前=${data.currentId ?? '无'}`)
+  /**
+   * 打**歌单名**而不是歌单 id
+   *
+   * `currentId` 是 `平台_平台歌单id`（`tx_8153225605` 这种），看日志时
+   * 还得回头去歌单管理里对一遍才知道是哪个歌单；直接打名字一眼就明白。
+   * 找不到对应记录（id 有值但记录不在）才退回显示 id，那本身也是要排查的异常。
+   */
+  const current =
+    data.playlists.find((p) => p.id === data.currentId)?.name ?? (data.currentId || '无')
+  console.log(`[playlist] 已加载 ${records.length} 个歌单，当前=${current}`)
 }
 
 /** 取完整集合（深拷贝，避免调用方改到内存里那份） */
 export const getPlaylists = (): PlaylistStoreData => structuredClone(data)
 
 /**
- * 按搜索键查一首歌的时长（秒）
+ * ★ 按**内存歌单**里的一首歌查时长（秒）
  *
  * 用途：搜索 B站 MV 时按「视频时长 vs 歌曲时长 ±90 秒」过滤候选
  * （见 `biliApi.searchSongFiltered`）—— 时长差太多的多半不是同一首歌。
@@ -527,8 +542,21 @@ export const getPlaylists = (): PlaylistStoreData => structuredClone(data)
  * （不是查库）：歌单是主进程内存里的权威副本，而且这里要的是「快」——
  * 每次搜索都要调一次，走 SQLite 反而多一层开销。
  *
- * ⚠️ 入参是 `songId`（形如 `tx_002dNLgZ2dk7sy`，或没有平台 id 时的
- * `歌名-歌手`），**不是显示名**。两者在「有平台 id」时完全不同，传错就找不到。
+ * ## ⚠️ 入参是**缓存键**（`歌名-歌手`），不是 `songs.id`
+ *
+ * 搜索链路上 `api:searchSong` 拿到的就是 `joinCacheKey(songName, singerName)`
+ * 的结果（`新地球-林俊杰` 这种），所以这里必须用 `toCacheKey(song)` 去比。
+ *
+ * 这两者**完全不同**，踩过一次：
+ *
+ * | 键 | 谁生成的 | 形态 | 例子 |
+ * | :--- | :--- | :--- | :--- |
+ * | `songs.id` | `songId()` | `平台_平台id` | `tx_1828354` |
+ * | 缓存键 | `toCacheKey()` | `歌名-歌手` | `新地球-林俊杰` |
+ *
+ * 实测：370 首歌的 `id` **全部**是 `tx_xxx` 形态，没有一个 `歌名-歌手` 形态。
+ * 所以用 `songId` 去比 → **0/30 命中**（永远找不到）→ 时长过滤被整段跳过
+ * → 5 分钟的歌会搜出 50 分钟的合集，而且**日志里只说"没过滤"、不报错**，极难查。
  *
  * @returns 时长（秒）；找不到或时长为空返回 `null`（调用方据此**跳过过滤**）
  */
@@ -539,23 +567,43 @@ export const findSongDuration = (cacheKey: string): number | null => {
 }
 
 /**
- * 按缓存键（`songId`）找到那首歌的**完整信息**
+ * 按缓存键找到那首歌的**完整信息**
  *
- * 用途：拼搜索词要用「歌名 + 歌手」，而缓存键本身（`tx_xxx`）里没有歌名。
+ * 用途：
+ *  - 拼搜索词要用「歌名 + 歌手」，而缓存键本身（`tx_xxx`）里没有歌名；
+ *  - **拿这首歌的时长**给时长过滤用（`findSongDuration`）；
+ *  - 拿 `platformId` / `source` 等展示字段。
+ *
  * 找不到返回 `null` —— 调用方应退化成「直接把键当搜索词」。
  *
  * 遍历内存里的 `data`（不是查库）：每次搜索都要调，走 SQLite 多一层开销。
+ *
+ * ## ⚠️ 必须用 `toCacheKey` 比对，**不能用 `songId`**（踩过，影响很大）
+ *
+ * 这两个函数返回的**不是同一种键**：
+ *
+ * | 函数 | 返回 | 例子 |
+ * | :--- | :--- | :--- |
+ * | `songId(song)` | 歌的**主键**（`songs.id`） | `tx_1828354` |
+ * | `toCacheKey(song)` | 歌的**缓存键**（`videos.search_key`） | `新地球-林俊杰` |
+ *
+ * 而调用方传进来的 `cacheKey` 是**缓存键**（`新地球-林俊杰`）。
+ * 之前这里写的是 `songId(song)`，于是：
+ *
+ * ```
+ * 拿 "tx_1828354" 去比 "新地球-林俊杰" → 永远不相等 → 永远返回 null
+ * ```
+ *
+ * 后果非常隐蔽：`findSongDuration` 永远拿到 `null` → **时长过滤整段跳过**
+ * → 5 分钟的歌会搜出 50 分钟的合集，而且日志里只说「没过滤」，不报错。
  */
 export const findSongByCacheKey = (cacheKey: string): PlaylistSong | null => {
   const want = cacheKey.trim().toLowerCase()
   if (!want) return null
   for (const record of data.playlists) {
     for (const song of record.songs) {
-      /**
-       * 用 `songId` 生成键再比 —— 与写缓存、读缓存用的是**同一个函数**，
-       * 这样「这首歌是谁」的判定完全一致（手工拼字符串早晚会漂移）。
-       */
-      if (songId(song).trim().toLowerCase() !== want) continue
+      /** 用 `toCacheKey` 生成键再比 —— 与写缓存 / 读缓存用的是**同一个函数** */
+      if (toCacheKey(song).trim().toLowerCase() !== want) continue
       return song
     }
   }
@@ -712,7 +760,7 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
     /**
      * 这里以前要顺手清掉「已不存在歌曲」的 videoCache / favorites。
      *
-     * 现在两者都在 `videos` 表里、按**搜索键**索引，和歌单曲目表是分开的：
+     * 现在两者都在 `videos` 表里、按**缓存键**索引，和歌单曲目表是分开的：
      * 曲目被移出歌单后它的收藏与播放地址仍然留着 —— 这是**有意的**，
      * 用户把一首歌删了再加回来，收藏不该丢（那张表本来就是跨歌单共享的）。
      * 所以这里不需要、也不应该再清任何东西。
