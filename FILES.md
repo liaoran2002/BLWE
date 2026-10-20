@@ -53,14 +53,23 @@
 
 ```
 ① setupUserDataPath()          ← 必须最早期，改 userData
-② registerProtectedScheme()    ← 必须在 whenReady 之前，privileges 才生效
-③ whenReady → initSetting() + initPlaylists()
-④ applyAutoLaunch()            ← 按设置写系统启动项（每次启动都重写，见下）
-⑤ installProtectedProtocol()   ← 必须在建窗之前
-⑥ registerIpcHandlers({...20 个能力})
-⑦ createMainWindow() + createTray()
-⑧ watchDisplayChanges() + grabCookiesSilently()
+② requestSingleInstanceLock()  ← ★ 单实例锁。拿不到就 app.quit()，另一个实例
+                                  监听 second-instance → restoreWindow() 把窗口拉到前台
+                                  （必须在 ① 之后：便携版改写了 userData 路径，
+                                    锁要跟着同一个路径；也必须在 ③ 之前：别白开库）
+③ registerProtectedScheme()    ← 必须在 whenReady 之前，privileges 才生效
+④ whenReady → if (!lockHeld) return → initSetting() + initPlaylists()
+⑤ applyAutoLaunch()            ← 按设置写系统启动项（每次启动都重写，见下）
+⑥ installProtectedProtocol()   ← 必须在建窗之前
+⑦ registerIpcHandlers({...20 个能力})
+⑧ createMainWindow() + createTray()
+⑨ watchDisplayChanges() + grabCookiesSilently()
 ```
+
+> ⚠️ **② 和 ④ 里的守卫缺一不可**：`app.quit()` 是**异步**的，不会中断执行流 ——
+> 光在 ② 调 quit，排队的 `whenReady` 回调照样跑完、照样 `initSetting` /
+> `initPlaylists()`，第二个实例还是会把数据库打开一遍（实测日志里能看到
+> `[playlist] 已加载 0 个歌单`）。所以 ④ 开头必须再 `if (!singleInstanceLockHeld) return`。
 
 整条链末尾挂了 `.catch()` → `dialog.showErrorBox` + `app.exit(1)`，
 避免 `initSetting` 抛错时进程静默停在「没有窗口」状态（用户只看到双击没反应）。

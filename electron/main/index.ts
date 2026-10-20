@@ -1487,6 +1487,54 @@ async function executeLogout(): Promise<void> {
 setupUserDataPath()
 
 /**
+ * ★ 第 1.2 步：**单实例锁**（必须在 `app.whenReady()` 之前）
+ *
+ * ## 不加会怎样（踩过）
+ *
+ * 双击第二次图标 → 第二个实例完整跑起来 → 它也去开同一个 `blmv.db`。
+ * 而 **SQLite 允许多个连接打开同一个文件**（`new Database()` 根本不会失败），
+ * 于是第二个实例读到的歌单是空的（WAL 里第一个实例还没 checkpoint 的部分
+ * 它看不见）—— 用户看到的就是「再开一个窗口，里面一个歌单都没有」。
+ *
+ * ## 为什么不是「检测数据库文件有没有被占用」
+ *
+ * 那个思路不可靠还会误伤：SQLite 允许多连接，检测不出「被占用」；
+ * 就算能检测文件锁，它也不代表是另一个本程序实例 —— 用户开着 DB 浏览器
+ * 或备份工具在读，都会被误判成「别开了」。
+ *
+ * 单实例锁是 Electron 自己的机制，语义精确：同一个 app 只允许一个进程。
+ *
+ * ## 第二个实例的处理
+ *
+ * 直接 `app.quit()`；第一个实例通过 `second-instance` 事件**把窗口拉到前台** ——
+ * 用户点图标后能看到窗口弹出来，窗口本身就是反馈，不需要再弹「已在运行」。
+ *
+ * 用现成的 `restoreWindow()` 而不是裸 `mainWindow.show()`：前者会处理
+ * 「窗口最小化了」「壁纸模式下窗口挂在桌面层」这些情况
+ * （裸 `show()` 对挂在 WorkerW 上的子窗口是无效的，点图标毫无反应）。
+ */
+/**
+ * 本进程有没有拿到单实例锁（`true` = 我是唯一的那个实例）
+ *
+ * 单独存一个变量是因为 `app.quit()` 是**异步**的：拿不到锁时光调 quit，
+ * 已排队的 `whenReady` 回调照样会跑完（照样打开数据库）。所以那个回调里
+ * 需要一个标记来提前返回 —— 见下面 `whenReady` 里那道守卫。
+ */
+let singleInstanceLockHeld = false
+
+if (!app.requestSingleInstanceLock()) {
+  /** 第二个实例：立刻退出，什么都不初始化 */
+  app.quit()
+} else {
+  /** 拿不到锁时上面就走了，这里说明「锁拿到了」—— 供 `whenReady` 里再守一道 */
+  singleInstanceLockHeld = true
+  app.on('second-instance', () => {
+    console.log('[main] 检测到重复启动，激活已运行的窗口')
+    void restoreWindow()
+  })
+}
+
+/**
  * 第 1.5 步：注册加密资源协议
  *
  * 必须在 `app.whenReady()` **之前** —— 只有这时注册的 privileges（standard / secure）才生效，
@@ -1495,6 +1543,21 @@ setupUserDataPath()
 registerProtectedScheme()
 
 void app.whenReady().then(async () => {
+  /**
+   * ★ 第二个实例在 `whenReady` 跑起来之前就退出了 —— 这里**再守一道**
+   *
+   * `app.quit()` 是**异步**的，它不会中断正在执行的同步代码流：上面那句
+   * `if (!app.requestSingleInstanceLock()) app.quit()` 之后，Node 照样会把
+   * 已排队的 `whenReady` 回调跑完 —— 于是第二个实例**依然会打开数据库**
+   * （实测日志里能看到 `[playlist] 已加载 0 个歌单`）。
+   *
+   * 所以这里必须早退，什么都不初始化。
+   *
+   * 为什么用 `return` 而不是再 `app.quit()` 一次：已经 quit 过了，
+   * 这里只需**停止后续初始化**；再调一次 quit 也不会更快，只是重复。
+   */
+  if (!singleInstanceLockHeld) return
+
   // 第 2 步：初始化配置（读盘 + 迁移 + 合并默认值）与歌单集合
   initSetting()
   initPlaylists()

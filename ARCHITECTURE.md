@@ -2878,6 +2878,7 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
 | 主窗口可能被导航到站外（preload 会跟过去） | `will-navigate` 白名单 + `setWindowOpenHandler` 拒绝 |
 | 打开外链没有白名单 | `app:openExternal` 只放行 http/https |
 | **用户可见文案里写满了内部细节** | 提示语原来长这样：「被 B 站限流了」「B 站把请求拦下来了」「SourceBuffer 配额超限」「无法获取视频 CID」「HTTP 500」。用户会**截图**，等于把「我们在按接口规则大量请求 + 怎么实现的」写在屏幕上；而且对用户毫无帮助（他只需要知道「怎么办」）。现在**统一收口**：`errMsg()` 加一道技术文案过滤（状态码 / 全大写错误码 / `SourceBuffer` 等内部词命中就换成「操作失败，请稍后再试」，原文只进控制台）；各处 `throw` 的文案改成人话；`RateLimitError` 的 message 也改成中性措辞，识别靠**类型**而不是靠匹配「风控」这种词 |
+| **同时开两个实例 → 第二个窗口里一个歌单都没有** | 原来**没有单实例锁**。第二个实例完整跑起来、也去开同一个 `blmv.db` —— 而 **SQLite 允许多个连接打开同一文件**（`new Database()` 根本不会失败），于是它读到的歌单是空的（WAL 里第一个实例还没 checkpoint 的部分它看不见）。用户看到的就是「再开一个窗口，里面啥都没有」。<br>修法：`app.requestSingleInstanceLock()`，拿不到就 `app.quit()`；第一个实例监听 `second-instance` 用 `restoreWindow()` 把窗口拉到前台（顺带处理「窗口最小化了」「壁纸模式下挂在桌面层」两种状态 —— 裸 `show()` 对 WorkerW 子窗口是无效的）。<br>⚠️ **光 quit 不够**：`app.quit()` 是**异步**的，不会中断执行流，排队的 `whenReady` 回调照样跑完、照样 `initSetting` / `initPlaylists`（实测第二个实例日志里能看见 `[playlist] 已加载 0 个歌单`）。所以 `whenReady` 回调开头还要一道 `if (!singleInstanceLockHeld) return`。<br>⚠️ 顺序：锁必须在 `setupUserDataPath()` **之后**（便携版会改写 userData 路径，锁得跟着用同一个路径，否则便携版和安装版会被当成两个不同实例）、在 `initSetting()` **之前** |
 
 **顺手删掉的死代码**：`common/index.ts`（没人 import 的 barrel）、`wallpaperDetect.ts`
 （WorkerW 检测没人调用，当时壁纸走的是 `electron-as-wallpaper`）、三个「声明了但从没被读取」的设置
