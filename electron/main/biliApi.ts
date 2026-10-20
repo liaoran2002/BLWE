@@ -15,7 +15,7 @@ import {
 } from '@common/constants'
 import type { QualityOption } from '@common/constants'
 import type { UserInfo } from '@common/types/ipc'
-import { rankVideos, baseSongName } from '@common/utils/videoRank'
+import { rankVideos, baseSongName, splitSongName } from '@common/utils/videoRank'
 import { durationToSeconds } from '@common/utils/duration'
 
 const SEARCH_API = 'https://api.bilibili.com/x/web-interface/wbi/search/type'
@@ -657,51 +657,21 @@ export const buildFallbackKeyword = (
   return parts.join(' ').trim()
 }
 
-/**
- * 从歌名里取出**括号中的内容**（多段**直接拼接**，去重）
+/*
+ * 这里**没有** `bracketContentOf`（已删）。
  *
- * ```
- * 九重楼 (不敢独上九重楼)                  →  不敢独上九重楼
- * 起风了 (Live)                          →  Live
- * A (B) [C]                             →  B C
- * Going Home (回家) (萨克斯版)            →  回家 萨克斯版
- * Going Home (回家) (萨克斯版) (萨克斯版)  →  回家 萨克斯版   ← 重复的只留一次
- * 晴天                                   →  ''（没有括号）
- * ```
- *
- * ## 多段**全部拼进去**（用户明确要求）
- *
- * 早期版本只取第一段，于是 `Going Home (回家) (萨克斯版)` 的第 4 轮
- * 只搜 `回家`，丢掉了「萨克斯版」这个有效信息。
- * 现在把**每一段**都拼上（空格连接），搜索词更完整。
- *
- * ## 但**去重**是必要的
- *
- * 歌单里出现过「同一个后缀写两遍」的数据：
- * `Going Home (回家) (萨克斯版) (萨克斯版)` —— 不去重的话搜索词会变成
- * `… 回家 萨克斯版 萨克斯版`。重复词既不增加信息量，
- * 又让搜索词变长变怪（搜索词越长，B站越可能匹配不到）。
- *
- * 用途：搜索流程的**最后一轮** —— 括号里往往是副标题 / 版本说明，
- * 拿它当独立关键词搜一次，能捞到标题里只写副标题的那些视频。
+ * 它原来只取「括号里的内容」，现在由 `@common/utils/videoRank` 的
+ * `splitSongName().tail` 承担 —— 那个会取**括号及其之后的全部内容**
+ * （例如 `溯(Reverse)feat.马吟吟` → `Reverse feat.马吟吟`），
+ * 比只取括号内更完整。而且它和「歌名的提取」**在同一个函数里**，
+ * 两者天然互补（名字 + 尾巴 = 原串的全部信息），不会各算各的。
  */
-export const bracketContentOf = (name: string): string => {
-  const out: string[] = []
-  const re = /[（(\[【〔〖]\s*([^（()）[\]【】〔〖〗]*?)\s*[）)\]】〕〗]/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(name)) !== null) {
-    const inner = m[1].trim()
-    /** 去重：同一段出现多次只留一次（见上面 `(萨克斯版) (萨克斯版)` 那个例子） */
-    if (inner && !out.includes(inner)) out.push(inner)
-  }
-  return out.join(' ')
-}
 
 /**
  * 搜索流程里**一轮**的原始结果（dev dump / 排查用）
  *
  * 「一轮」= 用一个搜索词 + 一个分区搜一次（含它内部的翻页）。
- * 降级是**多轮**：`歌名 歌手`（全站）→ `歌名 歌手`（音乐区）→ 加 `MV` → 加括号内容。
+ * 降级是**多轮**：`歌名 歌手`（全站）→ `歌名 歌手`（音乐区）→ 加 `MV` → 加括号部分。
  */
 export interface SearchRoundDetail {
   /** 这一轮发给 B 站的完整搜索词 */
@@ -1090,14 +1060,26 @@ export const searchSongFiltered = async (
    */
   if (minResults > 0) {
     /**
-     * 第 4 轮的词：优先取**括号里的副标题**，没有括号就用 `可视化`
+     * 第 4 轮的词：**歌名以外的那部分**（括号内容 + 括号后面的文字）
      *
-     * 括号里往往是副标题（`九重楼 (不敢独上九重楼)` → `不敢独上九重楼`）
-     * 或版本说明（`(Live)` / `(吉他版)`）。拿它当独立关键词搜一次，
-     * 能捞到标题里只写副标题、不写正名的视频。
+     * ## 为什么不再只取「括号里的内容」
+     *
+     * 用户点出的典型歌名：`溯(Reverse)feat.马吟吟`
+     *
+     * ```
+     * 歌名（第 1~3 轮用）：溯          ← `baseSongName`，第一个括号之前
+     * 第 4 轮用：Reverse feat.马吟吟  ← `splitSongName().tail`，括号及其后的全部
+     * ```
+     *
+     * 两者**互补**：一个负责正名，一个负责「括号 + 后面那串说明」。
+     * 只取括号内容的话 `feat.马吟吟` 那段就永远搜不到；
+     * 而把它留在歌名里又会让第 1~3 轮的搜索词变成
+     * `溯feat.马吟吟 马吟吟`（还和歌手名撞了）。
+     *
+     * 没有括号时 `tail` 是空串，退回 `可视化` 兜底（行为与以前一致）。
      */
-    const bracketText = bracketContentOf(song)
-    const lastSuffix = bracketText || LAST_FALLBACK_SUFFIX
+    const tailText = splitSongName(song).tail
+    const lastSuffix = tailText || LAST_FALLBACK_SUFFIX
 
     /**
      * 四轮的参数：搜索词 + 分区
@@ -1114,12 +1096,12 @@ export const searchSongFiltered = async (
         suffix: 'MV',
         label: 'MV',
       },
-      /** 第 4 轮：括号内容（没有则可视化） */
+      /** 第 4 轮：括号及其后的内容（没有则用 `可视化` 兜底） */
       {
         kw: buildFallbackKeyword(searchSongName, singer, lastSuffix),
         tids: TIDS_MUSIC,
         suffix: lastSuffix,
-        label: bracketText ? '括号内容' : '可视化',
+        label: tailText ? '括号部分' : '可视化',
       },
     ]
 

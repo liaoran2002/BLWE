@@ -194,49 +194,183 @@ const normalize = (s: unknown): string =>
   toSimplified(stripHtml(s)).toLowerCase().replace(/\s+/g, '')
 
 /**
- * ★ 去掉歌名里**所有**括号及其内容（循环剥到没有括号为止）
+ * 括号**开**字符的字符类（中英文都认，含 `【】〔〕〖〗`）
  *
- * ```
- * 起风了 (Live)          → 起风了
- * 九重楼 (不敢独上九重楼)   → 九重楼     ← 括号里是副标题，也剥掉
- * 童话【伴奏】            → 童话
- * A (B) [C]             → A
- * ```
- *
- * ## 为什么全剥（而不是只剥"像版本标记"的）
- *
- * 原来只剥 `(Live)` / `(伴奏)` 这类版本词，结果是**括号里带副标题的歌全部搜不到**：
- *
- * ```
- * 歌名「九重楼 (不敢独上九重楼)」
- *   旧逻辑 → want = 九重楼(不敢独上九重楼)   ← 括号里没有版本词，不剥
- *   B站标题 → 【Hi-Res】指尖笑《九重楼》…    ← 不含完整串
- *   → 140 条候选全被挡
- * ```
- *
- * ## ⚠️ 剥完没字了 → **那一轮只去掉括号符号、保留内容**
- *
- * `(Intro)` 全剥会变成空串，那就搜不了任何东西了。
- * 所以遇到这种情况退化成「只去括号、留里面的字」：`(Intro)` → `Intro`。
+ * 只用来「找第一个左括号的位置」—— 找到它，前面就是歌名、后面全是尾巴。
+ * 不需要匹配「配对」：`splitSongName` 只关心**劈开点在哪儿**，
+ * 至于尾巴里括号配对是否规整，靠 `stripBracketChars` 统一去掉符号就行。
  */
-export const baseSongName = (name: unknown): string => {
-  let out = stripHtml(name).trim()
-  /**
-   * 上限 20 轮：正常歌名最多两三层括号。
-   * 加这个上限纯粹防御 —— 正则每次至少去掉一对括号，长度必然变短。
-   */
-  for (let round = 0; round < 20; round++) {
-    const re = /[（(\[【〔〖]\s*([^（()）[\]【】〔〖〗]*?)\s*[）)\]】〕〗]/g
-    if (!re.test(out)) break
-    const next = out.replace(re, '').replace(/\s+/g, ' ').trim()
-    /** 这一轮剥完没字了 → 只去括号符号，把内容留下 */
-    if (!next) {
-      return out.replace(/[（()）[\]【】〔〖〗]/g, '').replace(/\s+/g, ' ').trim()
-    }
-    out = next
-  }
-  return out.replace(/\s+/g, ' ').trim()
+const BRACKET_OPEN = '[（(\\[【〔〖]'
+
+/**
+ * ★ **拆歌名**：把「正名」和「括号部分」分开
+ *
+ * ```
+ * 溯(Reverse)feat.马吟吟      → { name: '溯',        tail: 'Reverse feat.马吟吟' }
+ * 九重楼 (不敢独上九重楼)       → { name: '九重楼',    tail: '不敢独上九重楼' }
+ * 起风了 (Live)               → { name: '起风了',    tail: 'Live' }
+ * Going Home (回家) (萨克斯版)  → { name: 'Going Home', tail: '回家 萨克斯版' }
+ * 晴天                        → { name: '晴天',      tail: '' }
+ * (Intro)                     → { name: 'Intro',    tail: '' }   ← tail 没新信息
+ * 【伴奏】晴天                  → { name: '伴奏 晴天', tail: '' }   ← 同上
+ * ```
+ *
+ * ## 规则（用户定的）
+ *
+ * 1. **`name` = 第一个括号之前的全部内容** —— 那才是「歌名」。
+ *    括号里的东西（`(Live)` / `(Reverse)` / `(不敢独上九重楼)`）和
+ *    **括号后面的文字**（`feat.马吟吟`）都**不算歌名**。
+ *
+ *    > 为什么：`溯(Reverse)feat.马吟吟` 这种歌名里，真正的歌名只有「溯」——
+ *    > 把 `feat.马吟吟` 留在歌名里，搜出去的是
+ *    > `溯feat.马吟吟 马吟吟`（还和歌手名重复了一遍），B站很难匹配。
+ *
+ * 2. **`tail` = 第一个括号及其之后的全部内容**，括号符号去掉、多段用空格连、
+ *    **重复的词去掉**（`(回家) (萨克斯版) (萨克斯版)` → `回家 萨克斯版`）。
+ *    它和 `name` **互补**：`name` + `tail` 覆盖原串的全部有效信息，
+ *    第 4 轮降级就用它搜（见 `biliApi` 的 `lastSuffix`）。
+ *
+ * 3. **括号前没有字**（`(Intro)` / `【伴奏】晴天` 里的第一个括号在最前）：
+ *    `name` 退回用**括号里的内容**（连同括号后的字）—— 否则歌名空着就没法搜了。
+ *
+ * 4. **没有括号**：`name` = 原串、`tail` = `''`，行为与以前一致。
+ *
+ * 5. ★ **`tail` 里没有新信息时置空**（这条是用户指出来的）：
+ *    规则 3 生效时，`name` 本来就是由 `tail` 撑起来的 —— 再拿 `tail` 去搜，
+ *    第 4 轮的搜索词会和第 1 轮**一模一样**，纯属白发一次请求：
+ *
+ *    ```
+ *    (Intro)       → name='Intro',      tail='Intro'       ← 重复！
+ *    【伴奏】晴天    → name='伴奏 晴天',  tail='伴奏 晴天'   ← 重复！
+ *    置空后：         → name=...,        tail=''            → 第4轮退回「可视化」
+ *    ```
+ *
+ *    判定用**词集包含**（不是整串相等）：词序不同但信息等价也算重复。
+ *    详见 `isCoveredBy`。
+ */
+export interface SplitSongName {
+  /** 真正的歌名（第一个括号之前；括号前为空时退回括号内容） */
+  name: string
+  /** 第一个括号及其之后的全部内容（括号符号去掉、多段空格连接；无括号时为 ''） */
+  tail: string
 }
+
+/**
+ * 去掉括号符号并把**重复的词**去掉（只留字）
+ *
+ * ```
+ * "回家 萨克斯版"            → "回家 萨克斯版"
+ * "回家 萨克斯版 萨克斯版"     → "回家 萨克斯版"     ← 重复的词只留一次
+ * ```
+ *
+ * ## 为什么必须去重（踩过）
+ *
+ * 歌单里出现过「同一个后缀写两遍」的数据：
+ * `Going Home (回家) (萨克斯版) (萨克斯版)` —— 不去重的话第 4 轮的搜索词会变成
+ * `… 回家 萨克斯版 萨克斯版`。重复词不增加信息量，却让搜索词变长变怪
+ * （搜索词越长，B站越可能匹配不到）。
+ *
+ * 按**空格**切词去重而不是按整串比较：`(萨克斯版)` 与 `(萨克斯版)` 中间
+ * 可能隔着别的段，整串比不出来；按词去重才抓得住。
+ */
+const stripBracketChars = (s: string): string => {
+  const words = s
+    .replace(/[（()）[\]【】〔〖〗]/g, ' ')
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean)
+  /** 按出现顺序去重（第一次出现的位置决定了搜索词的词序，不宜打乱） */
+  const unique = [...new Set(words)]
+  return unique.join(' ')
+}
+
+/**
+ * `tail` 是否**完全被** `name` 覆盖（即 tail 没有任何新信息）
+ *
+ * 按**词集**判断，不按整串：
+ *
+ * ```
+ * name='伴奏 晴天'  tail='伴奏 晴天'   → true   （词集相同）
+ * name='伴奏 晴天'  tail='晴天 伴奏'   → true   （顺序不同，信息等价）
+ * name='溯'         tail='Reverse'    → false  （tail 有新词）
+ * name=''          tail='Intro'       → false  （name 空时一切 tail 都算新信息）
+ * ```
+ *
+ * 空串一律返回 `false`：`tail` 本来就是空的时候不用走这条判断
+ * （调用方只在 `rest` 非空时才问）。
+ */
+const isCoveredBy = (tail: string, name: string): boolean => {
+  if (!tail) return false
+  const nameWords = new Set(name.split(/\s+/).filter(Boolean))
+  if (nameWords.size === 0) return false
+  const tailWords = tail.split(/\s+/).filter(Boolean)
+  if (tailWords.length === 0) return false
+  /** tail 的每个词都在 name 里出现 → 没有新信息 */
+  return tailWords.every((w) => nameWords.has(w))
+}
+
+export const splitSongName = (input: unknown): SplitSongName => {
+  const raw = stripHtml(input).trim()
+  if (!raw) return { name: '', tail: '' }
+
+  /** 第一个开括号的位置 —— 有它才谈「拆分」 */
+  const firstOpen = raw.search(new RegExp(BRACKET_OPEN))
+  if (firstOpen < 0) {
+    /** 规则 4：没有括号，原样返回 */
+    return { name: raw.replace(/\s+/g, ' ').trim(), tail: '' }
+  }
+
+  /** 规则 1：正名 = 第一个括号之前 */
+  const head = raw.slice(0, firstOpen).replace(/\s+/g, ' ').trim()
+  /** 规则 2：尾部 = 第一个括号之后的所有文字（括号符号去掉、重复词去掉） */
+  const restRaw = raw.slice(firstOpen)
+  const rest = stripBracketChars(restRaw)
+
+  /** 规则 3：括号前没有字 → 用括号里的内容当歌名 */
+  const songName = head || rest
+
+  /**
+   * ★ **规则 5：`tail` 里没有新东西时置空**
+   *
+   * 第 4 轮的作用是「用**歌名以外**的信息再搜一次」。如果 `tail` 的内容
+   * 已经全部包含在 `name` 里，它就是**纯重复**，那一轮等于把第 1 轮的
+   * 搜索词再发一次 —— 白浪费一次请求（还会推高被限制的概率）。
+   *
+   * 什么时候会这样：
+   *
+   * ```
+   * 规则 3 的产物：(Intro)        → name='Intro',       tail 原样='Intro'
+   *                【伴奏】晴天    → name='伴奏 晴天',   tail 原样='伴奏 晴天'
+   * ```
+   *
+   * 这两种情况下 `name` 就是由 `tail` 撑起来的，再拿 `tail` 去搜毫无意义。
+   * 置空后第 4 轮会退回 `可视化` 兜底（行为和「没有括号」一致）。
+   *
+   * 判定用「**词集包含**」而不是整串相等：`伴奏 晴天` 与 `晴天 伴奏`
+   * 顺序不同但信息等价，也该算重复。
+   */
+  const tail = isCoveredBy(rest, songName) ? '' : rest
+
+  return { name: songName, tail }
+}
+
+/**
+ * 取「真正的歌名」（第一个括号之前的内容）
+ *
+ * 这是**搜索词与过滤判据共用的唯一来源** —— 两处必须用同一个名字，
+ * 否则「搜的是 A、过滤却要求标题含 B」，会一条都过不了（踩过）。
+ *
+ * 实现委托给 `splitSongName`，细节见它的说明。
+ *
+ * ```
+ * 溯(Reverse)feat.马吟吟      → 溯
+ * 起风了 (Live)              → 起风了
+ * 九重楼 (不敢独上九重楼)      → 九重楼
+ * (Intro)                    → Intro     ← 括号前没字，用括号内容
+ * 晴天                       → 晴天
+ * ```
+ */
+export const baseSongName = (name: unknown): string => splitSongName(name).name
 
 /**
  * 标题里取所有 `《…》` 段（也认 `〈〉`）
@@ -439,11 +573,39 @@ export const passHardFilter = (
 ): boolean => {
   const rawTitle = stripHtml(video.title)
   const title = normalize(rawTitle)
-  /** ★ 用 `baseSongName` 处理过的歌名来判（**去掉所有括号及其内容**） */
-  const want = normalize(baseSongName(song))
+  /** ★ 用 `baseSongName` 处理过的歌名来判（**第一个括号之前的那段**） */
+  const songName = baseSongName(song)
+  const want = normalize(songName)
 
-  /** ① 歌名必须**独立出现**（详见 `titleHasSongName`） */
-  if (want && !titleHasSongName(rawTitle, want)) return false
+  /**
+   * ① 歌名必须出现（详见 `titleHasSongName`）
+   *
+   * ## ★ 带空格的歌名：**整串匹配不上就按词分别匹配**
+   *
+   * `baseSongName` 可能返回带空格的多词串 —— 最典型的是
+   * `【伴奏】晴天`（括号在最前面，规则 3 退回时把括号内容和后面的字都带上了）
+   * → 歌名 = `伴奏 晴天`。
+   *
+   * 而 `normalize` 会把空格去掉变成 `伴奏晴天`，要求标题里**连着**出现这 5 个字 ——
+   * 实际标题是「伴奏 - 晴天」或「晴天（伴奏）」，根本连不起来，**必然全被挡**。
+   *
+   * 所以这类歌名拆成词分别判：**每个词都要在标题里独立出现**才算通过。
+   * 比整串连着出现宽松（能容纳标题里的分隔符 / 调换顺序），
+   * 又比「只匹配其中一个词」严格（`伴奏` 单命中不足以证明是这首歌）。
+   *
+   * ⚠️ 顺序：**先试整串**，不中才拆词 —— 单字歌名 / 普通歌名走整串，
+   * 行为与以前完全一致，只有带空格的多词串才会走第二条路。
+   */
+  if (want && !titleHasSongName(rawTitle, want)) {
+    const words = songName
+      .split(/\s+/)
+      .map((w) => normalize(w))
+      .filter((w) => w.length > 0)
+    /** 只有一个词（或拆完和整串一样）→ 拆词没有意义，直接判定不通过 */
+    if (words.length <= 1) return false
+    /** 每个词都得独立出现；任一不中就算这首歌不匹配 */
+    if (!words.every((w) => titleHasSongName(rawTitle, w))) return false
+  }
 
   /** ③ 命中屏蔽词直接丢（在时长之前判，省一次解析） */
   for (const kw of filterKeywords ?? []) {
