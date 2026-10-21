@@ -163,7 +163,7 @@ export const platformIdOfSongId = (id: string): string | null => {
  *
  * ## ⚠️ 它**不是搜索词**（这两个概念最容易混）
  *
- * 真正发给 B 站的是 `歌名 歌手`（见 `buildPrimaryKeyword`，**不带引号**），
+ * 真正发给 B 站的是 `歌名 歌曲 歌手`（见 `buildPrimaryKeyword`，**不带引号**），
  * 而这个只是数据库里用来标识"哪首歌的搜索结果"的**主键**：
  * `videos.search_key` / `song_meta.search_key` 的值。
  *

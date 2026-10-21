@@ -1949,23 +1949,26 @@ return layer + bonus     // ← 不 clamp
 
 **④ 排序**：收藏整段置顶（相对顺序不变、不参与打分）→ 其余按总分降序 → 同分保持 B 站原序。
 
-**⑤ 降级重搜：四轮递进**（`searchSongFiltered`，在主进程网络层）
+**⑤ 降级重搜：五轮递进**（`searchSongFiltered`，在主进程网络层）
 
 | 轮 | 搜索词 | 分区（`tids`） | 拼法 |
 | --- | --- | --- | --- |
-| 1 | `歌名 歌手` | **全站**（`''`） | `buildPrimaryKeyword(baseSongName(song), singer)` |
-| 2 | `歌名 歌手` | **音乐区**（`3`） | 同上（**同一句话换个分区**）|
-| 3 | `歌名 歌手 MV` | 音乐区 | `buildFallbackKeyword(song, singer, 'MV')` |
-| 4 | `歌名 歌手 <括号内容>`；没括号则 `可视化` | 音乐区 | `buildFallbackKeyword(song, singer, lastSuffix)` |
+| 1 | `歌名 歌曲 歌手` | **全站**（`''`） | `buildPrimaryKeyword(baseSongName(song), singer)` |
+| 2 | `歌名 歌曲 歌手` | **音乐区**（`3`） | 同上（**同一句话换个分区**）|
+| 3 | `歌名 歌曲 歌手 MV` | 音乐区 | `buildFallbackKeyword(song, singer, 'MV')` |
+| 4 | `歌名 歌曲 歌手 <括号内容>`；没括号则 `可视化` | 音乐区 | `buildFallbackKeyword(song, singer, lastSuffix)` |
+| 5 | `歌名 歌曲`（**不带歌手**） | 音乐区 | `buildPrimaryKeyword(song, '')` |
 
 代码里是 `plan` 数组（第 2~4 轮），第 1 轮在它之前单独搜（`primaryKeyword`），
 因为那次响应还要当作「本轮的第 1 页」复用给 `searchSongFiltered`（省一次网络往返）。
 
-**★ 搜索词形态：不带引号、不带书名号、不带 `歌曲`，纯空格分隔**
+**★ 搜索词形态：不带引号、不带书名号，纯空格分隔；歌名后加一个独立词 `歌曲`，歌手名里的括号换成空格**
 
 ```
-buildPrimaryKeyword('修炼爱情', '林俊杰')  →  修炼爱情 林俊杰
-buildFallbackKeyword('起风了', '买辣椒', 'MV') →  起风了 买辣椒 MV
+buildPrimaryKeyword('歌名', '歌手')            →  歌名 歌曲 歌手
+buildPrimaryKeyword('歌名', '歌手（别名）')    →  歌名 歌曲 歌手 别名
+buildPrimaryKeyword('歌名', '')                →  歌名 歌曲
+buildFallbackKeyword('歌名', '歌手', 'MV')     →  歌名 歌曲 歌手 MV
 ```
 
 **★ 为什么第 1、2 轮搜同一句话、只换分区**
@@ -2020,7 +2023,7 @@ searchRounds 内部：
 
 **为什么现在连翻页都不要了**：一首歌 4 轮，每轮再翻页 = 最多 8 个请求；
 再加上渲染层的重试，就是被 412 的主因（见后面「B站风控」一节）。
-四轮降级本来就覆盖了「换词再找」的需求，**翻页的边际收益不值得**。
+五轮降级本来就覆盖了「换词再找」的需求，**翻页的边际收益不值得**。
 
 > 连带去掉的：`searchRounds` 的 `relax` 参数（它只服务于「够不够、要不要翻页」
 > 那个判断）—— 函数现在只剩「搜一次 + 提取」两件事。
@@ -2089,7 +2092,7 @@ B站搜索把 `-` 当**排除语法**（`A -B` = 搜 A 并排除含 B 的结果�
 >
 > | | 形态 | 用途 |
 > | --- | --- | --- |
-> | 搜索词 | `歌名 歌手`（**剥过括号**）| 发给 B 站 |
+> | 搜索词 | `歌名 歌曲 歌手`（**剥过括号**，歌手名的括号换成空格）| 发给 B 站 |
 > | 缓存键 | `歌名-歌手`（`joinCacheKey`）| `videos.search_key` / `song_meta.search_key` |
 >
 > ⚠️ 两者会**不一致**：歌名带括号时，搜索词是剥过括号的版本，
@@ -2638,7 +2641,7 @@ wy: `song.id`，kw: `item.id`）。它是 `songs.id` 的来源，**不能丢**�
 | 层 | 做法 |
 | :--- | :--- |
 | ① 节流 | 发请求前过 `throttleSearch()`，**500ms**（模块级时间戳跨调用共享）|
-| ② 不翻页 | 每轮只取第 1 页（B站一页 42 条）—— 四轮降级已覆盖「换词再找」，翻页边际收益不值得 |
+| ② 不翻页 | 每轮只取第 1 页（B站一页 42 条）—— 五轮降级已覆盖「换词再找」，翻页边际收益不值得 |
 | ③ 空了就停 | 第 1 轮 0 条 → 抛 `RateLimitError`，**不再跑后面三轮** |
 | ④ 412 整轮中止 | 降级循环 catch 里 `isRateLimitError(err)` → 直接 `throw`（其它错误才继续）|
 

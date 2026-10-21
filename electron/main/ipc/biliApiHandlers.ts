@@ -238,7 +238,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
     }
 
     /**
-     * 第 1 轮搜索词：`歌名 歌手`（**全站**，不传 tids）
+     * 第 1 轮搜索词：`歌名 歌曲 歌手`（**全站**，不传 tids；歌名后的「歌曲」与歌手名的括号拆分见 `buildPrimaryKeyword`）
      *
      * ⚠️ **不用 `-`**：B站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 排除 B），
      * 写成 `歌名 - 歌手` 会变成「搜歌、**排除**这个歌手」，正好反了。
@@ -278,10 +278,11 @@ export const registerApiHandlers = (context: ApiContext): void => {
     }
 
     /**
-     * ★ 搜索 + **四轮降级重搜**
+     * ★ 搜索 + **五轮降级重搜**
      *
      * **用户定的规则**（详见 `biliApi.searchSongFiltered` 里的表格）：
      *  - 过滤后**少于 `player.minSearchResults` 条**（默认 30）就往下走一轮；
+     *  - 第 5 轮是**纯歌名**（去掉歌手名），专治「歌名 + 匹配不到的歌手」这种退化；
      *  - 每轮**只搜第 1 页**（翻页已取消 —— 它是风控的主要来源）；
      *  - 时长差超过容差（默认 300 秒）的丢掉（那多半不是同一首歌 —— 合集、live 全场、串烧）。
      *
