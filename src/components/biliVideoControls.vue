@@ -156,7 +156,13 @@
         @click="busy ? null : $emit('videoControl', 'next')"
         id="next"
       ></i>
-      <div class="audio-control">
+      <!--
+        音量：悬停出条 + 可拖动
+
+        滚轮也挂在这一块上（**不是**整个控制栏）：`.audio-control:hover` 正是
+        「音量条显示着」的那个条件，所以鼠标停在这一块上才滚得动 —— 恰好是用户要的。
+      -->
+      <div class="audio-control" @wheel.prevent="onVolumeWheel">
         <i
           :class="['iconfont', isMuted ? 'icon-sound-off' : 'icon-sound-on']"
           @click="toggleMute"
@@ -339,6 +345,27 @@ export default defineComponent({
       this.activeEl = e.currentTarget as HTMLElement;
       this.activeEl.setPointerCapture(e.pointerId);
       this.calcVolume(e);
+    },
+    /**
+     * 音量按钮上的滚轮：**一次 5**，上滚加、下滚减
+     *
+     * 触发范围就是音量条显示的范围（`.audio-control:hover`），鼠标不在按钮/条子上时
+     * 这里根本收不到事件 —— 不用再判断「条子有没有显示」，那和 hover 是同一件事。
+     * 步长和键盘 ↑ / ↓、托盘菜单里的滚轮一致，三处手感相同。
+     *
+     * 拖动中不响应：那时 `draggingVolume` 和指针位置才是权威，滚轮一插手就打架。
+     */
+    onVolumeWheel(e: WheelEvent) {
+      if (this.isSoundDragging) return;
+      if (!e.deltaY) return; // 触控板横向滑动、deltaY 为 0 的情况不理
+      const step = 5;
+      const next = Math.min(
+        100,
+        Math.max(0, this.currentVolume + (e.deltaY < 0 ? step : -step)),
+      );
+      // 已经 0 / 100：照样 preventDefault（别让滚轮漏到页面去），但不白发一次事件
+      if (next === this.currentVolume) return;
+      this.$emit('changeVolume', next);
     },
     onPointerMove(e: PointerEvent) {
       if (this.isVideoDragging) this.calcProgress(e);

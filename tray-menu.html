@@ -13,9 +13,9 @@
         这个页面跑在**独立的置顶窗口**里，收的是真实鼠标消息，所以菜单项点得动。
       */
       :root {
-        --glass-rgb: 32, 32, 38;
+        /* 不透明底色，必须和主进程 BrowserWindow 的 backgroundColor 一致，否则会露出一圈边 */
+        --glass-rgb: 35, 35, 41;
         --text-rgb: 255, 255, 255;
-        --glass-alpha: 0.72;
         --accent: 111, 140, 255;
         --danger: 208, 48, 80;
         color-scheme: dark;
@@ -24,22 +24,26 @@
       body {
         margin: 0;
         padding: 0;
-        background: transparent;
+        background: rgb(var(--glass-rgb));
         overflow: hidden;
         user-select: none;
         cursor: default;
         font: 13px/1.4 system-ui, 'Microsoft YaHei', sans-serif;
       }
+      /*
+        面板：不透明 + 直角
+
+        窗口是**不透明**的（不透明才不闪，见主进程 createTrayMenuWindow 的注释），
+        所以 CSS 这里的 `border-radius` 只是让内侧的 1px 边框和 hover 背景跟着弯一点，
+        **外轮廓是直角** —— 透明的窗口才能看见外侧的弧。这是确认接受的取舍。
+      */
       #menu {
         margin: 0;
         padding: 6px;
         border-radius: 10px;
         color: rgb(var(--text-rgb));
-        background: rgba(var(--glass-rgb), calc(var(--glass-alpha) + 0.2));
+        background: rgb(var(--glass-rgb));
         border: 1px solid rgba(var(--text-rgb), 0.14);
-        backdrop-filter: blur(20px);
-        -webkit-backdrop-filter: blur(20px);
-        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
       }
       .item {
         display: flex;
@@ -192,7 +196,7 @@
         align-items: center;
         gap: 8px;
         border-radius: 8px;
-        background: rgba(var(--glass-rgb), 0.94);
+        background: #2c2c36;
         border: 1px solid rgba(var(--text-rgb), 0.14);
         box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
         opacity: 0;

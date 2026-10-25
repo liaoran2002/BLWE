@@ -327,6 +327,13 @@ let volDragging = false
 let volValue = 70
 /** 最后一个非零音量：静音按钮点一下要有立刻的图标/数字反馈 */
 let lastNonZeroVol = 70
+/**
+ * 滚轮一次调多少
+ *
+ * 和控制栏音量按钮上的滚轮、以及键盘 ↑ / ↓ **同一个步长**（5）——
+ * 三处调音量的手感必须一致，否则用户会觉得「这里滚一下走得特别多」。
+ */
+const VOLUME_WHEEL_STEP = 5
 
 const paintVolume = (v: number, muted: boolean): void => {
   // 横向条：填充宽度 + 滑块位置都是百分比；数字在条左边
@@ -373,6 +380,35 @@ const finishVolume = (e: PointerEvent): void => {
 }
 volumeTrack.addEventListener('pointerup', finishVolume)
 volumeTrack.addEventListener('pointercancel', finishVolume)
+
+/**
+ * 滚轮调音量（鼠标停在音量按钮上时 —— 也就是那条横条显示着的时候）
+ *
+ * 挂在 `.volume` 这个外层上而不是按钮上：横条是它的子元素，鼠标从按钮移到条上时
+ * 事件仍然冒泡到这一层，**和 `.volume:hover` 决定横条显示的那个范围完全重合**。
+ *
+ * `passive: false` 是必须的：默认被动监听里 `preventDefault()` 无效，滚轮会漏到别处。
+ * 拖动中不响应，理由同控制栏：那时候指针位置才是权威。
+ */
+volumeWrap.addEventListener(
+  'wheel',
+  (e) => {
+    e.preventDefault()
+    if (volDragging) return
+    if (!e.deltaY) return
+    const next = Math.min(
+      100,
+      Math.max(0, volValue + (e.deltaY < 0 ? VOLUME_WHEEL_STEP : -VOLUME_WHEEL_STEP)),
+    )
+    if (next === volValue) return
+    volValue = next
+    if (next > 0) lastNonZeroVol = next
+    // 乐观更新：立刻画出来，主进程推回权威状态后再对齐一次
+    paintVolume(next, false)
+    run('volume', next)
+  },
+  { passive: false },
+)
 
 /**
  * 音量按钮：静音开关
@@ -438,6 +474,16 @@ const reportHeight = (): void => {
   reportedHeight = height
   api.trayMenuReady(height).catch((err) => console.warn('[tray] 回报高度失败:', err))
 }
+
+/**
+ * 布局一变就重报高度
+ *
+ * 只靠「收到状态时量一次」是不够的：首屏的主进程兜底定时器可能先跑
+ * （窗口按兜底高度弹出来了），之后 iconfont 才加载完、字体把行高撑开一点，
+ * 这一变化没有任何状态推送会触发测量 —— 菜单就停在偏一点的位置上。
+ * ResizeObserver 在**任何**尺寸变化时都能兜住（高度没变时由 reportHeight 自己滤掉）。
+ */
+new ResizeObserver(() => reportHeight()).observe(root)
 
 api.onTrayMenuState((state) => {
   apply(state)

@@ -1282,11 +1282,30 @@ let trayMenuWindow: BrowserWindow | null = null
 let trayMenuHeight = 0
 /** 本次弹出是否已经显示过（避免 ready 回报两次时重复定位） */
 let trayMenuShown = false
+/**
+ * 本次弹出是否还在进行中（`showTrayMenu` 置 true，`hideTrayMenu` 置 false）
+ *
+ * 和 `trayMenuShown` 不是一回事：`trayMenuShown` 只表示「已经显示过了」，
+ * 而页面在菜单**收起之后**依然可能回报高度（ResizeObserver、字体加载完撑开行高）。
+ * 那种回报只该更新缓存高度，绝不能顺手 `show()` 把菜单自己弹出来 —— 用户没点托盘。
+ */
+let trayMenuOpenRequested = false
 /** 失焦后延迟判断收起的定时器 */
 let blurHideTimer: ReturnType<typeof setTimeout> | null = null
 /** 弹出菜单的兜底显示定时器（见 showTrayMenu） */
 let trayMenuFallbackTimer: ReturnType<typeof setTimeout> | null = null
 const TRAY_MENU_WIDTH = 208
+/**
+ * 菜单兜底高度（首屏还没量到真实高度时用）
+ *
+ * 按 `tray-menu.html` 的布局：外层内边距 12 + 标题 25 + 进度条 14 + 时间 22
+ * + 控制行 36 + 分隔列表（4×30 + 间距 9）≈ 240。实测页面回报 **271**
+ * （`.now` 的行高和 `.item` 的 `gap` 比目测高一些），兜底值取实测值更准。
+ *
+ * 以前这里直接写 **300**，而菜单内容是**从窗口顶部往下排**的，窗口多出来的高度
+ * 全变成底部的一截透明 —— 首屏看着就是「菜单悬在半空、离任务栏很远」。
+ */
+const TRAY_MENU_DEFAULT_HEIGHT = 272
 
 const trayMenuUrl = (): string =>
   isDev && process.env.ELECTRON_RENDERER_URL
@@ -1296,10 +1315,49 @@ const trayMenuUrl = (): string =>
 function createTrayMenuWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: TRAY_MENU_WIDTH,
-    height: 300,
+    height: TRAY_MENU_DEFAULT_HEIGHT,
     show: false,
     frame: false,
-    transparent: true,
+    /**
+     * 不透明窗口（原来是 `transparent: true`）
+     *
+     * 唯一目的是**不闪**：透明窗口是 layered window，每次 `show()` 都要重建分层表面，
+     * Windows 上首帧经常是空的/背景没采样，看起来就是「显示一下、消失、再出现」。
+     * 不透明窗口直接由 DWM 合成，没有这一帧。
+     *
+     * 代价是**四角变直角**，这一点已确认接受：CSS 的 `border-radius` 只在窗口透明时
+     * 才看得见外侧的弧，而这台机器是 Windows 10（build 19045），DWM 没有圆角属性
+     * （`DWMWA_WINDOW_CORNER_PREFERENCE` 返回 0x80070057），唯一还能裁圆角的
+     * `SetWindowRgn` 是二值区域、没有抗锯齿，角上会有明显锯齿 —— 不如不圆。
+     *
+     * `backgroundColor` 要和 `tray-menu.html` 里 `#menu` 的底色一致，否则会露出一圈边。
+     */
+    transparent: false,
+    backgroundColor: '#232329',
+    /**
+     * 不要 `WS_THICKFRAME`（Windows 专有选项，默认 `true`）
+     *
+     * 这是**侧边和下边那条白边**的根因。默认 `true` 时，无边框窗口依然带着
+     * 「不可见缩放边框」—— 实测（koffi `GetWindowRect` / `GetClientRect` / `ClientToScreen`）：
+     *
+     * ```
+     * thickFrame 默认 : 左边框 8  上边框 0  右边框 8  下边框 8   （物理像素）
+     * thickFrame:false: 左边框 0  上边框 0  右边框 0  下边框 0
+     * ```
+     *
+     * Chromium 只往**客户区**里画，那 8px 边框区由 DWM 用系统窗框色去填 ——
+     * 于是左边、右边、下边各露出一条浅色线，**顶上 0px 所以顶部正常**，
+     * 和「侧边和下边偶尔有白边」的现象完全对上（窗口重排/重绘时更明显）。
+     *
+     * 关掉它顺带解决两件事：
+     * 1. 窗口矩形 == 客户区矩形，`setBounds(x, y, w, h)` 的矩形就是**看得见的面板**，
+     *    不再整体右下偏 8px；
+     * 2. 页面回报的高度就是窗口高度，面板底部不会被切掉一截。
+     *
+     * 代价：这个窗口不再有系统拖边缩放（本来就是 `resizable: false` 的固定尺寸菜单）
+     * 和 DWM 投影。两层都用不上。
+     */
+    thickFrame: false,
     resizable: false,
     movable: false,
     minimizable: false,
@@ -1308,7 +1366,12 @@ function createTrayMenuWindow(): BrowserWindow {
     skipTaskbar: true,
     // 要盖在任务栏和其它窗口之上，所以置顶到 screen-saver 层
     alwaysOnTop: true,
-    hasShadow: false,
+    /**
+     * 关掉 `thickFrame` 之后窗口没有 NCRendering 区域，DWM 基本不会再给投影 ——
+     * 留着这个开关只是不让 Electron 主动去掉窗口类上的投影样式，实际有没有要看系统。
+     * 菜单本身有 1px 边框和深色底，投影丢不丢都能看清。
+     */
+    hasShadow: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -1355,7 +1418,27 @@ function createTrayMenuWindow(): BrowserWindow {
  */
 function showTrayMenu(): void {
   if (!tray) return
+  /**
+   * 菜单已经开着 → 什么都不做（**这是「右键后闪两下」的解药**）
+   *
+   * Windows 上同一次右键可能让 `right-click` 触发两次；「菜单开着再右键一次图标」
+   * 也会再进来一趟。原来这里没有幂等保护：每进来一次都把 `trayMenuShown` 置回 false
+   * 并重新装一个兜底定时器，于是 120ms 后又跑一遍 `placeAndShowTrayMenu` ——
+   * `setBounds` + `show()` 再来一次，用户看到的就是菜单闪了两下。
+   *
+   * 顺手清掉失焦收起：这一下右键本来就发生在菜单开着的时候，光标在托盘图标上，
+   * 400ms 后会被判定成「点了别处」把菜单收掉。
+   */
+  if (trayMenuShown && trayMenuWindow && !trayMenuWindow.isDestroyed() && trayMenuWindow.isVisible()) {
+    if (blurHideTimer) {
+      clearTimeout(blurHideTimer)
+      blurHideTimer = null
+    }
+    return
+  }
+  console.log('[tray] 弹出菜单')
   trayMenuShown = false
+  trayMenuOpenRequested = true
   /**
    * 重新弹出时把「失焦收起」的定时器清掉
    *
@@ -1380,10 +1463,19 @@ function showTrayMenu(): void {
    * 现在每次都用上次的高度先弹出来；高度真变了页面会回报，`sizeTrayMenu` 再重新定位。
    */
   if (trayMenuFallbackTimer) clearTimeout(trayMenuFallbackTimer)
+  /**
+   * 还不知道真实高度时（首次右键，菜单窗口刚建、页面还在加载）多等一会儿
+   *
+   * 120ms 是给「高度已知」的常规路径的抢速度值；首次加载 tray-menu.html + iconfont
+   * 通常要 200ms 以上（dev 下 Vite 更慢），用 120ms 必然抢跑 —— 抢跑弹出的是
+   * 一个**还没渲染内容**的窗口（一块纯底色）。放宽到 1s 让它基本总能等到页面回报高度；
+   * 这个定时器只在页面彻底加载失败时才会赢。
+   */
+  const fallbackDelay = trayMenuHeight > 0 ? 120 : 1000
   trayMenuFallbackTimer = setTimeout(() => {
     trayMenuFallbackTimer = null
-    if (!trayMenuShown) placeAndShowTrayMenu(trayMenuHeight || 300)
-  }, 120)
+    if (!trayMenuShown) placeAndShowTrayMenu(trayMenuHeight || TRAY_MENU_DEFAULT_HEIGHT)
+  }, fallbackDelay)
 }
 
 /** 把最新状态推给菜单窗口 */
@@ -1413,34 +1505,160 @@ function getTrayMenuState(): TrayMenuState {
 
 /** 页面量好高度后：定位 + 显示 */
 function sizeTrayMenu(height: number): void {
-  trayMenuHeight = Math.max(60, Math.round(height))
-  console.log(`[tray] 菜单页面回报高度 ${trayMenuHeight}px`)
-  if (trayMenuShown) return
-  placeAndShowTrayMenu(trayMenuHeight)
+  const h = Math.max(60, Math.round(height))
+  /**
+   * 已经显示过、并且高度几乎没变 → 什么都别做
+   *
+   * 以前这里是 `if (trayMenuShown) return`，于是「已显示」就再也不会重定位：
+   * 首屏（页面还没加载完）只能用兜底高度弹出来，等真实高度回报时被这行直接吃掉，
+   * 菜单就一直停在那个人为偏高的位置 —— 这正是「第一次右键菜单离任务栏很远」的原因。
+   *
+   * 但也不能"变了就挪"：`Math.ceil` 的取整差会造出 1px 的假变化，
+   * 每挪一次窗口就是一次重绘（看着像闪）。1px 以内当没变。
+   */
+  if (trayMenuShown && Math.abs(h - trayMenuHeight) <= 1) return
+  trayMenuHeight = h
+  console.log(`[tray] 菜单页面回报高度 ${h}px`)
+  /**
+   * 菜单已经收起了就别再定位
+   *
+   * 收起后页面仍可能回报（ResizeObserver 观察到字体加载、布局重排），
+   * 那只是把高度缓存更新一下，留给下次右键用 —— 这里一旦放行，
+   * `placeAndShowTrayMenu` 会把窗口 `show()` 出来，菜单自己冒出来。
+   */
+  if (!trayMenuOpenRequested) return
+  placeAndShowTrayMenu(h)
+}
+
+/** 任务栏贴在屏幕的哪条边（`null` = 这块屏没有可见任务栏） */
+type TaskbarEdge = 'top' | 'bottom' | 'left' | 'right'
+
+/**
+ * 推断这块屏的任务栏贴在哪条边
+ *
+ * `workArea` 是系统扣掉任务栏之后剩下的区域，所以「屏幕 `bounds` 减去 `workArea`」
+ * 就是任务栏占的宽度 —— 哪边差值最大，任务栏就在哪边。这样不用去问 AppBar
+ * （那要走 `SHAppBarMessage`，还得自己处理多屏和自动隐藏），Windows 已经把答案放在
+ * `workArea` 里了。
+ *
+ * 差值都 < 2px 说明这块屏没有可见任务栏（自动隐藏、或副屏本来就没放任务栏）→ 返回
+ * `null`，调用方回落到「贴图标上方、放不下翻下方」的老启发式。
+ */
+function detectTaskbarEdge(
+  display: ReturnType<typeof screen.getDisplayMatching>
+): TaskbarEdge | null {
+  const b = display.bounds
+  const a = display.workArea
+  const insets: Record<TaskbarEdge, number> = {
+    top: a.y - b.y,
+    bottom: b.y + b.height - (a.y + a.height),
+    left: a.x - b.x,
+    right: b.x + b.width - (a.x + a.width),
+  }
+  let edge: TaskbarEdge | null = null
+  // 2px 以内当测量误差，不当任务栏
+  let widest = 2
+  for (const key of ['top', 'bottom', 'left', 'right'] as const) {
+    if (insets[key] > widest) {
+      widest = insets[key]
+      edge = key
+    }
+  }
+  return edge
 }
 
 function placeAndShowTrayMenu(height: number): void {
   const win = trayMenuWindow
   if (!win || win.isDestroyed() || !tray) return
-  const trayBounds = tray.getBounds()
+  let trayBounds = tray.getBounds()
+  /**
+   * 图标尺寸为 0 = 系统还没算好图标位置（刚注册、任务栏正在重排）
+   *
+   * 这种情况下 `getBounds()` 给的是 `{0,0,0,0}`，按它算出来的 y 会落到屏幕顶部，
+   * 菜单弹到左上角。右键时鼠标必然在图标上，用光标位置兜一个近似的图标矩形。
+   * 这是**兜底**：正常路径永远走不到这里。
+   */
+  if (trayBounds.width <= 0 || trayBounds.height <= 0) {
+    const p = screen.getCursorScreenPoint()
+    trayBounds = { x: p.x - 16, y: p.y - 16, width: 32, height: 32 }
+  }
   const display = screen.getDisplayMatching(trayBounds)
   const area = display.workArea
   const width = TRAY_MENU_WIDTH
   const gap = 8
+  const edge = detectTaskbarEdge(display)
 
-  // 贴着托盘图标弹：默认在图标上方，上方放不下就改到下方；再夹进工作区
-  let x = Math.round(trayBounds.x + trayBounds.width / 2 - width / 2)
-  let y = Math.round(trayBounds.y - height - gap)
-  if (y < area.y + 4) y = Math.round(trayBounds.y + trayBounds.height + gap)
-  x = Math.min(Math.max(x, area.x + 4), area.x + area.width - width - 4)
-  y = Math.min(Math.max(y, area.y + 4), area.y + area.height - height - 4)
+  /**
+   * 按任务栏所在的那条边决定弹出方向
+   *
+   * 原来只有一套「贴图标上方，放不下翻下方」—— 那是照着**底部任务栏**写的。
+   * 任务栏挪到顶部还能靠那个「放不下就翻下方」歪打正着，挪到**侧边**就完全不成立了：
+   * 竖着排的图标很窄，菜单居中于图标再往上下弹，等于横在任务栏上、
+   * 把上下相邻的图标全盖住。
+   */
+  let x: number
+  let y: number
+  switch (edge) {
+    /**
+     * 竖着的任务栏（左侧 / 右侧）—— 图标是**从上往下**排的
+     *
+     * 菜单要贴着任务栏的**内侧**：左侧任务栏放图标右边，右侧任务栏放图标左边。
+     * 竖直方向让菜单**底边与图标底边齐平**：垂直任务栏的托盘图标都在任务栏底部，
+     * 这样菜单是「从图标往上展开」，和系统原生菜单在侧边任务栏上的观感一致。
+     */
+    case 'left':
+      x = trayBounds.x + trayBounds.width + gap
+      y = trayBounds.y + trayBounds.height - height
+      break
+    case 'right':
+      x = trayBounds.x - width - gap
+      y = trayBounds.y + trayBounds.height - height
+      break
+    /** 顶部任务栏：只能往图标**下方**弹（上方就是任务栏本体 / 屏幕外） */
+    case 'top':
+      x = Math.round(trayBounds.x + trayBounds.width / 2 - width / 2)
+      y = trayBounds.y + trayBounds.height + gap
+      break
+    /**
+     * 底部任务栏（绝大多数人）以及**检测不到任务栏**的情况
+     *
+     * 默认往图标上方弹；上方真放不下（屏幕太矮、图标位置异常）再翻到下方。
+     */
+    default:
+      x = Math.round(trayBounds.x + trayBounds.width / 2 - width / 2)
+      y = Math.round(trayBounds.y - height - gap)
+      if (y < area.y + 4) y = Math.round(trayBounds.y + trayBounds.height + gap)
+      break
+  }
+  /**
+   * 不管哪种布局，最后都夹进工作区
+   *
+   * `workArea` 已经扣掉了任务栏，所以这一步同时保证「菜单不压任务栏、也不出屏」。
+   * 上限要跟下限比一次：菜单高到接近工作区高度时，`area 高 - height - 4` 会小于下限，
+   * 直接 `min(max(...))` 会把 y 压到屏幕上方去。
+   */
+  const maxX = Math.max(area.x + 4, area.x + area.width - width - 4)
+  const maxY = Math.max(area.y + 4, area.y + area.height - height - 4)
+  x = Math.min(Math.max(Math.round(x), area.x + 4), maxX)
+  y = Math.min(Math.max(Math.round(y), area.y + 4), maxY)
 
   win.setBounds({ x, y, width, height })
   trayMenuShown = true
-  win.show()
-  win.focus()
-  // 告诉主窗口「菜单开着」：壁纸模式下它要把合成点击吞掉
-  mainWindow?.webContents.send('trayMenu:visibility', true)
+  /**
+   * 只有「从隐藏变成显示」才 show + focus + 广播
+   *
+   * 自纠路径（首屏先用兜底高度弹、随后拿到真实高度重定位）会再进这个函数一次，
+   * 那时窗口**已经可见**：再 `show()` / `focus()` 等于让它重新出场一次，
+   * `trayMenu:visibility` 也会被重复广播。已可见时只做 `setBounds` 挪位置。
+   */
+  const wasVisible = win.isVisible()
+  if (!wasVisible) {
+    win.show()
+    win.focus()
+    // 告诉主窗口「菜单开着」：壁纸模式下它要把合成点击吞掉
+    mainWindow?.webContents.send('trayMenu:visibility', true)
+  }
+  console.log(`[tray] 菜单${wasVisible ? '重定位' : '显示'} ${width}x${height} @ ${x},${y}`)
 }
 
 /** 收起菜单（同时清掉失焦延迟） */
@@ -1463,6 +1681,7 @@ function hideTrayMenu(): void {
     trayMenuWindow.hide()
   }
   trayMenuShown = false
+  trayMenuOpenRequested = false
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('trayMenu:visibility', false)
   }

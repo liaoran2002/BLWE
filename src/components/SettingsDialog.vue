@@ -578,7 +578,7 @@ import {
   GLASS_TRANSPARENCY_MAX,
   GLASS_TRANSPARENCY_MIN,
   GLASS_TRANSPARENCY_STEP,
-  /** 控制栏闲置透明度的范围与步进（0-100，**十步一进**） */
+  /** 控制栏闲置透明度的范围与步进（0-100，**五步一进**） */
   IDLE_OPACITY_MAX,
   IDLE_OPACITY_MIN,
   IDLE_OPACITY_STEP,
@@ -648,7 +648,7 @@ export default defineComponent({
       GLASS_TRANSPARENCY_MIN,
       GLASS_TRANSPARENCY_MAX,
       GLASS_TRANSPARENCY_STEP,
-      /** 控制栏闲置透明度：0-100，**十步一进** */
+      /** 控制栏闲置透明度：0-100，**五步一进** */
       IDLE_OPACITY_MIN,
       IDLE_OPACITY_MAX,
       IDLE_OPACITY_STEP,
@@ -977,7 +977,7 @@ export default defineComponent({
      *
      * 与其它滑块一样过 `snapSlider`：`el-slider` 在某些交互下会给出
      * 不在步进上的值（拖动 + 键盘微调），统一夹一次能保证存进去的总是整步。
-     * 这里步进是 **10**（0-100 十步一进），所以存进去的会是 0/10/20/…/100。
+     * 这里步进是 **5**（0-100 五步一进），所以存进去的会是 0/5/10/…/100。
      */
     setIdleOpacity(v: number | number[]): void {
       this.set(
