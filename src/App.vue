@@ -576,6 +576,7 @@ export default defineComponent({
       removeTrayNext: null,
       removeTrayToggleMode: null,
       removeTrayShowPlaylist: null,
+      removeTrayShowSleepTimer: null,
       removeTrayShowLogoutConfirm: null,
       /** 左键点托盘图标 -> 解锁 */
       removeTrayUnlock: null as null | (() => void),
@@ -1416,6 +1417,13 @@ export default defineComponent({
       this._sleepUnsub = this._sleepTimer.subscribe((state) => {
         this.sleepState = state;
         /**
+         * 托盘菜单开着时，把倒计时也推过去
+         *
+         * 菜单里的「定时」显示剩余时间，而这条每秒一跳的状态是**唯一**能驱动它更新的
+         * 时钟：暂停时 `timeupdate` 不走了，光靠播放进度那条链倒计时会冻在菜单上。
+         */
+        if (this.trayMenuOpen) this.syncTrayState();
+        /**
          * ⚠️ **不要在这里根据 `state.active` 关面板**
          *
          * 踩过：原来写了 `if (!state.active) 关面板`，结果**点 `+` / 勾复选框就关掉弹窗**。
@@ -1474,8 +1482,16 @@ export default defineComponent({
     },
     // #endregion
 
+    /**
+     * 标题栏按下 = 开始拖动
+     *
+     * 全屏和壁纸模式下都不拖：
+     *  - 壁纸模式：窗口是桌面的一部分，拖动没有意义，标题栏本来也隐藏了；
+     *  - 全屏：和原生全屏一致（用户要求），只能按 F / Esc / 右下角按钮退出全屏。
+     *    以前这里是允许的，拖一下就会「退出全屏」，很容易误触。
+     */
     onTitlebarMouseDown(e: MouseEvent): void {
-      if (e.button !== 0 || this.wallpaperEnabled) return;
+      if (e.button !== 0 || this.wallpaperEnabled || this.isFullscreen) return;
       this.isDragging = true;
       this.dragStarted = false;
       this.dragReady = false;
@@ -1483,7 +1499,7 @@ export default defineComponent({
       this.dragStartY = e.screenY;
     },
     onTitlebarDblClick(e: MouseEvent): void {
-      if (e.button !== 0 || this.wallpaperEnabled) return;
+      if (e.button !== 0 || this.wallpaperEnabled || this.isFullscreen) return;
       this.isDragging = false;
       electronApi.winMaximize();
     },
@@ -3726,6 +3742,14 @@ export default defineComponent({
         muted: this.isMuted,
         // 登录态一起带上，防主进程那份和这边不一致
         isLoggedIn: this.isLoggedIn,
+        /**
+         * 定时倒计时（托盘菜单里那一项要显示）
+         *
+         * 用 `ceil` 是为了和界面上的 `formatRemain` 对齐：剩 0.4 秒时两边都显示 `00:01`，
+         * 不会出现「弹窗还有 1 秒、托盘已经 00:00」。
+         */
+        sleepActive: this.sleepState.active,
+        sleepRemainSec: Math.ceil(Math.max(0, this.sleepState.remainMs) / 1000),
       });
     },
     async initWallpaperState(): Promise<void> {
@@ -3916,6 +3940,15 @@ export default defineComponent({
       // 托盘「设置歌单」-> 直接打开统一的歌单管理弹窗
       this.playlistManagerVisible = true;
     });
+    this.removeTrayShowSleepTimer = electronApi.onTrayShowSleepTimer(() => {
+      /**
+       * 托盘「定时」-> 打开定时面板
+       *
+       * 和「设置歌单」同一条路径：主进程已经先把窗口从壁纸层/托盘里叫回来了，
+       * 这里只负责把面板弹出来。
+       */
+      this.sleepPanelVisible = true;
+    });
     this.removeTrayShowLogoutConfirm = electronApi.onTrayShowLogoutConfirm(
       () => {
         this.handleLogoutConfirm();
@@ -3979,6 +4012,14 @@ export default defineComponent({
      */
     this.removeTrayMenuListener = electronApi.onTrayMenuVisibility((visible) => {
       this.trayMenuOpen = visible;
+      /**
+       * 刚弹出时先推一份最新状态
+       *
+       * 主进程手里那份是**上一次推送的快照**：暂停很久之后再右键托盘，
+       * 定时倒计时会先用旧值显示一小会儿，等下一秒的推送才跳到正确值。
+       * 菜单一出现就推一次，省掉这一下跳变（进度条也同理）。
+       */
+      if (visible) this.syncTrayState();
     });
     /**
      * 这里原来有三个捕获阶段的监听，用来在托盘菜单打开时吞掉窗口内的点击 ——
@@ -4037,6 +4078,7 @@ export default defineComponent({
     if (this.removeTrayVolume) this.removeTrayVolume();
     if (this.removeTrayToggleMute) this.removeTrayToggleMute();
     if (this.removeTrayShowPlaylist) this.removeTrayShowPlaylist();
+    if (this.removeTrayShowSleepTimer) this.removeTrayShowSleepTimer();
     if (this.removeTrayShowLogoutConfirm) this.removeTrayShowLogoutConfirm();
     if (this.removeTrayUnlock) this.removeTrayUnlock();
     if (this.removeWallpaperState) this.removeWallpaperState();

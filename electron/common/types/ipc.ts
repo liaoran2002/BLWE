@@ -311,6 +311,8 @@ export interface IpcEventMap {
   'tray:next': void
   'tray:toggleMode': void
   'tray:showPlaylist': void
+  /** 托盘「定时」：回到窗口模式后打开定时面板 */
+  'tray:showSleepTimer': void
   'tray:showLogoutConfirm': void
   /**
    * 左键点了托盘图标：让界面解锁
@@ -378,6 +380,14 @@ export interface TrayState {
   volume?: number
   muted?: boolean
   /**
+   * 定时是否在倒计时 + 剩余秒数
+   *
+   * 托盘菜单里那一项要显示倒计时（到 `0` 变红），而计时器本身在渲染层
+   * （它要读 `<video>` 的播放位置，主进程看不到），所以这两项由渲染层一起带上。
+   */
+  sleepActive?: boolean
+  sleepRemainSec?: number
+  /**
    * 渲染层认定的登录态
    *
    * 一起带上是防漂移：主进程那份 `isLoggedIn` 只由 `auth:setLoggedIn` 改，
@@ -398,6 +408,8 @@ export type TrayMenuAction =
   | 'next'
   | 'toggleMode'
   | 'showPlaylist'
+  /** 定时：回到窗口模式并打开定时面板（和 `showPlaylist` 同一套跳转路径） */
+  | 'showSleepTimer'
   | 'toggleWallpaper'
   /** 窗口被收到托盘里时用它把窗口叫回来（菜单里那一项会变成「恢复窗口」） */
   | 'restoreWindow'
@@ -431,4 +443,12 @@ export interface TrayMenuState {
   /** 当前音量（0~100） */
   volume: number
   muted: boolean
+  /**
+   * 有没有在倒计时（含「已归零、在等视频播完」那段）
+   *
+   * 菜单里那一项据此决定显示「定时」还是倒计时。
+   */
+  sleepActive: boolean
+  /** 定时剩余秒数；`0` 表示没设定时，或者已经归零（界面用红色 `00:00` 表示后者） */
+  sleepRemainSec: number
 }

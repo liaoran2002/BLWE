@@ -30,6 +30,15 @@ export const registerWindowHandlers = (context: IpcContext): void => {
   mainHandle('win:maximize', () => {
     const win = context.getMainWindow()
     if (!win) return
+    /**
+     * 全屏时不响应最大化 / 还原
+     *
+     * 全屏是应用层模拟的（`applyFullScreenGeometry` 铺满 + 置顶），这时再
+     * `maximize()` / `unmaximize()` 会把窗口几何改掉，而 `isFullScreen` 仍是 true ——
+     * 窗口不再是全屏却依然处于「全屏」状态，按 F 就会出现莫名其妙的跳变。
+     * 用户要求全屏与原生一致：要退出全屏只能用 F / Esc / 右下角按钮。
+     */
+    if (context.isFullScreen()) return
     if (win.isMaximized()) win.unmaximize()
     else win.maximize()
   })

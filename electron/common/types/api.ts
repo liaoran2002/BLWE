@@ -60,6 +60,8 @@ export interface RendererAPI {
   onTrayVolume: (cb: (volume: number) => void) => RemoveListener
   onTrayToggleMute: (cb: () => void) => RemoveListener
   onTrayShowPlaylist: (cb: () => void) => RemoveListener
+  /** 托盘「定时」：回到窗口模式后打开定时面板 */
+  onTrayShowSleepTimer: (cb: () => void) => RemoveListener
   onTrayShowLogoutConfirm: (cb: () => void) => RemoveListener
   /** 左键点了托盘图标：让界面解锁（没锁时无事发生） */
   onTrayUnlock: (cb: () => void) => RemoveListener

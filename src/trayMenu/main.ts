@@ -8,7 +8,7 @@
  *   已播时长 / 视频时长
  *   [音量(悬停出条)] [上一首] [播放/暂停] [下一首] [模式切换]
  *   ────────────
- *   设置歌单 / 壁纸模式·窗口模式 / 退出登录 / 退出程序
+ *   设置歌单 / 定时（有定时时显示倒计时）/ 壁纸模式·窗口模式 / 退出登录 / 退出程序
  *
  * 为什么不用原生 `Menu.popup`：壁纸模式下窗口嵌在桌面层、界面按钮又都隐藏了，
  * 原生菜单在那种环境里点不动（详见 ARCHITECTURE 里那段 `RIDEV_INPUTSINK` 的分析）。
@@ -29,6 +29,20 @@ const pad = (n: number): string => String(Math.floor(n)).padStart(2, '0')
 const formatTime = (sec: number): string => {
   const s = Number.isFinite(sec) && sec > 0 ? Math.floor(sec) : 0
   return `${pad(s / 60)}:${pad(s % 60)}`
+}
+
+/**
+ * 剩余秒数 → 倒计时文本
+ *
+ * 和渲染层 `formatRemain` 的规则一致：**有小时才带小时**（`1:02:03`），
+ * 否则 `02:03` —— 两边显示同一个值，用户不会看到「弹窗 1:02:03、托盘 02:03」的错位。
+ */
+const formatRemainSec = (sec: number): string => {
+  const total = Number.isFinite(sec) && sec > 0 ? Math.floor(sec) : 0
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
 }
 
 // #region DOM（一次建好，之后只更新，别在拖拽中重建）
@@ -113,10 +127,36 @@ interface Item {
   action: TrayMenuAction | ((s: TrayMenuState) => TrayMenuAction)
   label: (s: TrayMenuState) => string
   danger?: boolean
+  /**
+   * 额外的状态类（只用于**染色**，不要在这里改布局）
+   *
+   * 菜单项是**启动时一次性建好**的，之后只改文案与类名 —— 所以在滑块旁边
+   * 重建元素会打断拖拽（见下面 `listEls` 那段），染色只能走 class。
+   */
+  classes?: (s: TrayMenuState) => string
 }
 
 const ITEMS: Item[] = [
   { action: 'showPlaylist', label: () => '设置歌单' },
+  {
+    /**
+     * 定时（睡觉定时器）
+     *
+     * 和「设置歌单」同一条路径：点击后主进程先把窗口叫回窗口模式，再让渲染层
+     * 弹出定时面板 —— 壁纸模式下窗口在桌面层，直接弹面板是看不见的。
+     *
+     * 文案随状态变：
+     *  - 没设定时 → `定时`（普通颜色）；
+     *  - 在倒计时 → `定时 12:34`，**蓝色**；
+     *  - 已归零（`00:00`，那段在等视频播完）→ **红色**。
+     *
+     * 归零那一段也算 `active`（SleepTimer 的设计）：面板里同样是红色 `00:00`，
+     * 两处显示必须一致，否则用户会以为定时已经没了。
+     */
+    action: 'showSleepTimer',
+    label: (s) => (s.sleepActive ? `定时 ${formatRemainSec(s.sleepRemainSec)}` : '定时'),
+    classes: (s) => (s.sleepActive ? (s.sleepRemainSec > 0 ? 'timer-running' : 'timer-zero') : ''),
+  },
   {
     /**
      * 壁纸 / 窗口切换（**只有这一项**，不另设「强制…」那种吓人的逃生口）
@@ -206,6 +246,11 @@ const renderList = (state: TrayMenuState): void => {
     entry.current = action
     const label = item.label(state)
     if (entry.el.textContent !== label) entry.el.textContent = label
+    // 染色（定时倒计时的蓝 / 红）：只换类名，不碰结构
+    const base = item.danger ? 'item danger' : 'item'
+    const extra = item.classes ? item.classes(state) : ''
+    const cls = extra ? `${base} ${extra}` : base
+    if (entry.el.className !== cls) entry.el.className = cls
   })
 }
 

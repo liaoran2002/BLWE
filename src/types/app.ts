@@ -157,6 +157,8 @@ export interface AppData {
   removeTrayNext: RemoveListener | null
   removeTrayToggleMode: RemoveListener | null
   removeTrayShowPlaylist: RemoveListener | null
+  /** 托盘「定时」-> 打开定时面板 */
+  removeTrayShowSleepTimer: RemoveListener | null
   removeTrayShowLogoutConfirm: RemoveListener | null
   /** 左键点托盘图标 -> 解锁界面的监听摘除函数 */
   removeTrayUnlock: RemoveListener | null

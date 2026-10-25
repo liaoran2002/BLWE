@@ -80,10 +80,53 @@ const WS_VISIBLE = 0x10000000
 const WS_EX_LAYERED = 0x00080000
 const WS_EX_TRANSPARENT = 0x00000020
 
+/**
+ * `SetWindowPos` 的标志位
+ *
+ *  - `SWP_NOZORDER`：不改变 z 序。**必须带** —— 否则窗口会被提到同层最上面，
+ *    而桌面层里可能还有别的壁纸程序，抢 z 序是多余且有害的副作用。
+ *  - `SWP_NOACTIVATE`：不激活窗口（壁纸不该抢焦点）。
+ *  - `SWP_NOSENDCHANGING`：跳过 `WM_WINDOWPOSCHANGING`。防的是「某个子类化过的
+ *    窗口过程在里面把新尺寸改回去」——这类拦截我们无从控制，直接绕过。
+ *    注意**仍然会收到 `WM_WINDOWPOSCHANGED`**，Chromium 靠它同步自己的 bounds，
+ *    所以不会出现「原生改了、Electron 不知道」的错位。
+ */
+const SWP_NOZORDER = 0x0004
+const SWP_NOACTIVATE = 0x0010
+const SWP_NOSENDCHANGING = 0x0400
+
 /** 初始化好的原生函数集合（任一环节失败则整体为 null） */
 interface NativeApi {
   /** 找到承载壁纸的那层 WorkerW；找不到返回 0 */
   findWorkerW: () => number
+  /**
+   * 同上，但**不发** `0x052C`（不惊动 Explorer）
+   *
+   * 守护轮询会高频调用，「每次问一个句柄就顺手让 Explorer 重建一次壁纸层」
+   * 显然不行。查找本身是只读的，真正需要 `0x052C` 的只有「第一次要往里挂」。
+   */
+  findWorkerWQuiet: () => number
+  /**
+   * 把窗口对齐到父窗口的客户区（幂等：尺寸已经一致就什么都不做）
+   *
+   * 为什么必须用原生 `SetWindowPos` 而不是 Electron 的 `setBounds`：
+   * 窗口一旦被 `SetParent` 挂到 WorkerW，它的坐标系就变成**父窗口客户区**，
+   * 而 Electron 侧仍然按「顶层窗口 + 屏幕坐标」理解 `bounds`。两边各说各话，
+   * 任务栏 / DPI / 分辨率一变就会错位（本项目出现过的「一圈白边 + 盖不住任务栏」
+   * 就是这个错位）。原生这条路只有一个坐标系，不存在歧义。
+   */
+  fitToParent: (
+    child: number,
+    parent: number,
+  ) => {
+    changed: boolean
+    width: number
+    height: number
+    /** 改动之前窗口的客户区尺寸（没改时与 width/height 相同） */
+    fromWidth: number
+    fromHeight: number
+    reason?: string
+  }
   setParent: (child: number, parent: number) => number
   /**
    * 取窗口在窗口层级里的**真实父窗口**
@@ -185,6 +228,19 @@ const initNative = (): void => {
     const IsWindowVisibleFn = user32.func('int IsWindowVisible(intptr_t hwnd)')
     const IsIconicFn = user32.func('int IsIconic(intptr_t hwnd)')
     const GetWindowRectFn = user32.func('int GetWindowRect(intptr_t hwnd, _Out_ void *rect)')
+    /** 客户区矩形：取父窗口（WorkerW）的宽度高度，窗口要盖满的就是这块 */
+    const GetClientRectFn = user32.func('int GetClientRect(intptr_t hwnd, _Out_ void *rect)')
+    /**
+     * 客户区原点 → 屏幕坐标（`POINT` = 两个 int32，8 字节）
+     *
+     * 用来算窗口的「左边框 / 上边框」有多宽。`SetWindowPos` 定位的是**外框**，
+     * 而我们要对齐的是**客户区**，两者差的就是这块边框（见 `fitToParent`）。
+     */
+    const ClientToScreenFn = user32.func('int ClientToScreen(intptr_t hwnd, void *point)')
+    /** 唯一用来**改**几何的 API（见 NativeApi.fitToParent 的说明） */
+    const SetWindowPosFn = user32.func(
+      'int SetWindowPos(intptr_t hwnd, intptr_t after, int x, int y, int cx, int cy, uint flags)',
+    )
     const RECT = koffi.struct('RECT', {
       left: 'int32',
       top: 'int32',
@@ -209,6 +265,32 @@ const initNative = (): void => {
     // kernel32 也 load 一下：确认基础库可用，失败时能给出明确原因
     void kernel32
 
+    /**
+     * 只读查找桌面壁纸层（**不发任何消息**）
+     *
+     * 逻辑和原来一样：挂着 `SHELLDLL_DefView` 的那层是图标层，它**后面**那个
+     * WorkerW 才是壁纸层；某些配置下 WorkerW 直接挂在 Progman 下，就走兜底。
+     */
+    const locateWorkerW = (): number => {
+      const progman = Number(FindWindowA('Progman', null))
+      if (!progman) return 0
+
+      let worker = 0
+      EnumWindows((hwnd: number) => {
+        if (FindWindowExA(hwnd, 0, 'SHELLDLL_DefView', null)) {
+          const w = Number(FindWindowExA(0, hwnd, 'WorkerW', null))
+          if (w) worker = w
+        }
+        return true
+      }, 0)
+
+      // 兜底：某些 Win10 配置下 WorkerW 直接挂在 Progman 下
+      if (!worker) worker = Number(FindWindowExA(progman, 0, 'WorkerW', null))
+      return worker
+    }
+
+    const findWorkerWQuiet = (): number => locateWorkerW()
+
     const findWorkerW = (): number => {
       const progman = Number(FindWindowA('Progman', null))
       if (!progman) {
@@ -219,25 +301,138 @@ const initNative = (): void => {
       // 让 Explorer 把壁纸层分离出来，否则壁纸窗口会盖在图标上面
       SendMessageTimeoutA(progman, WM_SPAWN_WORKERW, 0xd, 0x1, SMTO_NORMAL, 1000, null)
 
-      let worker = 0
-      EnumWindows((hwnd: number) => {
-        // 挂着 SHELLDLL_DefView 的那层是「图标层」，它后面那个 WorkerW 才是壁纸层
-        if (FindWindowExA(hwnd, 0, 'SHELLDLL_DefView', null)) {
-          const w = Number(FindWindowExA(0, hwnd, 'WorkerW', null))
-          if (w) worker = w
-        }
-        return true
-      }, 0)
-
-      // 兜底：某些 Win10 配置下 WorkerW 直接挂在 Progman 下
-      if (!worker) worker = Number(FindWindowExA(progman, 0, 'WorkerW', null))
-
+      const worker = locateWorkerW()
       if (!worker) console.error('[wallpaper] 没找到 WorkerW，桌面结构异常（壁纸模式不可用）')
       return worker
     }
 
+    /** 读 RECT（4 个 int32，按小端硬解，和历史代码保持一致） */
+    const readRect = (buf: Buffer): { w: number; h: number } => ({
+      w: buf.readInt32LE(8) - buf.readInt32LE(0),
+      h: buf.readInt32LE(12) - buf.readInt32LE(4),
+    })
+
+    /** 同上，但连左上角一起读（算边框宽度要用到位置） */
+    const readRectFull = (buf: Buffer): { l: number; t: number; r: number; b: number } => ({
+      l: buf.readInt32LE(0),
+      t: buf.readInt32LE(4),
+      r: buf.readInt32LE(8),
+      b: buf.readInt32LE(12),
+    })
+
+    /** 客户区原点（传入 hwnd 的客户区 (0,0)）在屏幕上的坐标；失败返回 null */
+    const clientOrigin = (hwnd: number): { x: number; y: number } | null => {
+      const buf = Buffer.alloc(8)
+      if (!ClientToScreenFn(hwnd, buf)) return null
+      return { x: buf.readInt32LE(0), y: buf.readInt32LE(4) }
+    }
+
     native = {
       findWorkerW,
+      findWorkerWQuiet,
+      fitToParent: (child, parent) => {
+        if (!child || !parent) {
+          return { changed: false, width: 0, height: 0, fromWidth: 0, fromHeight: 0, reason: '句柄为空' }
+        }
+
+        const pb = Buffer.alloc(16)
+        if (!GetClientRectFn(parent, pb)) {
+          return {
+            changed: false,
+            width: 0,
+            height: 0,
+            fromWidth: 0,
+            fromHeight: 0,
+            reason: 'GetClientRect(parent) 失败',
+          }
+        }
+        const p = readRect(pb)
+        // 父客户区取不到有效尺寸时**不要**动窗口：用 0x0 去 SetWindowPos 会把壁纸缩没
+        if (p.w <= 0 || p.h <= 0) {
+          return {
+            changed: false,
+            width: p.w,
+            height: p.h,
+            fromWidth: p.w,
+            fromHeight: p.h,
+            reason: `父客户区尺寸无效 ${p.w}x${p.h}`,
+          }
+        }
+
+        const cb = Buffer.alloc(16)
+        const c = GetClientRectFn(child, cb) ? readRect(cb) : { w: 0, h: 0 }
+
+        /**
+         * ★ **`SetWindowPos` 的 `cx/cy` 是外框尺寸，不是客户区尺寸**
+         *
+         * `frame: false` 的窗口并不是「零边框」—— Windows 上它仍然带着
+         * `WS_THICKFRAME`（用来支持边缘拖拽缩放），只是那圈边框不可见。实测：
+         *
+         * ```
+         * 窗口 windowRect 1935x1048   clientRect 1919x1040
+         * 边框: 左 8  上 0  右 8  下 8        （DIP 与物理像素一致时为 8px，随 DPI 变）
+         * ```
+         *
+         * 早先这里直接把**父客户区尺寸**传给 `SetWindowPos`，于是客户区被这圈边框
+         * 吃掉一圈 —— 露出的正是「两侧 + 下面」的 8px 白边（上边框为 0，所以上面没有）。
+         *
+         * 正确做法：把外框反推出去
+         *   - 位置 = 目标客户区原点 − (左边框, 上边框)
+         *   - 尺寸 = 目标客户区尺寸 + (左+右边框, 上+下边框)
+         * 这样客户区才**严丝合缝**等于父客户区（外框会超出父区域那几个像素，
+         * 超出部分只是不可见的边框，会被父窗口裁掉）。
+         */
+        let padLeft = 0
+        let padTop = 0
+        let padW = 0
+        let padH = 0
+        const wb = Buffer.alloc(16)
+        if (GetWindowRectFn(child, wb) && GetClientRectFn(child, cb)) {
+          const w = readRectFull(wb)
+          const origin = clientOrigin(child)
+          if (origin) {
+            padLeft = origin.x - w.l
+            padTop = origin.y - w.t
+          }
+          const fw = w.r - w.l
+          const fh = w.b - w.t
+          if (fw > 0 && fh > 0) {
+            padW = fw - c.w
+            padH = fh - c.h
+          }
+        }
+
+        /** 客户区是否已经等于父客户区，**且**左上角对齐到父客户区的 (0,0) */
+        const aligned = (): boolean => {
+          if (c.w !== p.w || c.h !== p.h) return false
+          const co = clientOrigin(child)
+          const po = clientOrigin(parent)
+          if (!co || !po) return true // 读不到偏移就只认尺寸，避免每次都白改一次
+          return co.x === po.x && co.y === po.y
+        }
+
+        if (aligned()) {
+          return { changed: false, width: p.w, height: p.h, fromWidth: c.w, fromHeight: c.h }
+        }
+
+        const ok = SetWindowPosFn(
+          child,
+          0, // 配合 SWP_NOZORDER，这个参数被忽略
+          -padLeft,
+          -padTop,
+          p.w + padW,
+          p.h + padH,
+          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+        )
+        return {
+          changed: !!ok,
+          width: p.w,
+          height: p.h,
+          fromWidth: c.w,
+          fromHeight: c.h,
+          reason: ok ? undefined : 'SetWindowPos 返回 0',
+        }
+      },
       setParent: (child, parent) => Number(SetParentFn(child, parent)),
       getRealParent: (hwnd) => {
         /**
@@ -446,5 +641,88 @@ export const isAttachedToWallpaper = (win: BrowserWindow): boolean => {
     return native.getRealParent(hwndOf(win)) === worker
   } catch {
     return false
+  }
+}
+
+/** 当前桌面壁纸层句柄（只读、不惊动 Explorer）；取不到返回 0 */
+export const getWallpaperLayer = (): number => {
+  initNative()
+  if (!native) return 0
+  try {
+    return native.findWorkerWQuiet()
+  } catch {
+    return 0
+  }
+}
+
+/** 窗口此刻的真实父窗口句柄（顶层窗口为 0） */
+export const getWindowParent = (win: BrowserWindow): number => {
+  initNative()
+  if (!native || win.isDestroyed()) return 0
+  try {
+    return native.getRealParent(hwndOf(win))
+  } catch {
+    return 0
+  }
+}
+
+/** `fitWallpaperWindow` 的结果 */
+export interface WallpaperFitResult {
+  /** 没有失败（`changed=false` 也算成功） */
+  ok: boolean
+  /** 这次是否真的改了几何 */
+  changed: boolean
+  /** 对齐后应是（或已是）的尺寸 */
+  width: number
+  height: number
+  /** 对齐前窗口的尺寸（排查「是谁把窗口改小了」时最关键的一个数） */
+  fromWidth: number
+  fromHeight: number
+  reason?: string
+}
+
+/**
+ * 让窗口重新盖满桌面层的客户区（幂等）
+ *
+ * 这是「任务栏大小 / 位置变化后出现一圈白边、盖不住任务栏」的修法本体：
+ *
+ *  - 窗口挂到 WorkerW 之后坐标是**父客户区**，而任务栏一动，桌面层的大小就变了
+ *    （任务栏占的地方越多，壁纸层能被盖住的区域越小）。子窗口**不会**跟着父窗口
+ *    自动改尺寸 —— 于是窗口还是旧尺寸，多出来的那块露的是宿主层的底色，
+ *    就是用户看到的那圈「白边」。
+ *  - 这里每次都问一遍父客户区，和窗口当前客户区比，不一致才 `SetWindowPos`。
+ *    所以可以放心地高频调用（守护轮询就是每秒一次），尺寸对的时候零副作用。
+ */
+export const fitWallpaperWindow = (win: BrowserWindow): WallpaperFitResult => {
+  const fail = (reason: string): WallpaperFitResult => ({
+    ok: false,
+    changed: false,
+    width: 0,
+    height: 0,
+    fromWidth: 0,
+    fromHeight: 0,
+    reason,
+  })
+
+  initNative()
+  if (!native) return fail(unavailableReason ?? '原生模块不可用')
+  if (win.isDestroyed()) return fail('窗口已销毁')
+
+  try {
+    const hwnd = hwndOf(win)
+    const parent = native.getRealParent(hwnd)
+    if (!parent) return fail('窗口不在任何父窗口下')
+    const r = native.fitToParent(hwnd, parent)
+    return {
+      ok: !r.reason,
+      changed: r.changed,
+      width: r.width,
+      height: r.height,
+      fromWidth: r.fromWidth,
+      fromHeight: r.fromHeight,
+      reason: r.reason,
+    }
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err))
   }
 }

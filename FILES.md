@@ -77,9 +77,30 @@
 **关键设计**：
 
 - **全屏是应用层模拟**：`applyFullScreenGeometry()` = `setAspectRatio(0)` →
-  `setBounds(所在屏 bounds)` → `setAlwaysOnTop(true)`。`isFullScreen` 由主进程自维护，
-  **绝不从原生状态回读**（`resize` 处理器明确不回写它）。
+  （最大化先 `unmaximize()`）→ `setResizable(true)` → `setBounds(所在屏 bounds)` →
+  `setResizable(false)` → `setAlwaysOnTop(true)`。
+  `isFullScreen` 由主进程自维护，**绝不从原生状态回读**（`resize` 处理器明确不回写它）。
   历史原因见 `transparent` 那条，但**现在主窗口已经不透明了**，模拟仍保留。
+- **★ 顺序是硬要求，两处都踩过**：
+  1. `setBounds` 的语义随 `resizable` 变：可缩放时按**客户区**解释（`1920x1080` → 客户区
+     `1920x1080`，正好铺满）；不可缩放时按**外框**解释（同样的参数 → 客户区 `1904x1072`，
+     右边和下边各留 8px 缝，外框右缘停在 `x=1912`）。所以必须**先开缩放、铺满、再关缩放**，
+     反过来就是「全屏右边没盖住」。
+  2. 最大化窗口不接受 `setBounds`（Windows 规则），不先 `unmaximize()` 的话「全屏」实际停在
+     工作区尺寸（`1920x1040`），任务栏那一条露在外面。还原点由 `captureFullScreenRestore`
+     提前记好，退出时 `exitFullScreen` 会先 `setBounds(还原点)` 再 `maximize()` ——
+     不写回的话 `rcNormalPosition` 已被整屏那次 `setBounds` 污染，
+     「向下还原 / 拖离最大化」会还原成整屏。
+- **全屏下不可拖动、不可缩放**（用户要求，和原生全屏一致）：
+  - 缩放：`setResizable(false)` 去掉 `WS_THICKFRAME`，四个边都没有热区。
+    不关的话那圈**不可见**的 8px 边框能拖小窗口，而 `isFullScreen` 仍是 true ——
+    状态和几何脱节。顺带解释了「全屏下只有顶边能拖、侧边拖不动」的现象：
+    窗口外框铺满后左右/下的边框被推到屏幕外，只有顶边留在屏内。
+    退出全屏（`exitFullScreen` / `exitWallpaperGeometry`）会恢复 `setResizable(true)`，
+    **顺序必须在 `maximize()` 之前** —— 不可缩放的窗口没有 `WS_MAXIMIZEBOX`，最大化会失效。
+  - 拖动：`startWindowDrag` 在 `isFullScreen` 时直接返回 `null`，
+    渲染层 `onTitlebarMouseDown` / `onTitlebarDblClick` 也跳过全屏，
+    `win:maximize` 在全屏下不再响应。退出全屏只走 F / Esc / 右下角按钮。
 - **壁纸模式唯一入口 `setWallpaperMode(want)`**：用 `wallpaperWant` + `wallpaperBusy`
   实现**串行 + 合并**（以最后一次目标为准）。进入时**先置 `wallpaperAttached = true`
   再 attach**（宁可多摘一次，不能漏摘），失败无条件回滚。
@@ -506,6 +527,46 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   且只在虚拟机复现；这行日志把可见性、矩形、子窗口/分层标志、DWM 合成状态
   一起打出来。每项包在独立 try 里 —— 诊断函数**绝不能**因为某个 API 不可用
   而把 attach 流程搞挂。
+- **`fitWallpaperWindow`（唯一改几何的地方）**：`GetClientRect(父窗口)` 取桌面层客户区，
+  和窗口自己的客户区比，不一致才 `SetWindowPos(..., SWP_NOZORDER|SWP_NOACTIVATE|
+  SWP_NOSENDCHANGING)`。幂等，所以可以每秒调。**不走 Electron 的 `setBounds`**：
+  挂到 WorkerW 之后是父客户区坐标系，混用会让窗口在任务栏/分辨率变化后对不上
+  （「一圈白边」）。
+  **注意 `SetWindowPos` 的 `cx/cy` 是外框尺寸**：frameless 窗口仍有 8px 不可见边框
+  （左/右/下 8、上 0，随 DPI 变），直接传父客户区尺寸会漏出「两侧 + 下面」的白边。
+  所以位置要减 `(左边框, 上边框)`、尺寸要加边框总量，边框每次现读（`GetWindowRect` −
+  `GetClientRect` + `ClientToScreen`）。对齐判据 = 客户区尺寸相等 **且** 客户区原点在父
+  客户区的 `(0,0)`。
+- **`findWorkerWQuiet`**：不发 `0x052C` 的只读查找，给守护轮询用 ——
+  高频路径不能再顺手动 Explorer 重建壁纸层。
+
+### `winShowState.ts` —— 窗口显示状态的原生还原
+
+**职责**：`restoreFromMaximized(win)` —— 把最大化的窗口还原成普通窗口，
+**在鼠标左键按着的时候也能生效**（拖动路径必须用它）。
+
+**为什么不能直接用 `unmaximize()`**：`BrowserWindow.unmaximize()` 在
+**左键按着**的状态下是**空操作** —— 返回成功、`isMaximized()` 仍为 `true`，
+松手也不补。而「拖离最大化」这个动作恰好就发生在左键按着的时候，于是
+窗口留在最大化状态，后续每帧 `setPosition` 被 Windows 忽略，
+表现是「最大化之后窗口拖不动」。
+
+实测对照（`frame:false` 窗口，同机同进程）：
+
+| 场景 | `unmaximize()` | `ShowWindow(SW_RESTORE)` |
+| :--- | :--- | :--- |
+| 没按鼠标键 | ✅ 立即生效 | ✅ |
+| **左键按着** | ❌ 仍是 true，250ms 后、松手后都仍是 true | ✅ 立即生效 |
+
+所以这里走原生 `ShowWindow(hwnd, 9)`，并用 `IsZoomed` 校验（系统眼里是否最大化，
+比 `isMaximized()` 更接近「`setBounds` 能不能生效」的真相）。koffi 加载失败时
+退回 Electron API 并返回 `via: 'electron'`，由调用方判断（`startWindowDrag`
+拿不到 `restored: true` 就返回 `null`，绝不用错误的偏移量继续拖）。
+
+> ⚠️ 退出壁纸的还原（`exitWallpaperGeometry`）**仍然用 `unmaximize()`**：
+> 那里窗口是 `hide()` 的，而 `ShowWindow(SW_RESTORE)` 会顺带**显示**窗口，
+> 正好破坏「退出时不闪一下」。
+
 
 ### `portable.ts` —— 便携版数据目录
 
@@ -1795,26 +1856,62 @@ restoreSongVideo(songName, resumeTime)
 ```
 ① isWallpaperAvailable() 校验      ← 失败会告诉渲染层原因
 ② captureWallpaperRestore()        ← 记还原点（是否全屏 + 普通尺寸）
-③ applyFullScreenGeometry()        ← 先铺满
-④ setVisibleOnAllWorkspaces(true) + isFullScreen = true
-⑤ await 120ms                      ← 等系统把尺寸应用完
-⑥ 先置 wallpaperAttached = true    ← 宁可多摘一次，不能漏摘
-⑦ attachWallpaper()                ← SetParent + 回读验证
+③ setAspectRatio(0)                ← 比例约束会改写几何，壁纸要的是盖满
+   isMinimized() → restore()       ← 最小化的窗口挂上去画不出来
+④ 先置 wallpaperAttached = true    ← 宁可多摘一次，不能漏摘
+⑤ attachWallpaper()                ← SetParent + 回读验证（此时窗口还是小尺寸）
      失败 → rollbackWallpaperAttach()（必含 detach）
-     成功 → setSkipTaskbar(true)
+     成功 → ⑥
+⑥ fitWallpaperWindow()             ← 原生 SetWindowPos 撑满桌面层客户区
+⑦ setSkipTaskbar(true) + isFullScreen = true
+   窗口不可见（从托盘进来的）→ showInactive()
+⑧ startWallpaperFitGuard()         ← 每秒贴合、每 5 秒校验父窗口
 ```
 
-**退出**：`detachWallpaper()` → `resetWallpaper()` →
-**确认成功才清 `wallpaperAttached`** → `await 80ms` → 还原几何。
+**退出**：`hide()` → `detachWallpaper()` → `resetWallpaper()` →
+**确认成功才清 `wallpaperAttached`** → `await 80ms` → 还原几何 → `show()`。
 
-**为什么先铺满再 attach、为什么要等 120ms/80ms**：
-原实现先 attach 再切全屏，挂载时窗口还是普通尺寸 →
-「进了壁纸模式但没在壁纸层全屏」；壁纸层跟随窗口几何，要等尺寸应用完。
+**★ 退出还原时必须先写回「最大化前尺寸」**：壁纸里用原生 `SetWindowPos` 撑满，
+Windows 会把那次尺寸记进窗口的**还原尺寸**（`rcNormalPosition`）。不写回去的话，
+退出后拖离最大化 / 点还原按钮都会回到**整屏大小** —— 表现为「还原不了原尺寸」
+和「拖不动」（窗口一直是满屏，移动看不出位移）。`exitWallpaperGeometry` 的做法是
+`unmaximize() → setBounds(还原点) → maximize()`（全在 `hide()` 状态下做，无视觉影响）。
+
+还原点本身也要体检：`sanitizeRestoreBounds` 在「最大化时的 normalBounds ≥ 整块工作区」
+时判定为被写坏，改用工作区 80%（否则老状态会一直传染下去）。`startWindowDrag`
+的最大化分支有同样的兜底，保证「拖离最大化」永远有可感知的结果。
+
+**★ 「拖离最大化」必须用原生 `ShowWindow(SW_RESTORE)`**：`unmaximize()` 在
+**左键按着**的时候是空操作（返回成功但不生效，松手也不补），而拖动恰好发生在
+左键按着的状态下 —— 窗口留在最大化，后面每帧 `setPosition` 全被系统忽略，
+用户看到的就是「最大化之后拖不动」。改用 `winShowState.restoreFromMaximized()`
+（原生 + `IsZoomed` 校验），拿不到 `restored: true` 就直接返回 `null`，
+不让错误的偏移量把窗口甩飞。详见 `winShowState.ts` 顶部那张实测对照表。
+
+**应用退出（含定时关闭 / 关机）也必须走「先隐藏再摘」**：`app.on('before-quit')` 里
+先 `hide()` + `setAlwaysOnTop(false)` 再 `detachWallpaper()`。`detach` 的瞬间窗口就
+变回顶层窗口，而壁纸模式里它是整屏、还可能带着进壁纸前留下的 `alwaysOnTop` ——
+那一下会**闪在最前面**（打全屏游戏时会直接把游戏挤出独占全屏）。同理，进入壁纸时
+也要 `setAlwaysOnTop(false)`，让任何摘层路径都不会出现「一帧置顶整屏窗口」。
+
+**为什么「先挂载再撑满」「先隐藏再摘下」**：
+
+- 旧顺序是「先 `setBounds` 铺满 + 置顶，等 120ms，再 `SetParent`」——
+  那 120ms 里窗口是个盖住任务栏和桌面图标的普通窗口，就是**进入时闪一下全屏**。
+  现在窗口以小尺寸沉到图标层后面（视觉上等于原地消失），再在壁纸层里撑满，
+  全程被图标层挡着。
+- 退出时反过来：`detach` 之后窗口立刻变回顶层窗口，若此时还是整屏尺寸，
+  会再闪一次。隐藏状态下做完再 `show`，只剩「小窗口出现」这一帧。
+
+**为什么壁纸几何不用 `setBounds`**：窗口挂到 WorkerW 之后坐标系是**父客户区**，
+而 Electron 仍按「屏幕坐标」理解 bounds。任务栏 / 分辨率 / 缩放一变，两边就对不上，
+多出来的那块露宿主层底色 —— 就是「一圈白边、盖不住任务栏」。
+`fitWallpaperWindow` 用 `GetClientRect(父)` + `SetWindowPos` 走单一坐标系，幂等。
 
 **为什么串行 + 合并**：连点（标题栏按钮 + 托盘项）或与「开机即壁纸」的启动
-apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 120ms 延时后才 attach，
-而退出那次早已 detach 并还原几何，最后 `wallpaperEnabled = false`
-但窗口真的挂在桌面层、任务栏按钮也没了，**状态与实际长期漂移**。
+apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 attach 前后被退出那次抢跑，
+最后 `wallpaperEnabled = false` 但窗口真的挂在桌面层、任务栏按钮也没了，
+**状态与实际长期漂移**。
 
 **回到窗口模式的三条路**：标题栏按钮 / 左键点托盘图标 / 托盘菜单里的「窗口模式」。
 三者都走 `restoreWindow()`，它用**三条件取或**判断是否需要 detach ——
@@ -1848,7 +1945,7 @@ apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 120ms 延�
 这些**不会被连续使用**的动作**不收起菜单**。
 判据是「这个动作会不会被连续使用」—— 进度条/音量拖动是连续的
 （踩过：鼠标一碰音量条菜单就没了），上/下一首/暂停/循环是连点场景；
-而设置歌单/壁纸/退出登录/退出程序是一次性跳转或命令，执行完就该收起。
+而设置歌单/定时/壁纸/退出登录/退出程序是一次性跳转或命令，执行完就该收起。
 
 ## 11. 配置（setting）的读写与广播
 
@@ -2090,6 +2187,7 @@ electron-builder（asar）→ 打包 out/
 │    ├── music/           多平台歌单解析（移植自 LX）                      │
 │    ├── utils/           db(SQLite) / cache / playlist / setting / store │
 │    ├── winWallpaper.ts  koffi 直调 Win32                                │
+│    ├── winShowState.ts  原生还原（拖离最大化）                          │
 │    └── protection.ts    blmv:// 解密协议                                │
 └───────────────────────────────┬────────────────────────────────────────┘
                                 │

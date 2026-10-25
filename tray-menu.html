@@ -44,6 +44,9 @@
       .item {
         display: flex;
         align-items: center;
+        /* 文字居中（用户要求）：菜单项是纯文本，没有左右分栏的子元素 */
+        justify-content: center;
+        text-align: center;
         gap: 8px;
         height: 30px;
         padding: 0 10px;
@@ -51,6 +54,18 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+      }
+      /*
+        定时那一项：倒计时蓝色、归零红色（用户要求）
+
+        `timer-zero` 对应 `00:00` —— 倒计时结束、正在等视频播完的那一段，
+        面板里同样是红色 `00:00`，两处必须一致。
+      */
+      .item.timer-running {
+        color: #6ba8ff;
+      }
+      .item.timer-zero {
+        color: #ff5c5c;
       }
       .item:hover {
         background: rgba(var(--accent), 0.28);
@@ -74,6 +89,8 @@
         padding: 2px 10px 6px;
         font-size: 12px;
         opacity: 0.75;
+        /* 和菜单项一起居中，否则顶部标题左对齐、下面居中会显得歪 */
+        text-align: center;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;

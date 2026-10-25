@@ -56,7 +56,11 @@ import {
   isWallpaperAvailable,
   getUnavailableReason,
   isAttachedToWallpaper,
+  fitWallpaperWindow,
+  getWallpaperLayer,
+  getWindowParent,
 } from './winWallpaper'
+import { restoreFromMaximized } from './winShowState'
 
 const isDev = !app.isPackaged
 
@@ -158,6 +162,15 @@ let trayDuration = 0
 /** 托盘菜单音量按钮要用的音量与静音状态 */
 let trayVolume = 70
 let trayMuted = false
+/**
+ * 托盘菜单「定时」那一项要显示的倒计时
+ *
+ * 计时器本身在渲染层（它要读 `<video>` 的播放位置判断「暂停冻结」「等视频播完」），
+ * 主进程只负责把渲染层送上来的快照原样塞进菜单状态 —— **不在这里自己算时间**，
+ * 否则多一个时钟源，迟早和弹窗里的倒计时不一致。
+ */
+let traySleepActive = false
+let traySleepRemainSec = 0
 /** 上一次设过的 tooltip 文本，避免重复设置 */
 let lastTrayTip = ''
 /**
@@ -195,7 +208,7 @@ const INITIAL_SIZE_FALLBACK_ASPECT = 16 / 9
  * 当前应该锁定的宽高比数值（0 = 不限制）
  *
  * 从设置里读，**不要写死** —— 踩过的坑：原来这里是 `const FULLSCREEN_ASPECT = 16/9`，
- * 散落在「建窗口 / 退出全屏 / 退出壁纸 / 拖出全屏」四处；一旦用户把比例改成 4:3，
+ * 散落在「建窗口 / 退出全屏 / 退出壁纸」三处；一旦用户把比例改成 4:3，
  * 这几处会把它悄悄改回 16:9（退出全屏后比例莫名变回去）。
  * 现在统一走这个函数，改设置后行为一致。
  */
@@ -455,6 +468,30 @@ function sendToMain<E extends IpcEvent>(event: E, payload?: IpcEventPayload<E>):
 }
 
 /**
+ * 还原点里的尺寸是否已经不可信
+ *
+ * 「最大化前尺寸」存在窗口的 `rcNormalPosition` 里，而原生 `SetWindowPos` 会改写它 ——
+ * 壁纸模式撑满桌面层就是一次（退出时已专门还原，见 `exitWallpaperGeometry`）。
+ * 如果拿到的尺寸**等于或大于整块工作区**，它基本就是被撑满操作写坏的，
+ * 直接当还原点用会让窗口「还原成满屏」。
+ *
+ * 这里按工作区 80% 给一个合理值；只有确实异常时才动手，正常窗口不受影响。
+ */
+const sanitizeRestoreBounds = (bounds: Electron.Rectangle): Electron.Rectangle => {
+  const area = screen.getDisplayMatching(bounds).workArea
+  if (bounds.width < area.width || bounds.height < area.height) return bounds
+  console.warn(
+    `[win] 还原尺寸异常（${bounds.width}x${bounds.height} >= 工作区 ${area.width}x${area.height}），改用工作区 80%`,
+  )
+  return {
+    x: area.x + Math.round(area.width * 0.1),
+    y: area.y + Math.round(area.height * 0.1),
+    width: Math.round(area.width * 0.8),
+    height: Math.round(area.height * 0.8),
+  }
+}
+
+/**
  * 取当前窗口作为「普通窗口」时的尺寸与最大化状态
  *
  * 只在窗口不是全屏时调用：全屏是我们自己用 setBounds 撑出来的，
@@ -466,8 +503,12 @@ const readNormalWindowState = (): FullScreenRestore => {
   }
   const maximized = mainWindow.isMaximized()
   return {
-    // 最大化时 getBounds 是工作区大小，要取 normalBounds 才是还原用的尺寸
-    bounds: maximized ? mainWindow.getNormalBounds() : mainWindow.getBounds(),
+    // 最大化时 getBounds 是工作区大小，要取 normalBounds 才是还原用的尺寸。
+    // 只有这条路径需要体检：非最大化时 getBounds 是窗口真实尺寸，本来就可信
+    // （普通窗口允许跨屏、允许比工作区大，不能按工作区去卡它）。
+    bounds: maximized
+      ? sanitizeRestoreBounds(mainWindow.getNormalBounds())
+      : mainWindow.getBounds(),
     maximized,
   }
 }
@@ -478,8 +519,46 @@ const applyFullScreenGeometry = (): void => {
   // 16:9 的宽高比约束会把 setBounds 的结果改写掉，全屏时必须先解除，
   // 否则在非 16:9 的显示器上窗口撑不满，看起来就「没全屏」
   mainWindow.setAspectRatio(0)
+  /**
+   * ★ **全屏几何有三条硬性顺序，全都实测踩过**
+   *
+   * ## ① 最大化要先还原
+   *
+   * Windows 不允许移动 / 缩放最大化窗口，`setBounds` 只会改写还原尺寸、不动几何。
+   * 不还原的话「全屏」实际停在**最大化**的尺寸（工作区，比如 `1920x1040`），
+   * 任务栏那一条仍露在外面 —— 这也是「全屏没盖住屏幕」的一种形态。
+   * 还原点已经在 `captureFullScreenRestore` 里记过了（含 `maximized` 与普通尺寸），
+   * 退出时 `exitFullScreen` 会按它恢复成最大化，所以这里还原不丢状态。
+   *
+   * ## ② 必须先开缩放 → `setBounds()` → 再关缩放
+   *
+   * 同一个 `setBounds(w, h)` 在两种状态下语义不一样（实测 dpi=96）：
+   *
+   * ```
+   * 可缩放   setBounds(0,0,1920,1080) → 客户区 1920x1080   ← 按客户区解释，正好铺满
+   * 不可缩放 setBounds(0,0,1920,1080) → 客户区 1904x1072   ← 按外框解释，被 8px 边框吃一圈
+   * ```
+   *
+   * 先关缩放再 setBounds 的话，右边和下边各留 8px 缝（外框右缘停在 `x=1912`，
+   * 屏幕是 `1920`），看起来就是「全屏右边没盖住」。所以刻意先打开缩放，
+   * 让 `setBounds` 走「客户区」语义，铺满之后再关 —— 关缩放本身不改动几何。
+   *
+   * ## ③ 关缩放是为了禁掉边缘热区
+   *
+   * 窗口是 `frame: false`，但仍带 `WS_THICKFRAME`，那圈**不可见**的 8px 边框就是
+   * 缩放热区。不关的话能在全屏下把窗口拖小，而 `isFullScreen` 仍是 true，
+   * 状态和几何脱节（按 F「退出全屏」会跳回一个莫名其妙的位置）。
+   * 这同时也解释了「全屏下只有顶边能拖、侧边拖不动」：外框铺满屏幕后，
+   * 左右/下的那圈边框被推到屏幕外，只有顶边还在屏内。
+   * 退出全屏时 `exitFullScreen` / `exitWallpaperGeometry` 会恢复成可缩放。
+   *
+   * 整段对同一块屏重算，重复调用幂等（`display-metrics-changed` 会再走一遍）。
+   */
+  if (mainWindow.isMaximized()) mainWindow.unmaximize()
+  mainWindow.setResizable(true)
   // 必须按「窗口现在在哪块屏」算，写死 getPrimaryDisplay() 会把副屏上的窗口拽回主屏
   mainWindow.setBounds(screen.getDisplayMatching(mainWindow.getBounds()).bounds)
+  mainWindow.setResizable(false)
   // 不置顶的话任务栏会压在窗口上面，看起来也不像全屏
   mainWindow.setAlwaysOnTop(true)
 }
@@ -504,6 +583,9 @@ const exitFullScreen = (): void => {
   if (!mainWindow || mainWindow.isDestroyed()) return
   isFullScreen = false
   mainWindow.setAlwaysOnTop(false)
+  // 全屏时被 `applyFullScreenGeometry` 关掉的缩放要先恢复：
+  // 不可缩放的窗口没有 `WS_MAXIMIZEBOX`，下面那句 `maximize()` 会失效
+  mainWindow.setResizable(true)
   // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
   applyAspectRatio()
 
@@ -515,8 +597,20 @@ const exitFullScreen = (): void => {
     mainWindow.center()
     return
   }
-  if (point.maximized) mainWindow.maximize()
-  else mainWindow.setBounds(point.bounds)
+  /**
+   * 原来这里是 `if (point.maximized) maximize()` —— 直接最大化、不写回尺寸。
+   *
+   * 那样会依赖 Windows 记着的还原尺寸（`rcNormalPosition`），而**进入全屏时那次
+   * `setBounds(整屏)` 已经把它写成整屏了**：退出全屏后「拖离最大化」或点「向下还原」，
+   * 窗口会还原成整屏大小（看起来像还原失效、也像拖不动）。
+   * 所以这里先 `setBounds(还原点)` 把正确的尺寸写回去，再 `maximize()`。
+   */
+  if (point.maximized) {
+    mainWindow.setBounds(point.bounds)
+    mainWindow.maximize()
+  } else {
+    mainWindow.setBounds(point.bounds)
+  }
 }
 
 /** 退出壁纸模式：按壁纸还原点回到全屏 / 最大化 / 普通窗口 */
@@ -535,6 +629,8 @@ const exitWallpaperGeometry = (): void => {
 
   isFullScreen = false
   mainWindow.setAlwaysOnTop(false)
+  // 全屏（含壁纸模式里那次模拟全屏）关掉的缩放要恢复，否则回到窗口模式后拖不了边
+  mainWindow.setResizable(true)
   // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
   applyAspectRatio()
   if (!point) {
@@ -543,8 +639,27 @@ const exitWallpaperGeometry = (): void => {
     mainWindow.center()
     return
   }
-  if (point.maximized) mainWindow.maximize()
-  else mainWindow.setBounds(point.bounds)
+  if (point.maximized) {
+    /**
+     * ★ **先把「最大化前的尺寸」写回去，再最大化**
+     *
+     * 壁纸模式里窗口是用原生 `SetWindowPos` 撑满桌面层的，而 Windows 会把
+     * 那次改动的结果记进窗口的**还原尺寸**（`rcNormalPosition`）—— 也就是说，
+     * 从壁纸出来之后，窗口的「最大化前尺寸」已经悄悄变成了整屏大小。
+     *
+     * 后果全在用户体验上，且看起来像两个不相干的 bug：
+     *  - 拖离最大化解锁 / 点还原按钮，窗口变回**整屏大小**（等于没还原）；
+     *  - 于是拖动时窗口一直是满屏，"拖不动"的观感就是这么来的。
+     *
+     * `setBounds` 对最大化窗口只会改还原尺寸、不改变视觉，但这里先
+     * `unmaximize()` 再写，纯粹是为了让语义确定（此时窗口是隐藏的，没有视觉影响）。
+     */
+    if (mainWindow.isMaximized()) mainWindow.unmaximize()
+    mainWindow.setBounds(point.bounds)
+    mainWindow.maximize()
+    return
+  }
+  mainWindow.setBounds(point.bounds)
 }
 
 /** 全屏状态变化后通知渲染进程 */
@@ -601,17 +716,112 @@ const captureWallpaperRestore = (): void => {
 }
 
 /**
+ * 壁纸模式的「贴合守护」
+ *
+ * 为什么需要它：窗口一旦被 `SetParent` 挂到桌面层，坐标系就变成**父窗口客户区**，
+ * 而桌面层的大小是会变的 —— 任务栏改位置 / 改高度 / 自动隐藏 / 改分辨率 / 改缩放 /
+ * Explorer 重建桌面窗口，任何一项都会让「窗口尺寸」和「桌面层客户区」对不上。
+ * 子窗口**不会**跟着父窗口自动改尺寸，多出来或缺失的那块露的就是宿主层底色，
+ * 也就是「一圈白边，而且盖不住任务栏那一条」。
+ *
+ * 策略是「每秒问一次、只在真不一样时才动」：尺寸一致时 `fitWallpaperWindow`
+ * 立刻返回 `changed=false`，不会产生任何副作用（不重绘、不抢焦点）。
+ * 之所以轮询而不是监听 `WM_SETTINGCHANGE`：子类化 Chromium 的窗口过程风险太大
+ * （那套消息一进来就要和它的 `HWNDMessageHandler` 抢着处理），而每秒两次
+ * `GetClientRect` 的开销可以忽略。
+ */
+let wallpaperFitTimer: ReturnType<typeof setInterval> | null = null
+/** 上一次贴合到的尺寸（只在尺寸变化时打日志，避免每秒刷屏） */
+let lastWallpaperFitSize = ''
+
+function stopWallpaperFitGuard(): void {
+  if (wallpaperFitTimer) {
+    clearInterval(wallpaperFitTimer)
+    wallpaperFitTimer = null
+  }
+}
+
+/**
+ * 让窗口重新贴合桌面层（幂等，可以高频调用）
+ *
+ * @param where       触发来源，只用于日志
+ * @param checkParent 是否顺带检查「父窗口还是不是当前桌面层」。这项要 `EnumWindows`，
+ *                    比读两次客户区矩形贵得多，所以只在必要时（显示器变化、每隔几秒）做
+ */
+function ensureWallpaperFit(where: string, checkParent = true): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  /**
+   * ① 父窗口对不上 = 桌面层被重建过
+   *
+   * 改任务栏行为、重启资源管理器都可能让 Explorer 重建 WorkerW。旧句柄那棵树
+   * 被丢掉之后，窗口要么跟着消失，要么留在屏幕外/尺寸异常的父窗口下面。这时
+   * 只能重新挂一次（这是唯一会再发 `0x052C` 的路径，所以特意加了「检测到不一致
+   * 才执行」的前置条件，正常运行时一次都不会走到）。
+   */
+  if (checkParent) {
+    const layer = getWallpaperLayer()
+    const parent = getWindowParent(mainWindow)
+    if (layer && parent !== layer) {
+      console.warn(`[wallpaper] ${where}: 窗口不在壁纸层（父=${parent} 期望=${layer}），重新挂载`)
+      const retry = attachWallpaper(mainWindow)
+      if (!retry.ok) {
+        console.warn(`[wallpaper] ${where}: 重新挂载失败:`, retry.reason)
+        return
+      }
+    }
+  }
+
+  /** ② 尺寸对不上父客户区 → 原生 `SetWindowPos` 对齐（不经过 Electron 的坐标系） */
+  const fit = fitWallpaperWindow(mainWindow)
+  if (!fit.ok) {
+    console.warn(`[wallpaper] ${where}: 贴合桌面层失败:`, fit.reason)
+    return
+  }
+  if (fit.changed) {
+    const size = `${fit.width}x${fit.height}`
+    if (size !== lastWallpaperFitSize) {
+      console.log(
+        `[wallpaper] ${where}: 已重新贴合桌面层 ${fit.fromWidth}x${fit.fromHeight} → ${size}`,
+      )
+      lastWallpaperFitSize = size
+    }
+  }
+}
+
+function startWallpaperFitGuard(): void {
+  stopWallpaperFitGuard()
+  lastWallpaperFitSize = ''
+  let ticks = 0
+  wallpaperFitTimer = setInterval(() => {
+    if (!wallpaperEnabled || !wallpaperAttached) return
+    ticks += 1
+    try {
+      // 父窗口每 5 秒校验一次（要 EnumWindows），尺寸每秒校验一次（只有两次 GetClientRect）
+      ensureWallpaperFit('守护', ticks % 5 === 0)
+    } catch (err) {
+      console.warn('[wallpaper] 守护轮询异常（忽略本次）:', err)
+    }
+  }, 1000)
+}
+
+/**
  * 应用壁纸模式
  *
  * 修复要点（老 bug）：
- *  1. **先把窗口几何铺满主屏，再挂壁纸层**。
- *     原实现是先 attach 再切全屏，挂载时窗口还是普通尺寸，
- *     所以「进了壁纸模式但没在壁纸层全屏」。
- *  2. 完全不调用原生 setFullScreen：改用「解除宽高比约束 + 铺满主屏 + 置顶」
- *     在应用层实现（原因见 isFullScreen 的注释）。
+ *  1. **先挂到壁纸层，再撑满**。原实现先把窗口 `setBounds` 铺满整屏并置顶、
+ *     等 120ms 才 `SetParent` —— 那 120ms 里它是一个盖住任务栏和桌面图标的
+ *     普通窗口，就是「进壁纸模式时闪一下全屏」。现在窗口以小尺寸直接沉到
+ *     图标层后面（它在最底层，视觉上等于原地消失），再用原生 `SetWindowPos`
+ *     在壁纸层里撑满，整个过程都被图标层挡着。
+ *  2. 壁纸几何**不用** `setBounds`：窗口被 `SetParent` 之后坐标系是父客户区，
+ *     而 Electron 仍按「顶层窗口 + 屏幕坐标」理解 bounds，两边不一致就会错位
+ *     （「一圈白边 + 盖不住任务栏」的根源，见 `fitWallpaperWindow`）。
  *  3. 进入前用独立的 wallpaperRestore 记录窗口状态，退出时原样还原
  *     （原本是全屏就回到全屏，原本是最大化就回到最大化），
  *     不会再出现「退不出去的全屏」。
+ *  4. 退出时**先隐藏再 detach**：否则 detach 之后那一瞬间窗口是个盖住整屏的
+ *     顶层窗口，又是「闪一下全屏」。
  */
 async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
   if (!mainWindow || mainWindow.isDestroyed()) return false
@@ -627,17 +837,27 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
     // 1) 先记住进入前的状态（已有记录则保留更早的那个）
     captureWallpaperRestore()
 
-    // 2) 先把窗口铺满主屏 —— 必须在挂到壁纸层之前完成
-    applyFullScreenGeometry()
-    mainWindow.setVisibleOnAllWorkspaces(true)
-    isFullScreen = true
-    // 壁纸层跟随窗口几何，等系统把尺寸应用完再挂载，否则 attach 拿到的是旧几何
-    await new Promise((resolve) => setTimeout(resolve, 120))
-
-    if (!mainWindow || mainWindow.isDestroyed()) return false
+    /**
+     * 2) 挂到壁纸层 —— 此时窗口还是**原来的小尺寸**，不是全屏
+     *
+     * `setAspectRatio(0)`：16:9 约束会在尺寸被改写时插手，壁纸要的是「盖满客户区」，
+     * 任何比例约束都是错的（退出时 `exitWallpaperGeometry` 会按设置恢复）。
+     *
+     * 最小化状态要先 `restore()`：最小化的窗口挂到桌面层之后画不出来，而且壁纸
+     * 模式不该弹窗抢焦点，后面没有「显示它」的时机。
+     */
+    mainWindow.setAspectRatio(0)
+    /**
+     * 清掉置顶：壁纸层里「置顶」没有意义（窗口是桌面的一部分），
+     * 却会在任何一次摘层（退出应用 / 回滚 / 托盘恢复）时变成
+     * 「一帧置顶的整屏窗口」—— 那就是用户看到的「退出前闪一下」。
+     * 退出壁纸若原本是全屏，`exitWallpaperGeometry` 会重新置顶。
+     */
+    mainWindow.setAlwaysOnTop(false)
+    if (mainWindow.isMinimized()) mainWindow.restore()
 
     /**
-     * 3) 几何就绪后再挂到壁纸层
+     * 3) 挂到壁纸层
      *
      * **必须在调 attach 之前置位 `wallpaperAttached`**：`attachWallpaper` 内部
      * 只要执行到 `SetParent`，窗口就已经离开正常窗口层了 —— 哪怕它返回失败，
@@ -661,6 +881,10 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
       return false
     }
 
+    // 4) 在壁纸层里撑满桌面层客户区（原生坐标，一步到位，没有过渡帧）
+    const fit = fitWallpaperWindow(mainWindow)
+    if (!fit.ok) console.warn('[wallpaper] 挂载后贴合桌面层失败（守护会再试）:', fit.reason)
+
     /**
      * 壁纸模式 = 没有任务栏按钮
      *
@@ -669,28 +893,70 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
      * `restoreWindow()`，或右键菜单里的「窗口模式」。
      */
     mainWindow.setSkipTaskbar(true)
+    isFullScreen = true
+    mainWindow.setVisibleOnAllWorkspaces(true)
 
-    // 4) 刷新托盘提示（壁纸模式下操作都在托盘菜单里）
+    /**
+     * 从托盘进入时窗口是隐藏的（关闭到托盘 = `hide()`），挂上去也不会自己出现。
+     * 用 `showInactive` 而不是 `show`：壁纸不该抢焦点，也不该把用户正在用的窗口挤下去。
+     */
+    if (!mainWindow.isVisible()) mainWindow.showInactive()
+
+    // 5) 贴合守护（任务栏 / 分辨率 / DPI / Explorer 重建都会触发重新对齐）+ 托盘提示
+    startWallpaperFitGuard()
     applyTrayMode()
   } else {
-    // 退出壁纸模式：先脱离壁纸层，再恢复窗口状态
-    const detachResult = mainWindow ? detachWallpaper(mainWindow) : { ok: false }
-    if (mainWindow && !detachResult.ok) {
-      console.warn('[wallpaper] detach 未确认成功，仍继续还原窗口:', detachResult.reason)
-    }
-    resetWallpaper()
-    // detach 已确认（或已尽力）→ 清除「原生层可能挂着」的标志
-    if (detachResult.ok) wallpaperAttached = false
+    /** 退出壁纸模式：先脱离壁纸层，再恢复窗口状态 */
+    stopWallpaperFitGuard()
 
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setVisibleOnAllWorkspaces(false)
-      // 任务栏按钮恢复（进入壁纸模式时被 setSkipTaskbar(true) 摘掉了）
-      mainWindow.setSkipTaskbar(false)
-    }
+    /**
+     * **先藏起来再摘**
+     *
+     * detach 之后窗口立刻变回顶层窗口 —— 如果这时它还是整屏尺寸，用户看到的就是
+     * 「退出时又闪一下全屏」，然后才缩回小窗口。隐藏状态下做 detach + 还原几何，
+     * 最后一次性 `show`，全程只有「小窗口出现」这一帧。
+     */
+    const wasVisible = !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()
+    if (wasVisible) mainWindow?.hide()
 
-    // 等壁纸层把窗口还回来，再还原尺寸，否则 setBounds 会被忽略
-    await new Promise((resolve) => setTimeout(resolve, 80))
-    if (mainWindow && !mainWindow.isDestroyed()) exitWallpaperGeometry()
+    try {
+      const detachResult = mainWindow ? detachWallpaper(mainWindow) : { ok: false }
+      if (mainWindow && !detachResult.ok) {
+        console.warn('[wallpaper] detach 未确认成功，仍继续还原窗口:', detachResult.reason)
+      }
+      resetWallpaper()
+      // detach 已确认（或已尽力）→ 清除「原生层可能挂着」的标志
+      if (detachResult.ok) wallpaperAttached = false
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.setVisibleOnAllWorkspaces(false)
+        // 任务栏按钮恢复（进入壁纸模式时被 setSkipTaskbar(true) 摘掉了）
+        mainWindow.setSkipTaskbar(false)
+        // 兜一次残留的置顶（壁纸层里置顶没有意义，但退出时会把整屏窗口顶在最上面）
+        mainWindow.setAlwaysOnTop(false)
+      }
+
+      // 等壁纸层把窗口还回来，再还原尺寸，否则 setBounds 会被忽略（隐藏状态下等，看不见）
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      if (mainWindow && !mainWindow.isDestroyed()) exitWallpaperGeometry()
+    } finally {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        /**
+         * 还挂在桌面层就再硬摘一次：这时候 `show()` 出来的是一个被图标层盖住的窗口，
+         * 用户会觉得「点了恢复窗口但什么都没发生」。
+         */
+        if (wallpaperAttached) {
+          const retry = detachWallpaper(mainWindow)
+          if (retry.ok) {
+            wallpaperAttached = false
+            resetWallpaper()
+          } else {
+            console.error('[wallpaper] 退出时仍未能脱离桌面层:', retry.reason)
+          }
+        }
+        if (wasVisible) mainWindow.show()
+      }
+    }
 
     // 托盘还在（一直是同一个实例），切回「应用模式用法」就行
     applyTrayMode()
@@ -709,6 +975,7 @@ async function applyWallpaperMode(enabled: boolean): Promise<boolean> {
  * 而「多摘一次」是幂等且无害的，「漏摘」则是永久性故障。
  */
 function rollbackWallpaperAttach(): void {
+  stopWallpaperFitGuard()
   if (!mainWindow || mainWindow.isDestroyed()) {
     wallpaperAttached = false
     return
@@ -1139,6 +1406,8 @@ function getTrayMenuState(): TrayMenuState {
     duration: trayDuration,
     volume: trayVolume,
     muted: trayMuted,
+    sleepActive: traySleepActive,
+    sleepRemainSec: traySleepRemainSec,
   }
 }
 
@@ -1294,6 +1563,15 @@ function runTrayMenuAction(action: TrayMenuAction, value?: number): void {
        * 所以先把窗口恢复出来，再让渲染层打开弹窗。
        */
       void restoreWindow().then(() => sendToMain('tray:showPlaylist'))
+      break
+    case 'showSleepTimer':
+      /**
+       * 定时：和「设置歌单」完全同一套跳转 —— **先回到窗口模式，再打开面板**
+       *
+       * 壁纸模式下窗口在桌面层、标题栏和弹窗都看不见，所以必须先 `restoreWindow`；
+       * 面板本身（`SleepTimerPanel`）由渲染层管，这里只发一条「请打开」的事件。
+       */
+      void restoreWindow().then(() => sendToMain('tray:showSleepTimer'))
       break
     case 'toggleWallpaper':
       void toggleWallpaper()
@@ -1711,6 +1989,11 @@ void app.whenReady().then(async () => {
       if (state.duration !== undefined) trayDuration = state.duration
       if (state.volume !== undefined) trayVolume = state.volume
       if (state.muted !== undefined) trayMuted = state.muted
+      // 定时倒计时：菜单里那一项显示「定时 12:34」（到 00:00 变红）
+      if (state.sleepActive !== undefined) traySleepActive = state.sleepActive
+      if (state.sleepRemainSec !== undefined) {
+        traySleepRemainSec = Math.max(0, Math.round(state.sleepRemainSec))
+      }
       // 登录态也一起收下（防漂移：托盘菜单那一项要显示「退出登录」还是「登录」）
       if (state.isLoggedIn !== undefined && state.isLoggedIn !== isLoggedIn) {
         isLoggedIn = state.isLoggedIn
@@ -1769,43 +2052,75 @@ void app.whenReady().then(async () => {
     app.exit(1)
   })
 
-/** 拖动窗口：处理全屏/最大化状态下先还原再跟手移动 */
+/**
+ * 拖动窗口：最大化状态下先还原再跟手移动
+ *
+ * @returns 鼠标相对窗口左上角的偏移；`null` = 这次拖动不该发生
+ */
 function startWindowDrag(): { offsetX: number; offsetY: number } | null {
   if (!mainWindow) return null
   const cursor = screen.getCursorScreenPoint()
 
-  if (isFullScreen) {
-    // 全屏时拖动 = 退出全屏，并按鼠标在窗口中的相对位置把窗口摆到鼠标下
-    const fullBounds = mainWindow.getBounds()
-    const normalBounds = fullScreenRestore?.bounds ?? fullBounds
-    // 注意减掉 fullBounds.x/y：全屏窗口不一定从 (0,0) 开始（副屏 / 多屏），
-    // 不减的话相对位置会大于 1，还原出来的窗口直接飞出屏幕
-    const ratioX =
-      fullBounds.width > 0 ? (cursor.x - fullBounds.x) / fullBounds.width : 0.5
-    const ratioY =
-      fullBounds.height > 0 ? (cursor.y - fullBounds.y) / fullBounds.height : 0.5
-    isFullScreen = false
-    fullScreenRestore = null
-    mainWindow.setAlwaysOnTop(false)
-    // 退出全屏 / 壁纸后，按用户设置的比例恢复约束（'free' = 不限制）
-    applyAspectRatio()
-    syncFullScreenState()
-    mainWindow.setBounds({
-      x: Math.round(cursor.x - ratioX * normalBounds.width),
-      y: Math.round(cursor.y - ratioY * normalBounds.height),
-      width: normalBounds.width,
-      height: normalBounds.height,
-    })
-  }
+  /**
+   * ★ **全屏时不允许拖动**（用户要求：和原生全屏一致）
+   *
+   * 老实现是「全屏时拖动 = 退出全屏 + 把窗口摆到鼠标下」。但全屏下标题栏
+   * 是可见的（除非开了「全屏自动锁定」），顺手拖一下就退出全屏，
+   * 既容易误触，也和系统全屏的行为不一致 —— 现在退出全屏只走 F / Esc / 按钮。
+   *
+   * 返回 `null` 而不是偏移量：渲染层拿到 `null` 就不会开始移动窗口。
+   */
+  if (isFullScreen) return null
 
   if (mainWindow.isMaximized()) {
     const fullBounds = mainWindow.getBounds()
-    const normalBounds = mainWindow.getNormalBounds()
+    /**
+     * 兜底：还原尺寸不可信时给一个合理值
+     *
+     * 「最大化前尺寸」存在窗口的 `rcNormalPosition` 里，任何一次原生 `SetWindowPos`
+     * 都会改写它（壁纸模式撑满屏幕就是典型场景，退出时已专门还原，见
+     * `exitWallpaperGeometry`）。万一它还是等于或大于整块工作区，按它还原就等于
+     * 还原成满屏 —— 用户看到的是窗口没变小、接着拖也看不出位移，即「拖不动」。
+     * 这里退回到工作区的 80%，保证「拖离最大化」这个动作永远有可感知的结果。
+     */
+    const workArea = screen.getDisplayMatching(fullBounds).workArea
+    let normalBounds = mainWindow.getNormalBounds()
+    if (normalBounds.width >= workArea.width && normalBounds.height >= workArea.height) {
+      console.warn(
+        '[win] 最大化前尺寸异常（' +
+          `${normalBounds.width}x${normalBounds.height} >= 工作区 ` +
+          `${workArea.width}x${workArea.height}），按工作区 80% 还原`,
+      )
+      normalBounds = {
+        x: workArea.x + Math.round(workArea.width * 0.1),
+        y: workArea.y + Math.round(workArea.height * 0.1),
+        width: Math.round(workArea.width * 0.8),
+        height: Math.round(workArea.height * 0.8),
+      }
+    }
     const ratioX =
       fullBounds.width > 0 ? (cursor.x - fullBounds.x) / fullBounds.width : 0.5
     const ratioY =
       fullBounds.height > 0 ? (cursor.y - fullBounds.y) / fullBounds.height : 0.5
-    mainWindow.unmaximize()
+
+    /**
+     * ★ **必须用原生还原，不能用 `unmaximize()`**
+     *
+     * 这个函数是在**鼠标左键按着**的时候调的（渲染层判定拖动超过 5px 才发 IPC），
+     * 而 `win.unmaximize()` 恰好在这种状态下是**空操作**：返回成功、`isMaximized()`
+     * 仍为 true，松手也不补。窗口留在最大化状态后，下面和后续每一帧的
+     * `setBounds / setPosition` 都会被 Windows 忽略 —— 用户看到的就是
+     * 「最大化之后窗口拖不动」（实测对照见 `winShowState.ts` 顶部）。
+     */
+    const restore = restoreFromMaximized(mainWindow)
+    if (!restore.restored) {
+      console.warn(
+        `[win] 拖离最大化失败（via=${restore.via}）:`,
+        restore.reason ?? '原因未知',
+      )
+      return null
+    }
+
     mainWindow.setBounds({
       x: Math.round(cursor.x - ratioX * normalBounds.width),
       y: Math.round(cursor.y - ratioY * normalBounds.height),
@@ -1881,8 +2196,16 @@ const handleDisplayChange = (): void => {
   }
   if (!isFullScreen && !wallpaperEnabled) return
   try {
-    // 两种情况都是「窗口应该铺满所在屏幕」，所以同一个几何函数；
-    // 壁纸模式下不需要重新 attach（窗口已经贴在桌面层，只是尺寸要跟着新分辨率走）
+    /**
+     * 壁纸模式下**不能**走 `applyFullScreenGeometry`：它用的是 `setBounds`（屏幕坐标），
+     * 而挂到桌面层的窗口坐标是**父客户区** —— 两套坐标系混用正是「改完分辨率就一圈白边」
+     * 的来源。壁纸模式统一交给原生贴合逻辑（顺带把父窗口被重建的情况也一并处理）。
+     */
+    if (wallpaperEnabled) {
+      ensureWallpaperFit('显示器变化')
+      return
+    }
+    // 全屏是应用层模拟的：窗口还是顶层窗口，用屏幕坐标重算就对了
     applyFullScreenGeometry()
   } catch (err) {
     console.warn('[win] 显示器变化后重算几何失败:', err)
@@ -1919,6 +2242,20 @@ app.on('before-quit', () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     const needDetach = wallpaperAttached || wallpaperEnabled || isAttachedToWallpaper(mainWindow)
     if (needDetach) {
+      stopWallpaperFitGuard()
+      /**
+       * ★ **先隐藏 + 取消置顶，再 detach**（否则退出前会在最前面闪一下）
+       *
+       * `detachWallpaper` 的瞬间，窗口就从桌面层变回一个**普通顶层窗口**。
+       * 壁纸模式里它是整屏尺寸，而且可能还带着「进壁纸前是全屏」留下的
+       * `alwaysOnTop` —— 两者一叠加，用户看到的就是「程序退出前在最前面闪一下」；
+       * 正在打全屏游戏时，这一下甚至会直接把游戏挤出独占全屏。
+       *
+       * 窗口马上要销毁，`hide()` 不会有任何代价；置顶标志也顺手清掉，
+       * 防止任何一帧的可见窗口被顶到最前。
+       */
+      if (mainWindow.isVisible()) mainWindow.hide()
+      mainWindow.setAlwaysOnTop(false)
       const result = detachWallpaper(mainWindow)
       if (!result.ok) console.warn('[wallpaper] 退出前 detach 未确认成功（忽略）:', result.reason)
       resetWallpaper()
