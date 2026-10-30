@@ -22,7 +22,7 @@
           <button
             class="lt-icon lt-refresh"
             :class="{ spin: spinning }"
-            :title="isSongList ? '重新同步歌单' : '重新搜索这首歌'"
+            :title="isSongList ? (mode === 'ov' ? '重新同步列表' : '重新同步歌单') : '重新搜索这首歌'"
             @click="onRefresh"
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -48,7 +48,7 @@
               v-model="keyword"
               size="small"
               class="lt-search"
-              placeholder="搜索歌名 / 歌手 / 专辑"
+              :placeholder="mode === 'ov' ? '搜索标题 / UP 主' : '搜索歌名 / 歌手 / 专辑'"
               clearable
               @keydown.esc.stop="closeSearch"
             />
@@ -74,7 +74,7 @@
           v-for="row in rows"
           :key="row.index"
           :ref="(el) => setItemRef(row.index, el)"
-          :class="{ active: row.index === currentIndex }"
+          :class="{ active: row.index === currentIndex, missing: row.item.missing }"
           @click="onItemClick(row.item, row.index)"
         >
           <div class="index">{{ row.index + 1 }}</div>
@@ -112,6 +112,14 @@
               <span v-if="albumOf(row.item)" class="album" :title="albumOf(row.item)">
                 {{ albumOf(row.item) }}
               </span>
+              <!--
+                本地文件丢了：列表里**先标出来**，而不是等播到它再报错。
+                值来自主进程读条目时的 `stat`（见 VideoListItem.missing），不落库 ——
+                文件插回移动硬盘、重新定位之后，下次读列表自然就没了。
+              -->
+              <span v-if="row.item.missing" class="missing-tag" title="本地文件已不在原位置">
+                文件丢失
+              </span>
             </div>
           </div>
 
@@ -119,11 +127,14 @@
           <div v-if="durationOf(row.item)" class="duration">{{ durationOf(row.item) }}</div>
 
           <!--
-            收藏（空心爱心 / 实心爱心）：只在视频列表里出现
-            点了立刻变实心，收藏项在重新搜索后会固定排在最前面
+            收藏（空心爱心 / 实心爱心）
+
+            出现的位置有两处：
+              - **候选视频列表**（MV）：收藏 = 「这首歌就播这条」的记忆；
+              - **OV 的主列表**：收藏 = 这个列表里的收藏，会置顶（同一套 `ord` 事务）。
           -->
           <div
-            v-if="!isSongList"
+            v-if="!isSongList || mode === 'ov'"
             class="fav"
             :class="{ on: isFav(row.item) }"
             :title="isFav(row.item) ? '取消收藏' : '收藏'"
@@ -144,7 +155,7 @@
         </li>
         <!-- 过滤之后一条都不剩：给个明确交代，别让人以为列表空了 -->
         <li v-if="rows.length === 0" class="empty">
-          {{ isSongList && keyword.trim() ? '没有匹配的歌曲' : '列表是空的' }}
+          {{ emptyText }}
         </li>
       </ul>
     </div>
@@ -178,12 +189,40 @@ export interface VideoListItem {
    * 所以到渲染层这里**只可能是数字**。
    */
   duration?: number | null;
+  /**
+   * 本地文件条目：文件此刻不在了
+   *
+   * 由主进程在读列表条目时顺手 `stat` 得出（**不落库**），只对 `lf_` 条目有意义。
+   * 主列表据此把那一行压暗并打标 —— 播到它之前就能看见。
+   */
+  missing?: boolean;
 }
 
 type ListItem = PlaylistSong | VideoListItem;
 
 const isVideoItem = (item: ListItem): item is VideoListItem =>
   typeof (item as VideoListItem).bvid === 'string';
+
+/**
+ * 两种「带 bvid 的条目」的公共字段视图
+ *
+ * 列表里可能混着两种形状，而且**都有 `bvid`**，所以 `isVideoItem` 分不开它们：
+ *  - **搜索结果**（`VideoListItem`）：`title` / `pic` / `author`；
+ *  - **视频列表条目**（`PlaylistSong`）：`name` / `cover` / `singer`（装的是 UP 主）。
+ *
+ * 取值时按「先搜索字段、再列表字段」的顺序回落，两个来源共用同一套展示逻辑 ——
+ * 否则视频列表那些行会显示空标题、空封面、空 UP 主（踩过）。
+ */
+type ListItemFields = {
+  title?: string
+  name?: string
+  pic?: string | null
+  cover?: string | null
+  author?: string | null
+  singer?: string
+}
+
+const fieldsOf = (item: ListItem): ListItemFields => item as unknown as ListItemFields
 
 /**
  * 时长文案（**秒 -> `mm:ss`**）
@@ -269,6 +308,27 @@ export default defineComponent({
       type: Array as () => string[],
       default: () => [],
     },
+    /**
+     * 当前 `songs` 是不是来自 **B 站视频列表**
+     *
+     * 只影响文案（搜索框写「标题 / UP 主」、刷新叫「重新同步列表」）——
+     * 条目的渲染字段两个来源本来就用同一套（`name` / `singer` / `cover`），
+     * 所以不需要第二套模板。
+     */
+    fromVideoList: {
+      type: Boolean,
+      default: false,
+    },
+    /**
+     * 当前工作区：`ov` / `mv`
+     *
+     * 决定**主列表里要不要显示爱心**（OV 的收藏挂在 `videolist_items` 上，
+     * 不在 `favorites` 那个「这首歌选哪个 bvid」的数组里）。
+     */
+    mode: {
+      type: String,
+      default: 'mv',
+    },
   },
   computed: {
     isSongList(): boolean {
@@ -301,6 +361,16 @@ export default defineComponent({
       }
       return `${this.list.length} 项`;
     },
+    /** 一条都没有时的提示（空库指向入口，过滤无结果只说没匹配） */
+    emptyText(): string {
+      if (this.isSongList && this.keyword.trim()) {
+        return this.mode === 'ov' ? '没有匹配的视频' : '没有匹配的歌曲';
+      }
+      if (this.mode === 'ov') {
+        return '这里还没有视频 —— 点左上角打开「视频管理」导入收藏夹，或新建一个本地列表';
+      }
+      return '列表是空的';
+    },
   },
   watch: {
     listType(val: string) {
@@ -329,7 +399,8 @@ export default defineComponent({
     },
     /** 歌名 / 视频标题 */
     nameOf(item: ListItem): string {
-      return isVideoItem(item) ? item.title : item.name;
+      const f = fieldsOf(item)
+      return f.title ?? f.name ?? '';
     },
     /** 纯文本标题（用于 title 提示与 alt） */
     plainTitleOf(item: ListItem): string {
@@ -346,16 +417,17 @@ export default defineComponent({
     },
     /** 歌手；视频项显示 UP 主 */
     singerOf(item: ListItem): string {
-      return isVideoItem(item) ? (item.author ?? '') : item.singer;
+      const f = fieldsOf(item)
+      return f.author ?? f.singer ?? '';
     },
-    /** 专辑名（仅歌单项有） */
+    /** 专辑名（只有音乐歌单的条目才有） */
     albumOf(item: ListItem): string {
       return isVideoItem(item) ? '' : (item.album ?? '');
     },
     /** 封面：歌单用平台专辑图，视频用 B 站缩略图 */
     coverOf(item: ListItem): string | null {
-      if (isVideoItem(item)) return normalizeImageUrl(item.pic);
-      return normalizeImageUrl(item.cover);
+      const f = fieldsOf(item)
+      return normalizeImageUrl(f.pic ?? f.cover);
     },
     /**
      * 时长文案（两种列表项都存在 `duration` 字段，所以不必分支）
@@ -379,10 +451,18 @@ export default defineComponent({
     bvidOf(item: ListItem): string {
       return isVideoItem(item) ? item.bvid : '';
     },
-    /** 这一项是不是已收藏 */
+    /** 这一项是不是已收藏
+     *
+     * 两个来源：
+     *  - MV 候选视频：`favorites`（这首歌选中的 bvid 列表）；
+     *  - OV 列表条目：条目自己的 `favorites` 标记（同一个 bvid 换个列表就不一样，
+     *    所以只能挂在条目上，不能挂在视频上）。
+     */
     isFav(item: ListItem): boolean {
       const bvid = this.bvidOf(item);
-      return !!bvid && this.favorites.includes(bvid);
+      if (!bvid) return false;
+      if (this.favorites.includes(bvid)) return true;
+      return (item as PlaylistSong).favorites === true;
     },
     /**
      * 左上角刷新
@@ -675,6 +755,21 @@ export default defineComponent({
 }
 .lists .album::before {
   content: '· ';
+}
+/* 本地文件失效：压暗整行 + 一个小红标（点进去仍会尝试播放，失败后弹重新定位） */
+.lists li.missing .index,
+.lists li.missing .title,
+.lists li.missing .cover {
+  opacity: 0.45;
+}
+.lists .missing-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 15px;
+  color: #fff;
+  background: var(--accent-danger);
 }
 .lists .duration {
   flex: none;

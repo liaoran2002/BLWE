@@ -25,10 +25,11 @@
  */
 import { app } from 'electron'
 import { createHash } from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 
 /** 库文件名（放在 userData 下，和 setting.json 同级） */
-const DB_FILE_NAME = 'blmv.db'
+const DB_FILE_NAME = 'blwe.db'
 
 // #region better-sqlite3 的最小类型声明
 // 只声明本项目真正调用的成员：prepare / exec / pragma / transaction / close。
@@ -96,13 +97,21 @@ const loadSqlite = (): SqliteConstructor => {
 /**
  * 建表语句
  *
- * **解析结果合在 `videos` 里，不再单独开表。**
+ * **解析结果按 bvid 独立成行（videos），「候选关系」另开一张表（song_videos）。**
  *
- * 曾经拆出过一张 `video_details`（按 bvid 唯一），理由是「同一个 bvid 被两个缓存键
- * 引用时地址会存两份」。但那个重复**很少见**，而拆表的代价是实打实的：每次查询都要
- * `LEFT JOIN`（还必须用 LEFT，用内连接会把没解析过的候选整批丢掉）、`clearAll` 要清
- * 三张表、补插一条记录要写两张表。解析结果拆成结构化字段之后列本来就多，
- * 再为它们单独开一张表、每次 join，收益更不划算，所以合回来。
+ * 这是本项目**第二次**做「实体 + 关系」的拆分（第一次是 songs vs playlist_songs）。
+ * 旧结构把两种生命周期塞在同一行里：
+ *   - `ord` / `favorites` / 带关键词高亮的 `title` 是**每首歌独立**的；
+ *   - `durl_url` / `dash_*` / `playurl_*` 只跟 **bvid** 有关。
+ * 于是同一个 bvid 出现在两首歌的候选里就要存两份 27KB 的 dash，过期还要刷两遍。
+ *
+ * 曾经也试过拆出 `video_details`（按 bvid 唯一）又合回来 —— 那时的理由是
+ * 「重复很少见」。这次必须拆，原因是新增的 **B 站视频列表**：
+ * 列表条目不再经过搜索，同一个 bvid 同时被「音乐候选」和「视频列表」引用是常态，
+ * 而删除其中一边的关系时**绝不能连带删掉另一边还在用的地址缓存**。
+ *
+ * 代价用**一个视图**（song_videos_view）抵掉：它的列名和顺序与旧 videos 逐字一致，
+ * 于是所有旧读路径（cache.ts 的列清单常量、六处纯读）都不用改。
  *
  * **为什么不再是整包 JSON**：原来 `view_result` / `playurl_result` 存的是接口原始响应。
  * - `view_result` **整个删掉**：它唯一的用途是取 `title` / `pic`，而这两列在
@@ -177,28 +186,48 @@ CREATE TABLE IF NOT EXISTS playlist_songs (
 -- 按 song_id 反查歌单（「这首歌在哪些歌单里」；也让删除/更新能走索引）
 CREATE INDEX IF NOT EXISTS idx_playlist_songs_song ON playlist_songs(song_id);
 
--- 每首歌的候选视频：搜索结果 + 收藏 + 顺序 + 解析结果
+-- 候选关系：哪首歌的候选里有它、排第几、收藏没有
 --
--- ## 'search_key' 存的是**歌名**（'歌名-歌手'），不是 'songs.id'
+-- ## 为什么和视频实体（videos）拆开
 --
--- 为什么不用 id：这张表要拿键**去 B站搜索**（'-' 会被换成空格），
--- 用 'tx_101104624' 那种 id 搜不出任何东西。
--- 而且搜索要的正是「歌名 + 歌手」，那本来就是这个键的内容。
+-- 旧表把两种生命周期混在一行里，看列就知道：
+--   - ord / favorites / title_hl 是「每首歌独立」的（A 歌里排第 3、B 歌里排第 7）；
+--   - 地址列（durl_url / dash_* / playurl_*）只跟 bvid 有关，跟哪首歌毫无关系。
+-- 于是同一个 bvid 在两首歌的候选里就要各存一份约 27KB 的 dash —— 拆开之后只存一份。
 --
--- 所以 'songs.id'（平台 id）与它**没有关系** —— id 只在 songs 表内部
--- 用来标识「同一首歌」，两张表各用各的键。
+-- 这和 songs（实体）vs playlist_songs（关系）是**同一个模式**，本项目第二次做这种拆分。
+--
+-- ## 'search_key' 有两种取值
+--
+--   1. 音乐搜索的「歌名-歌手」（'新地球-林俊杰'）；
+--   2. 直连条目的 'bv:<bvid>' —— B 站视频列表里的条目**本来就是视频**，
+--      这里给它留一行不是为了搜索，而是为了让「候选列表」这个抽象统一：
+--      api:searchSong 一看到 bv: 前缀就短路，直接返回这一条。
+CREATE TABLE IF NOT EXISTS song_videos (
+  search_key TEXT    NOT NULL,
+  bvid       TEXT    NOT NULL,
+  -- 列表顺序（0 起）；收藏项排在最前
+  ord        INTEGER NOT NULL DEFAULT 0,
+  favorites  INTEGER NOT NULL DEFAULT 0,
+  -- 带 <em class="keyword"> 关键词高亮的标题
+  --
+  -- 必须留在这一层：高亮是**每次搜索**的产物，同一个 bvid 被两首歌搜出来时
+  -- 该高亮两个不同的词，而 videos.title 全局只有一份。
+  title_hl   TEXT,
+  PRIMARY KEY (search_key, bvid)
+);
+
+-- 视频实体 + 播放地址缓存（bvid 全局唯一，一种数据只有一份）
+--
+-- 只放「这个视频本身是什么」和「怎么播它」，不放「它在谁的列表里排第几」。
 CREATE TABLE IF NOT EXISTS videos (
-  search_key     TEXT    NOT NULL,
-  bvid           TEXT    NOT NULL,
-  -- 列表顺序（0 起、连续）；收藏项排在最前
-  ord            INTEGER NOT NULL DEFAULT 0,
-  -- 展示字段（来自**搜索结果**，标题里带 <em class="keyword"> 关键词高亮，要留着）
+  bvid           TEXT PRIMARY KEY,
+  -- 干净标题（已去掉 <em class="keyword">）。带高亮的那份在 song_videos.title_hl
   title          TEXT,
   -- 封面来自 **view 响应**（搜索结果里的封面尺寸偏小）
   pic            TEXT,
   author         TEXT,
   duration       INTEGER,
-  favorites      INTEGER NOT NULL DEFAULT 0,
 
   -- ↓↓↓ 解析结果（dash / durl 播放地址）↓↓↓
   -- 渐进式 mp4 地址（durl 兜底通道，封顶 720P）；走 dash 时为 NULL
@@ -222,13 +251,15 @@ CREATE TABLE IF NOT EXISTS videos (
   --       已覆盖全部 12 档，每行存一份 JSON 纯属冗余）
   -- 这份**播放地址**是在什么登录态下取的：0 否 / 1 是 / **NULL 未知**
   -- （NULL 必须与 0 区分：未知 ≠ 未登录，当成 0 会导致每次解析都白重取一遍）
+  --
+  -- ⚠️ 拆表后它从 per-song 变成 per-bvid，这是**语义变化**（见 ARCHITECTURE 的取舍记录）：
+  -- 同一个 bvid 只保留最后一次取地址时的登录态。判断「要不要重取」时与当前登录态
+  -- 比较即可，粒度变粗但语义更简单。
   playurl_login_state INTEGER,
   -- 这次解析有没有试过 dash（试过但没拿到就别反复重取）
   dash_tried     INTEGER NOT NULL DEFAULT 0,
   -- 上面那批地址的写入时刻（过期判定）
-  playurl_at     INTEGER,
-
-  PRIMARY KEY (search_key, bvid)
+  playurl_at     INTEGER
 );
 
 -- 每首歌的元信息
@@ -244,30 +275,117 @@ CREATE TABLE IF NOT EXISTS song_meta (
   updated_at    INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_videos_key_ord ON videos(search_key, ord);
+-- 按 (search_key, ord) 取某首歌的候选列表（返回顺序就是显示顺序）
+CREATE INDEX IF NOT EXISTS idx_song_videos_key_ord ON song_videos(search_key, ord);
+-- 反查「这个视频出现在哪些搜索键 / 候选里」（收藏、清理、孤儿 GC 时用）
+CREATE INDEX IF NOT EXISTS idx_song_videos_bvid ON song_videos(bvid);
 -- 过期清理按 playurl_at 扫；这张表会随视频数一直长，没索引就得全表扫
 CREATE INDEX IF NOT EXISTS idx_videos_playurl_at ON videos(playurl_at);
 
--- 元数据视图：**不含任何地址列**
+-- 视频列表本身（B 站收藏夹 / 合集 / 系列 / 本地列表）
+--
+-- 与 playlists（音乐平台歌单）**并列**、互不干扰：那是「歌名-歌手 → 要搜索」，
+-- 这是「条目就是视频」，两条通道各自独立的表，共同的下游只有 videos。
+--
+-- kind = 'local' 是**本地列表**：没有远端来源、没有 source_id、不参与同步，
+-- 条目全靠用户「添加视频」一条条攒。它和收藏夹共用同一套播放 / 续播 / 壁纸链路，
+-- 区别只在「谁来喂条目」。
+CREATE TABLE IF NOT EXISTS videolists (
+  -- 'bv_fav_123456' / 'bv_season_789' / 'bv_series_456' / 'bv_local_xxxx'
+  id           TEXT PRIMARY KEY,
+  kind         TEXT    NOT NULL,          -- fav | season | series | local
+  source_id    TEXT,                      -- media_id / season_id / series_id
+  -- UP 主 mid：合集 / 系列的接口**必须带**它，收藏夹不需要。
+  -- 存在这里是因为「重新同步」时要重新打接口，而那时用户不会再给一次链接。
+  mid          TEXT,
+  name         TEXT    NOT NULL,
+  cover        TEXT,
+  item_count   INTEGER,
+  -- 重新同步的策略（**不是**音乐那边的 sync_interval_ms）
+  sync_mode    TEXT    NOT NULL DEFAULT 'off',   -- off | manual
+  last_sync_at INTEGER,
+  -- 播到第几条（下标）。必须持久化：条目增删后要靠 bvid 重定位（见 utils/videolist.ts）
+  last_index   INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+-- 列表成员 + 顺序
+--
+-- 为什么不能把 ord 塞进 videos：同一个视频可以同时在两个收藏夹、两个合集、
+-- 以及一份音乐歌单里（B 站允许，且很常见）。videos 一行只能记一个 ord。
+-- 这和 playlist_songs、song_videos 是同一个模式（第三次出现）。
+--
+-- ## 主键是 (list_id, bvid)，**不含 ord**
+--
+-- 置顶（收藏 / 手动添加）的做法和音乐歌单那边「添加视频」完全一样：
+-- 事务里把别人的 ord + 1、自己写 0。如果 ord 参与主键，那个 ord = ord + 1
+-- 会**逐行撞唯一约束**（SQLite 是立即检查，不是语句结束才查），
+-- 于是每加一条都要先改成负数再改回来 —— 纯粹是给自己找麻烦。
+--
+-- 同理「一个视频在一个列表里只出现一次」本来就是事实，
+-- 用 (list_id, bvid) 当主键正好把这条约束交给数据库，不用在代码里查重。
+CREATE TABLE IF NOT EXISTS videolist_items (
+  list_id    TEXT    NOT NULL,
+  bvid       TEXT    NOT NULL,
+  -- 显示顺序（0 起、连续）。**置顶区在前**，见下面的 favorites / origin
+  ord        INTEGER NOT NULL DEFAULT 0,
+  -- 收藏：1 = 在置顶区。同步时**保留**，不会被远端顺序冲掉
+  favorites  INTEGER NOT NULL DEFAULT 0,
+  -- 来源：sync = 从 B 站拉的；local = 用户手动添加的。
+  -- 同步时 local 一律保留 —— B 站上没有它，删了就再也找不回来
+  origin     TEXT    NOT NULL DEFAULT 'sync',
+  -- 加入 / 置顶的时刻（同一秒内连续操作时的稳定排序依据）
+  added_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (list_id, bvid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_videolist_items_bvid ON videolist_items(bvid);
+
+-- 视图：把两张表还原成旧 videos 表的 15 列形状
+--
+-- 这是「旧读路径一行不用改」的关键：列名和顺序与旧 videos 逐字一致，
+-- 于是 cache.ts 顶部那两个列清单常量（VIDEO_COLUMNS / META_COLUMNS）不用动。
+--
+-- 用 LEFT JOIN 而不是 INNER JOIN：某个 song_videos 行对应的 videos 行因为任何原因
+-- 不存在时（迁移中断、手工清过表），INNER JOIN 会让这条候选**从列表里消失**，
+-- 用户看到的是「我收藏的视频没了」。LEFT JOIN 下它仍然出现，只是地址和封面为 NULL，
+-- 下次解析会自动补回来 —— 退化成「没缓存」，而不是「消失」。
+--
+-- 视图**只承担读**：SQLite 会拒绝 UPDATE 一个视图（除非有 INSTEAD OF 触发器），
+-- 写操作必须落到两张基表。这反而是个保护：不会有人误以为改视图就改了基表。
+CREATE VIEW IF NOT EXISTS song_videos_view AS
+  SELECT sv.search_key,
+         sv.bvid,
+         sv.ord,
+         COALESCE(sv.title_hl, v.title) AS title,
+         v.pic,
+         v.author,
+         v.duration,
+         sv.favorites,
+         v.durl_url,
+         v.dash_video,
+         v.dash_audio,
+         v.dash_duration,
+         v.playurl_login_state,
+         v.dash_tried,
+         v.playurl_at
+    FROM song_videos sv
+    LEFT JOIN videos v ON v.bvid = sv.bvid;
+
+-- 元数据视图：**不含任何地址列**，改从上面那个视图取（列与旧版逐字一致）
 --
 -- 为什么需要它（实测数据）：一行候选的 dash_video + dash_audio 约 27 KB
 -- （10 档视频轨 + 每档 4 个 backupUrl，签名参数很长），300 行候选就是 7.5 MB。
 -- 而绝大多数读（列候选、合并收藏项、给渲染层的整包）**只要元数据** ——
 -- 读全列要 9.6 ms，只读这个视图 0.64 ms，差 15 倍。
 --
--- 视图在这里是「查询重写」而不是物化，SQLite 不会去读没被引用的列，
--- 所以它和手写列清单一样快（实测差 0.07 ms，噪声级），但调用方不用记列清单、
--- 加列时也不用改多处 SQL。
---
--- **「全部列」不需要再建一个视图** —— 那就是基表本身，包一层只是多余。
--- 需要地址的地方（解析前读地址）直接查基表。
---
--- 另一个好处：视图**默认只读**（SQLite 会拒绝 UPDATE 一个视图），
--- 写操作只能走明确的 UPDATE，避免有人误用视图改基表。
+-- 视图在这里是「查询重写」而不是物化，SQLite 不会去读没被引用的列。
+-- 视图套视图 SQLite 支持，且不物化、不多读列。
 CREATE VIEW IF NOT EXISTS videos_meta AS
   SELECT search_key, bvid, ord, title, pic, author, duration, favorites,
          playurl_login_state, dash_tried, playurl_at
-    FROM videos;
+    FROM song_videos_view;
 `
 
 /**
@@ -322,7 +440,149 @@ const schemaFingerprint = (): number => {
   return hash.readUInt32BE(0) & 0x7fffffff
 }
 
+/**
+ * 旧库判据：旧 `videos` 有 `search_key` 列，新库没有
+ *
+ * ⚠️ **这个判断必须在执行 `CREATE_TABLES_SQL` 之前做。**
+ * 新 DDL 是 `CREATE TABLE IF NOT EXISTS videos` —— 旧表存在时它什么都不做，
+ * 于是「有 search_key 的旧 videos」和「本该是 bvid 主键的新 videos」会共存，
+ * 之后所有查询都错，而且是那种「看起来能跑、数据不对」的错。
+ *
+ * 判断用列而不是 `user_version`：指纹会随 DDL 变化，旧库的指纹值不可预测；
+ * 而「有没有 search_key 列」是结构事实。
+ */
+const hasLegacyVideos = (database: SqliteDatabase): boolean => {
+  try {
+    const cols = database.prepare(`PRAGMA table_info(videos)`).all() as Array<{ name?: string }>
+    return cols.some((col) => col.name === 'search_key')
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 实体表：同一个 bvid 在旧表里可能有多行（每首歌一行），只能留一行
+ *
+ * 挑选优先级：**有 dash 的优先**，其次 `playurl_at` 新的。
+ * 不能只按 `playurl_at` 取 MAX —— 旧表里完全可能存在一行「有地址但 playurl_at 为 NULL」
+ * （早期版本写的、或者清过时间戳），那样它永远比不过任何带时间戳的行，
+ * 结果是「明明有 dash 却被丢掉，下次播放还得重新解析」。
+ */
+const MIGRATE_VIDEOS_SQL = `
+INSERT OR REPLACE INTO videos
+  (bvid, title, pic, author, duration,
+   durl_url, dash_video, dash_audio, dash_duration,
+   playurl_login_state, dash_tried, playurl_at)
+SELECT v.bvid,
+       -- 干净标题：去掉搜索高亮标签。带标签的那份进 song_videos.title_hl
+       NULLIF(REPLACE(REPLACE(v.title, '<em class="keyword">', ''), '</em>', ''), ''),
+       v.pic, v.author, v.duration,
+       v.durl_url, v.dash_video, v.dash_audio, v.dash_duration,
+       v.playurl_login_state,
+       v.dash_tried,
+       -- playurl_at 取「该 bvid 在所有旧行里最新的那个」，不能只用选中那一行的：
+       -- 照搬 NULL 的话，迁移后第一次 clearExpiredPlayurl 会把它当成
+       -- 「不知道什么时候取的」直接清掉 —— 表现为「升级后第一次播放全部重新解析」
+       COALESCE(v.playurl_at,
+                (SELECT MAX(r.playurl_at) FROM videos_old r WHERE r.bvid = v.bvid))
+  FROM videos_old v
+ WHERE v.rowid = (
+         SELECT r.rowid FROM videos_old r
+          WHERE r.bvid = v.bvid
+          ORDER BY (r.dash_video IS NULL), COALESCE(r.playurl_at, 0) DESC
+          LIMIT 1
+       );
+`
+
+/** 关系表：ord / favorites / 高亮标题逐行搬，一行都不能少 */
+const MIGRATE_SONG_VIDEOS_SQL = `
+INSERT OR REPLACE INTO song_videos (search_key, bvid, ord, favorites, title_hl)
+SELECT search_key, bvid, ord, favorites, title FROM videos_old;
+`
+
+/**
+ * 一次性迁移：把旧 videos（search_key + bvid 复合主键）拆成 videos + song_videos
+ *
+ * ## 为什么不能靠指纹重建
+ *
+ * 指纹机制在指纹不匹配时会**清库重建**（见下面的 migrateSchema）。
+ * 而这次是**真·改结构**，用户库里有真实的歌单与收藏 —— 清库等于把用户数据删了。
+ *
+ * ## 步骤顺序不能改
+ *
+ * 1. checkpoint + 备份（WAL 里可能还有没落盘的数据，先 checkpoint 再复制才完整）；
+ * 2. `ALTER TABLE videos RENAME TO videos_old` —— 只改名，不动数据；
+ * 3. 删掉旧视图（ALTER RENAME 会把视图定义里的 videos 改成 videos_old，
+ *    `CREATE VIEW IF NOT EXISTS` 就不会覆盖它们）；
+ * 4. 执行 `CREATE_TABLES_SQL` 建新表 + 两个视图；
+ * 5. 搬数据；
+ * 6. `DROP TABLE videos_old`；
+ * 7. **最后**写指纹。顺序反了下次启动会判定「版本一致」而跳过迁移，
+ *    或者反过来再重建一次把刚迁好的数据清掉。
+ *
+ * 为什么不建 videos_new 再 DROP + RENAME：那样 schema 就有两份定义
+ * （一份在 CREATE_TABLES_SQL、一份在迁移脚本里），以后改一个列要记得改两处。
+ * **改名让位**只需要维护一份 DDL。
+ */
+const migrateVideosSplit = (database: SqliteDatabase, file: string): void => {
+  // WAL 里可能还有没写进主库的数据；checkpoint 之后再复制备份才是完整的库
+  try {
+    database.pragma('wal_checkpoint(TRUNCATE)')
+  } catch (err) {
+    console.warn('[db] 迁移前 checkpoint 失败（继续）:', err)
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const backup = `${file}.bak-${stamp}`
+  try {
+    fs.copyFileSync(file, backup)
+    console.log(`[db] 拆表迁移：已备份数据库到 ${backup}`)
+  } catch (err) {
+    // 备份失败不阻断迁移（否则用户永远升不上去），但必须让人看见这条日志
+    console.error('[db] 拆表迁移：备份失败，继续迁移（请手工备份 blwe.db）', err)
+  }
+
+  const run = database.transaction(() => {
+    database.exec(`ALTER TABLE videos RENAME TO videos_old`)
+    database.exec(`DROP VIEW IF EXISTS videos_meta`)
+    database.exec(`DROP VIEW IF EXISTS song_videos_view`)
+    database.exec(CREATE_TABLES_SQL)
+    database.exec(MIGRATE_VIDEOS_SQL)
+    database.exec(MIGRATE_SONG_VIDEOS_SQL)
+    database.exec(`DROP TABLE videos_old`)
+    database.pragma(`user_version = ${schemaFingerprint()}`)
+  })
+
+  try {
+    run()
+    const videos = (
+      database.prepare(`SELECT COUNT(*) AS n FROM videos`).get() as { n: number } | undefined
+    )?.n
+    const relations = (
+      database.prepare(`SELECT COUNT(*) AS n FROM song_videos`).get() as { n: number } | undefined
+    )?.n
+    console.log(
+      `[db] 拆表迁移完成：videos ${videos ?? 0} 行（按 bvid 去重）、song_videos ${relations ?? 0} 行`,
+    )
+  } catch (err) {
+    // 事务已回滚：videos_old 还在，库仍是旧结构，下次启动会再试一次
+    console.error('[db] 拆表迁移失败，已回滚（仍是旧结构，下次启动重试）:', err)
+    throw err
+  }
+}
+
 const migrateSchema = (database: SqliteDatabase): void => {
+  /**
+   * ① 先处理「旧 videos 结构」
+   *
+   * 必须在 `CREATE_TABLES_SQL` 之前：`CREATE TABLE IF NOT EXISTS videos`
+   * 遇到旧表什么都不做，两者共存之后所有查询都会错。
+   */
+  if (hasLegacyVideos(database)) {
+    migrateVideosSplit(database, getDbPath())
+    return
+  }
+
   const stored = Number(database.pragma('user_version', { simple: true })) || 0
   const wanted = schemaFingerprint()
 
@@ -345,7 +605,7 @@ const migrateSchema = (database: SqliteDatabase): void => {
    *  - 逐字段搬运要处理「旧列可能不存在 / 类型变了 / 要重新拆」三种情况，
    *    出错面远比"丢掉重来"大，收益只是省几次重新解析。
    *
-   * 副作用：**收藏、顺序、选中视频、歌单会一起清掉**。要保留就先备份 `blmv.db`。
+   * 副作用：**收藏、顺序、选中视频、歌单会一起清掉**。要保留就先备份 `blwe.db`。
    */
   console.warn('[db] 表结构已变更（指纹不匹配），重建数据库（数据会清空）')
   /**
@@ -426,6 +686,41 @@ export const getDb = (): SqliteDatabase => {
   }
 
   return db
+}
+
+/**
+ * 清掉没人引用的 `videos` 行（孤儿 GC）
+ *
+ * ## 为什么需要它
+ *
+ * 拆表后「删掉某首歌的候选」只删 `song_videos` 的关系行，`videos` 里的实体
+ * **不能跟着删** —— 它可能正被另一个搜索键、或某个 `videolist_items` 引用。
+ * 于是那些真的没人用的行会一直留着（每行最多 27KB 的 dash）。
+ *
+ * ## ⚠️ 必须同时看两张引用表
+ *
+ * 只看 `song_videos` 会把**视频列表正在用的地址缓存**删掉：B 站列表条目
+ * 在 `song_videos` 里有 `bv:<bvid>` 一行，但那个关系可能在「清空缓存」或
+ * 「重新同步」时被清过，而 `videolist_items` 仍然引用着它。
+ *
+ * 频率不用高（`cache.prune()` 里顺手跑一次），代价是一次全表扫。
+ */
+export const gcOrphanVideos = (): number => {
+  try {
+    const result = getDb()
+      .prepare(
+        `DELETE FROM videos
+          WHERE bvid NOT IN (SELECT bvid FROM song_videos)
+            AND bvid NOT IN (SELECT bvid FROM videolist_items)`,
+      )
+      .run()
+    const changed = Number(result.changes) || 0
+    if (changed > 0) console.log(`[db] 已清理 ${changed} 条没有引用的视频实体`)
+    return changed
+  } catch (err) {
+    console.error('[db] 清理孤儿视频失败:', err)
+    return 0
+  }
 }
 
 /**

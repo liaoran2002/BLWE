@@ -28,8 +28,8 @@
         </div>
       </div>
 
-      <div class="ab-title">BiLiMusicVideo(简称:BLMV)</div>
-      <div class="ab-desc">把音乐歌单变成 B 站视频播放列表的桌面播放器</div>
+      <div class="ab-title">BiLiWallpaperEngine(简称:BLWE)</div>
+      <div class="ab-desc">把 B 站视频列表 / 音乐歌单铺到桌面当壁纸的播放器</div>
 
       <div class="ab-link" title="用系统浏览器打开" @click="openRepo">
         https://github.com/liaoran2002/BiLiMusicVideo

@@ -141,12 +141,20 @@ export interface RendererAPI {
     audioQualityDesc?: string | null
     /** 这个视频当前可选的清晰度 / 音质 */
     options?: import('./ipc').QualityOptionsPayload | null
+    /** 这条是不是本地视频文件（渲染层据此决定失败时弹「重新定位」） */
+    isLocal?: boolean
+    /** 机器可读错误码（`LOCAL_MISSING` = 本地文件不存在），文案在 `error` 里 */
+    code?: 'LOCAL_MISSING' | 'AUTH_FAILED'
+    /** 错误细节（本地文件丢失时是原本的绝对路径） */
+    detail?: string
     error?: string
   }>
   /** 解析各大音乐平台的歌单分享链接（移植自 LX 的 musicSdk） */
   getPlaylistDetail: (
     params: import('./musicSdk').GetPlaylistDetailParams,
   ) => Promise<import('./ipc').IpcChannelMap['music:getPlaylistDetail']['result']>
+  /** 拖入歌单链接：导入（已有则同步）并设为当前 —— 会写库 */
+  importMusicPlaylist: (url: string) => Promise<import('./ipc').IpcChannelMap['music:importPlaylist']['result']>
   // #endregion
 
   // #region 歌单 / 缓存
@@ -163,6 +171,89 @@ export interface RendererAPI {
   getCacheStats: () => Promise<import('./cache_stats').CacheStats>
   /** 手动触发一次过期清理（只清播放地址，不删行） */
   pruneCache: () => Promise<import('./cache_stats').CacheStats>
+  // #endregion
+
+  // #region B 站视频列表（收藏夹 / 合集 / 系列）
+  /** 识别用户粘贴的链接是哪种列表（失败返回 null） */
+  parseListInput: (text: string) => Promise<import('./playlist').ParsedListInput | null>
+  /** 拖入识别：音乐歌单 / B 站列表 / 单条视频 / 没认出来（不联网、不写库） */
+  classifyDrop: (text: string) => Promise<import('./playlist').DropInputTarget>
+  /** 「我创建的收藏夹」——导入弹窗里的选集入口（需要登录；`cover` 给封面网格用） */
+  fetchMyFavFolders: () => Promise<
+    Array<{ id: string; title: string; count: number; cover: string | null }>
+  >
+  /** 「订阅合集」（我收藏的别人做的合集；需要登录） */
+  fetchMySubLists: () => Promise<
+    Array<{
+      kind: 'season' | 'series'
+      id: string
+      mid: string
+      title: string
+      count: number
+      cover: string | null
+    }>
+  >
+  /** 全部视频列表 */
+  getVideoLists: () => Promise<import('./playlist').VideoListRecord[]>
+  /** 导入一个列表（内部拉取 + 落库，几百条会跑几秒） */
+  addVideoList: (input: {
+    kind: import('./playlist').VideoListKind
+    sourceId: string
+    mid?: string
+  }) => Promise<{
+    record: import('./playlist').VideoListRecord
+    skipped: number
+    /** 库里原来就有这个列表（这次走的其实是同步） */
+    existed: boolean
+  }>
+  removeVideoList: (id: string) => Promise<boolean>
+  /** 新建本地列表（名字为空时自动叫「本地列表」「本地列表2」…） */
+  createLocalVideoList: (name?: string) => Promise<import('./playlist').VideoListRecord>
+  /** 给列表改名 */
+  renameVideoList: (id: string, name: string) => Promise<boolean>
+  /** 「添加视频」：解析链接 / BV 号后插到列表最前（置顶区） */
+  addVideoListItem: (id: string, input: string) => Promise<import('./playlist').VideoListItem>
+  /** 拖入单条视频：放进**默认列表**（没有就现建），返回落点供播放 */
+  addVideoItemToDefault: (
+    input: string,
+  ) => Promise<import('./ipc').IpcChannelMap['videolists:addItemToDefault']['result']>
+  /** 拖入本地视频文件：登记 + 挂进默认列表（条目带 `url`，供探针与起播） */
+  importLocalVideoFiles: (
+    paths: string[],
+  ) => Promise<import('./ipc').IpcChannelMap['videolists:importLocal']['result']>
+  /**
+   * 拖进来的 `File` → 真实磁盘路径（Electron 32 起 `File.path` 已移除）
+   *
+   * **同步**、无 IPC：preload 内部查一下拖拽数据里的系统路径。
+   * 拿不到返回空串，调用方当「没认出」处理。
+   */
+  getPathForFile: (file: File) => string
+  /** 从列表里删掉一条 */
+  removeVideoListItem: (id: string, bvid: string) => Promise<boolean>
+  /** 收藏 / 取消收藏（收藏 = 置顶；取消收藏位置不动） */
+  setVideoListItemFavorite: (id: string, bvid: string, favorite: boolean) => Promise<void>
+  /** 重新同步列表（`last_index` 会按 bvid 重定位，当前播放的仍是原来那条） */
+  syncVideoList: (id: string) => Promise<import('./playlist').VideoListSyncResult>
+  /** 取列表条目（已在库里，不联网） */
+  getVideoListItems: (id: string) => Promise<import('./playlist').VideoListItem[]>
+  /** 记录播到第几条 */
+  setVideoListIndex: (id: string, index: number) => Promise<void>
+  // #endregion
+
+  // #region 本地视频文件（丢了之后怎么救）
+  /** 弹系统对话框选一个视频文件；用户取消返回空串（不是错误） */
+  pickLocalVideo: (currentPath?: string) => Promise<string>
+  /**
+   * 重新定位某条本地视频
+   *
+   * 只改路径、**bvid 不变**：列表顺序、收藏、续播位置都原样保留。
+   */
+  relocateLocalVideo: (
+    bvid: string,
+    newPath: string,
+  ) => Promise<import('./ipc').IpcChannelMap['local:relocate']['result']>
+  /** 文件此刻还在不在（用于区分「文件丢了」和「解码不支持」） */
+  localVideoExists: (bvid: string) => Promise<{ exists: boolean; filePath: string | null }>
   // #endregion
 
   // #region 窗口

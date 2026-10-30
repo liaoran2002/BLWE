@@ -10,7 +10,7 @@
  *     这样安装版和便携版会共用同一份配置 / 歌单，换版本不会「数据不见了」。
  *  2. 否则，如果这是 electron-builder 打出来的**便携版**
  *     （运行时带 `PORTABLE_EXECUTABLE_DIR` 环境变量）->
- *     在 exe 同级建一个 `blmvdata` 目录，数据跟着程序走。
+ *     在 exe 同级建一个 `blwedata` 目录，数据跟着程序走。
  *  3. 再否则（安装版且是全新环境）-> 用默认的 `%APPDATA%/<应用名>`。
  *
  * 判断「已经有数据」看的是我们自己的文件（setting.json / playlists.json / search-cache），
@@ -25,12 +25,13 @@ import path from 'node:path'
  * 便携版数据目录名
  *
  * 早期版本叫 `data`，太通用的名字放在 exe 同级容易和别的软件撞
- * （用户把好几个绿色版丢一个文件夹里就冲突了），所以改成 `blmvdata` 做区分。
+ * （用户把好几个绿色版丢一个文件夹里就冲突了），所以改成带前缀的目录名做区分。
+ * 项目从 BLWE 起，目录名统一用 `blwedata`。
  *
- * 注意：**不做旧目录迁移**。旧版本留下的 `data/` 原样放着不动 ——
- * 应用只认 `blmvdata/`，不会再读写那个旧目录。
+ * 注意：**不做旧目录迁移**。老版本留下的数据目录原样放着不动 ——
+ * 应用只认 `blwedata/`，不会再读写它。
  */
-const PORTABLE_DATA_DIR_NAME = 'blmvdata'
+const PORTABLE_DATA_DIR_NAME = 'blwedata'
 
 /** 当前是否在用便携目录 */
 let portable = false
@@ -38,12 +39,12 @@ let portable = false
 /**
  * 我们自己的数据文件名 / 目录名：任意一个存在就算「这里已经有数据」
  *
- * `blmv.db` 必须在列表里 —— 换成 SQLite 之后**真正承载用户数据的就是它**
+ * `blwe.db` 必须在列表里 —— 换成 SQLite 之后**真正承载用户数据的就是它**
  * （歌单、收藏、选中视频）。漏掉的话，一个「只有库文件」的目录会被判成「没有数据」，
  * 便携版就会去 exe 同级再建一个空库，用户看到的是「歌单全没了」。
  */
 const DATA_MARKERS = [
-  'blmv.db',
+  'blwe.db',
   'setting.json',
   'playlists.json',
   'playlist.json',

@@ -12,6 +12,7 @@ import { registerWindowHandlers } from './ipc/window'
 import { registerAuthHandlers } from './ipc/auth'
 import { registerApiHandlers } from './ipc/biliApiHandlers'
 import { registerPlaylistHandlers } from './ipc/playlist'
+import { registerVideoListHandlers } from './ipc/videolists'
 import { registerCacheHandlers } from './ipc/cache'
 import { registerMusicHandlers } from './ipc/music'
 import { registerWallpaperHandlers } from './ipc/wallpaper'
@@ -75,6 +76,9 @@ export const registerIpcHandlers = (context: IpcContext): void => {
 
   // 歌单
   registerPlaylistHandlers()
+
+  // B 站视频列表（收藏夹 / 合集 / 系列）
+  registerVideoListHandlers()
 
   // 音乐平台歌单解析（移植自 LX 的 musicSdk）
   registerMusicHandlers()

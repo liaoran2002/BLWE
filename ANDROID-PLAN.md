@@ -3,7 +3,7 @@
 > **状态：调研结论，未开始实施。**
 >
 > 本文是一次架构调研的存档，回答一个问题：
-> **「BLMV 能不能再做一个 Android 手机 / TV 端，功能全复刻、UI 按手机重设计？」**
+> **「BLWE 能不能再做一个 Android 手机 / TV 端，功能全复刻、UI 按手机重设计？」**
 >
 > 结论是**能**，路线是 **Kotlin 原生（Compose + ExoPlayer）**。
 > 本文记录评估依据、复用清单、风险与分期步骤 —— 供将来真要动手时直接拿来用。
@@ -180,7 +180,7 @@ App.vue                 3692    203     3070    411
 SettingsDialog.vue      1418    450      723    237
 PlaylistManager.vue      902    229      373    292
 showList.vue             718    150      303    257
-biliVideoControls.vue    709    203      215    283
+VideoControls.vue    709    203      215    283
 AddVideoDialog.vue       248     72       88     80
 AboutDialog.vue          148     39       36     65
 PlaylistPanel.vue         68     13       15     32
@@ -196,7 +196,7 @@ PlaylistPanel.vue         68     13       15     32
 | 桌面 UI | 行数 | 手机端 | 为什么 |
 | :--- | ---: | ---: | :--- |
 | `App.vue` 模板 | 203 | ~600 | 标题栏→顶栏、控制栏→底部条、全屏→沉浸式 |
-| `biliVideoControls.vue` | 709 | ~700 | 进度条/音量/清晰度角标 → 手机版交互 |
+| `VideoControls.vue` | 709 | ~700 | 进度条/音量/清晰度角标 → 手机版交互 |
 | `showList.vue` | 718 | ~650 | 视频列表 → 底部抽屉 / 独立列表页 |
 | `PlaylistManager.vue` | 902 | ~800 | **功能全复刻**：切/增/删/改名/同步/曲目浏览/曲目搜索 |
 | `SettingsDialog.vue` | 1418 | ~1100 | **功能全复刻，但导航模型必须改**（见下） |

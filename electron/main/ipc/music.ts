@@ -21,6 +21,7 @@
 import { mainHandle } from '@common/mainIpc'
 import { resolvePlaylist } from '../music'
 import { toPlaylistSongs } from '../utils/playlist'
+import { importMusicPlaylist } from '../utils/playlistImport'
 import { playlistKey } from '@common/types/playlist'
 
 export const registerMusicHandlers = (): void => {
@@ -54,4 +55,13 @@ export const registerMusicHandlers = (): void => {
       id,
     }
   })
+
+  /**
+   * 拖入一个音乐歌单链接 = 导入 + 设为当前
+   *
+   * 和上面的 `getPlaylistDetail` 不一样的地方：它**会写库**（已有则只刷新曲目）。
+   * 分成两个通道是为了让「弹窗里填链接」那条老路径继续只读 —— 那边用户还要
+   * 在表单里改名 / 调同步策略，导入时机由他自己点「保存」决定。
+   */
+  mainHandle('music:importPlaylist', ({ url }) => importMusicPlaylist(url))
 }

@@ -60,14 +60,25 @@
         </div>
 
         <div class="plm-side-actions">
-          <el-button size="small" type="primary" @click="startCreate">新建歌单</el-button>
-          <el-button
-            size="small"
-            :disabled="store.playlists.length === 0 || store.isSyncing"
-            :loading="store.isSyncing"
-            @click="syncAll"
-          >
-            全部同步
+          <div class="plm-side-row">
+            <el-button size="small" type="primary" @click="startCreate">新建歌单</el-button>
+            <el-button
+              size="small"
+              :disabled="store.playlists.length === 0 || store.isSyncing"
+              :loading="store.isSyncing"
+              @click="syncAll"
+            >
+              全部同步
+            </el-button>
+          </div>
+          <!--
+            切换工作区：点它 = 切到 OV 模式并打开「视频管理」
+
+            放在这一排按钮**下面**（用户要求）：上面两个是「歌单管理」自己的动作，
+            这个是「换个管理器」，语义不同，不该混在同一排里。
+          -->
+          <el-button class="plm-side-switch" size="small" @click="$emit('openVideoLists')">
+            视频管理 →
           </el-button>
         </div>
       </div>
@@ -266,7 +277,7 @@ export default defineComponent({
     /** 当前播放到第几首（仅当展示的是当前歌单时有意义） */
     currentIndex: { type: Number, default: -1 },
   },
-  emits: ['update:modelValue', 'switch', 'play', 'reload'],
+  emits: ['update:modelValue', 'switch', 'play', 'reload', 'openVideoLists'],
   data() {
     return {
       SYNC_INTERVAL_OPTIONS,
@@ -703,9 +714,15 @@ export default defineComponent({
 }
 .plm-side-actions {
   display: flex;
+  /* 竖排：上面一行是歌单自己的动作，下面一行是「切到视频管理」 */
+  flex-direction: column;
   gap: 6px;
   padding-top: 10px;
   border-top: 1px solid var(--panel-divider);
+}
+.plm-side-row {
+  display: flex;
+  gap: 6px;
 }
 .plm-side-actions :deep(.el-button) {
   flex: 1;

@@ -12,7 +12,7 @@
  *
  * 因此渲染进程侧不再需要手写一层 any 转发（见 src/api/electron.ts）。
  */
-import { contextBridge } from 'electron'
+import { contextBridge, webUtils } from 'electron'
 import { rendererInvoke, rendererOn } from '@common/rendererIpc'
 import type {
   AppSetting,
@@ -31,6 +31,12 @@ import type {
   PlaylistSaveParams,
   PlaylistStoreData,
   SyncResult,
+  DropInputTarget,
+  ParsedListInput,
+  VideoListKind,
+  VideoListItem,
+  VideoListRecord,
+  VideoListSyncResult,
 } from '@common/types/playlist'
 import type { CacheStats } from '@common/types/cache_stats'
 
@@ -126,6 +132,9 @@ const api = {
     params: GetPlaylistDetailParams,
   ): Promise<IpcChannelMap['music:getPlaylistDetail']['result']> =>
     rendererInvoke('music:getPlaylistDetail', params),
+  /** 拖入歌单链接：导入（已有则同步）并设为当前 —— 会写库 */
+  importMusicPlaylist: (url: string): Promise<IpcChannelMap['music:importPlaylist']['result']> =>
+    rendererInvoke('music:importPlaylist', { url }),
   // #endregion
 
   // #region 歌单 / 缓存
@@ -138,6 +147,96 @@ const api = {
   clearCache: (): Promise<boolean> => rendererInvoke('cache:clearAll'),
   getCacheStats: (): Promise<CacheStats> => rendererInvoke('cache:getStats'),
   pruneCache: (): Promise<CacheStats> => rendererInvoke('cache:prune'),
+  // #endregion
+
+  // #region B 站视频列表（收藏夹 / 合集 / 系列）
+  parseListInput: (text: string): Promise<ParsedListInput | null> =>
+    rendererInvoke('api:parseListInput', { text }),
+  /** 拖入识别：音乐歌单 / B 站列表 / 单条视频 / 没认出来（不联网、不写库） */
+  classifyDrop: (text: string): Promise<DropInputTarget> =>
+    rendererInvoke('api:classifyDrop', { text }),
+  fetchMyFavFolders: (): Promise<
+    Array<{ id: string; title: string; count: number; cover: string | null }>
+  > => rendererInvoke('api:myFavFolders'),
+  /** 「订阅合集」：我收藏的合集（主进程只回 `type = 21` 的那些） */
+  fetchMySubLists: (): Promise<
+    Array<{
+      kind: 'season' | 'series'
+      id: string
+      mid: string
+      title: string
+      count: number
+      cover: string | null
+    }>
+  > => rendererInvoke('api:mySubLists'),
+  getVideoLists: (): Promise<VideoListRecord[]> => rendererInvoke('videolists:list'),
+  addVideoList: (input: {
+    kind: VideoListKind
+    sourceId: string
+    mid?: string
+  }): Promise<{ record: VideoListRecord; skipped: number; existed: boolean }> =>
+    rendererInvoke('videolists:add', input),
+  removeVideoList: (id: string): Promise<boolean> =>
+    rendererInvoke('videolists:remove', { id }),
+  createLocalVideoList: (name?: string): Promise<VideoListRecord> =>
+    rendererInvoke('videolists:createLocal', { name }),
+  renameVideoList: (id: string, name: string): Promise<boolean> =>
+    rendererInvoke('videolists:rename', { id, name }),
+  addVideoListItem: (id: string, input: string): Promise<VideoListItem> =>
+    rendererInvoke('videolists:addItem', { id, input }),
+  /** 拖入单条视频：放进默认列表（没有就现建），返回落点供播放 */
+  addVideoItemToDefault: (
+    input: string,
+  ): Promise<IpcChannelMap['videolists:addItemToDefault']['result']> =>
+    rendererInvoke('videolists:addItemToDefault', { input }),
+  /**
+   * 拖入本地视频文件：登记 + 挂进默认列表，返回带 `url` 的条目供探针与起播
+   */
+  importLocalVideoFiles: (
+    paths: string[],
+  ): Promise<IpcChannelMap['videolists:importLocal']['result']> =>
+    rendererInvoke('videolists:importLocal', { paths }),
+  /**
+   * 拖进来的 `File` → 真实磁盘路径
+   *
+   * **必须走 preload 的 `webUtils`**：Electron 32 起 `File.path` 已被移除
+   * （安全考虑），渲染层拿到的 File 上没有任何路径信息。
+   *
+   * 这个函数是**同步**的、也没有 IPC —— `webUtils.getPathForFile` 只是查一下
+   * 拖拽数据里那条系统路径，不跨进程。失败返回空串，调用方按「没认出」处理。
+   */
+  getPathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file) || ''
+    } catch {
+      return ''
+    }
+  },
+  removeVideoListItem: (id: string, bvid: string): Promise<boolean> =>
+    rendererInvoke('videolists:removeItem', { id, bvid }),
+  setVideoListItemFavorite: (id: string, bvid: string, favorite: boolean): Promise<void> =>
+    rendererInvoke('videolists:setFavorite', { id, bvid, favorite }),
+  syncVideoList: (id: string): Promise<VideoListSyncResult> =>
+    rendererInvoke('videolists:sync', { id }),
+  getVideoListItems: (id: string): Promise<VideoListItem[]> =>
+    rendererInvoke('videolists:getItems', { id }),
+  setVideoListIndex: (id: string, index: number): Promise<void> =>
+    rendererInvoke('videolists:setIndex', { id, index }),
+  // #endregion
+
+  // #region 本地视频文件（丢了之后怎么救）
+  /** 弹系统对话框选一个视频文件；用户取消返回空串 */
+  pickLocalVideo: (currentPath?: string): Promise<string> =>
+    rendererInvoke('local:pickVideo', { currentPath }),
+  /** 重新定位（改 `durl_url`，bvid 不变 → 列表位置 / 收藏 / 续播都保留） */
+  relocateLocalVideo: (
+    bvid: string,
+    newPath: string,
+  ): Promise<IpcChannelMap['local:relocate']['result']> =>
+    rendererInvoke('local:relocate', { bvid, newPath }),
+  /** 文件此刻还在不在（`<video>` 报错后用它区分「丢了」和「解码不支持」） */
+  localVideoExists: (bvid: string): Promise<{ exists: boolean; filePath: string | null }> =>
+    rendererInvoke('local:exists', { bvid }),
   // #endregion
 
   // #region 窗口

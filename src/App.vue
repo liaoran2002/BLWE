@@ -8,7 +8,7 @@
     <div class="titlebar" :class="{ 'wm-hidden': wallpaperEnabled || locked }">
       <!-- 左侧：歌单入口（点一下直接打开歌单管理弹窗，没有二级菜单） -->
       <div class="titlebar-left">
-        <PlaylistPanel @manage="playlistManagerVisible = true" />
+        <PlaylistPanel :mode="mode" @manage="openManager(mode)" />
       </div>
       <!-- 中间：拖拽区 -->
       <div class="titlebar-drag"
@@ -130,12 +130,14 @@
     </div>
     <showList
       :listType="listType"
-      :title="listType == 'list' ? listName : songName"
-      :list="listType == 'list' ? songs : videoList"
-      :currentIndex="listType == 'list' ? currentIndex : currentVideoIndex"
+      :title="listType == 'list' ? browseName : songDisplayName"
+      :list="listType == 'list' ? browseSongs : videoList"
+      :currentIndex="listType == 'list' ? browseIndex : currentVideoIndex"
       :favorites="favoriteBvids"
+      :fromVideoList="fromVideoList"
+      :mode="mode"
       @showList="showList"
-      @changeSong="changeSong"
+      @changeSong="onBrowsePlay"
       @changeVideo="changeVideo"
       @refresh="onListRefresh"
       @addVideo="addVideoVisible = true"
@@ -144,9 +146,9 @@
 
     <!-- 「添加视频」：解析链接后加到这首歌的收藏里 -->
     <AddVideoDialog v-model="addVideoVisible" @confirm="onAddVideo" />
-    <biliVideoControls
+    <VideoControls
       :class="{ 'wm-hidden': wallpaperEnabled || locked }"
-      :videoName="videoName || songName"
+      :videoName="videoName || songDisplayName"
       :cover="currentCover() || ''"
       :subtitle="controlsSubtitle"
       :quality="videoQuality"
@@ -164,13 +166,14 @@
       :duration="duration"
       :paused="paused"
       :listType="listType"
+      :mode="mode"
       :busy="netBusy"
       :qualityBusy="qualityBusy"
       @videoControl="videoControl"
       @changeTime="changeTime"
       @changeVolume="changeVolume"
       @toggleMute="toggleMute"
-    ></biliVideoControls>
+    ></VideoControls>
 
     <div
       class="fullscreen-btn"
@@ -221,6 +224,22 @@
       @switch="onPlaylistSwitch"
       @play="onPlayFromManager"
       @reload="reloadCurrentPlaylistSongs"
+      @open-video-lists="openManager('ov')"
+    />
+
+    <!--
+      B 站视频列表（收藏夹 / 合集 / 系列）
+
+      与歌单管理**并列**而不是塞进去：表、id、同步方式都不同，
+      混在一个界面里只会到处判断「这条是歌还是视频」。
+    -->
+    <VideoListManager
+      v-model="videoListVisible"
+      :browse-id="browseVideoListId"
+      @play="onVideoListPlay"
+      @browse="onVideoListBrowse"
+      @open-playlists="openManager('mv')"
+      @changed="refreshBrowseAfterEdit"
     />
 
     <!-- 设置 -->
@@ -247,6 +266,30 @@
 
     <!-- 关于 -->
     <AboutDialog v-model="aboutVisible" />
+
+    <!--
+      拖入遮罩
+
+      整窗盖一层虚线框 + 一句「松手导入并播放」：
+      拖拽过程中浏览器给的唯一反馈就是光标，不盖点东西用户不知道松手会发生什么。
+      `pointer-events: none` —— 它只是个提示，不能挡住鼠标（否则 drop 事件都收不到）。
+      层级压过 Element Plus 的弹窗（2000+）：管理弹窗开着时也照样看得见。
+    -->
+    <div v-if="dropActive" class="drop-overlay">
+      <div class="drop-card">
+        <div class="drop-ring"></div>
+        <div class="drop-title">
+          {{ dropBusy ? '正在导入…' : '松手即可导入并播放' }}
+        </div>
+        <div class="drop-sub">
+          {{
+            dropBusy
+              ? '拉取列表可能要几秒，导入完直接从第一条开始播'
+              : 'B 站视频 / 合集 / 收藏夹 · 网易云 / QQ音乐歌单'
+          }}
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -255,23 +298,30 @@ import { defineComponent, markRaw } from 'vue';
 import type { AppSetting } from '@common/types/app_setting';
 import defaultSetting from '@common/defaultSetting';
 import { PLAY_LOOP_MODES, VIDEO_QUALITY_OPTIONS, findQualityOption } from '@common/constants';
-import biliVideoControls from './components/biliVideoControls.vue';
+import VideoControls from './components/VideoControls.vue';
 import showList from './components/showList.vue';
 import AddVideoDialog from './components/AddVideoDialog.vue';
 import PlaylistPanel from './components/PlaylistPanel.vue';
 import PlaylistManager from './components/PlaylistManager.vue';
+import VideoListManager from './components/VideoListManager.vue';
 import SettingsDialog from './components/SettingsDialog.vue';
 import AboutDialog from './components/AboutDialog.vue';
 import SleepTimerPanel from './components/SleepTimerPanel.vue';
 import electronApi from './api/electron';
 import { useSettingStore } from './stores/setting';
 import { usePlaylistStore } from './stores/playlists';
-import { toCacheKey } from '@common/types/playlist';
-import type { PlaylistSong as StructuredSong, SyncResult } from '@common/types/playlist';
+import { useVideoListStore } from './stores/videoLists';
+import { directKeyOf, toCacheKey } from '@common/types/playlist';
+import type {
+  DropInputTarget,
+  PlaylistSong as StructuredSong,
+  SyncResult,
+} from '@common/types/playlist';
 import { normalizeImageUrl } from './utils/image';
 import { qualityLabelOf } from './utils/videoQuality';
 import { DashSession } from './utils/dashPlayer';
 import { SleepTimer, formatRemain } from './utils/sleepTimer';
+import { probeMedia } from './utils/mediaProbe';
 import type { SleepTimerOptions, SleepTimerState } from './utils/sleepTimer';
 import type { DashStreamsPayload, QualityOptionsPayload } from '@common/types/ipc';
 
@@ -291,6 +341,14 @@ const LEAD_S = 3;
  * 留 15 秒足够，也不至于太早 —— 太早拿到的播放地址可能已经过期。
  */
 const PREFETCH_AHEAD_S = 15;
+/**
+ * OV 模式下连续多少个条目失效就停止自动跳过
+ *
+ * 收藏夹里「已删除 / 私享 / 充电专属」的条目可能连成片，一条无效就跳下一条会让
+ * 程序自己打出一串解析请求（B 站 412 的经典触发方式），而且用户看到的是
+ * 界面疯狂闪、不知道发生了什么。5 条足够越过零星失效，又不至于失控。
+ */
+const OV_MAX_AUTO_SKIP = 5;
 /**
  * 播放位置停住多久算「这条流不行了」
  *
@@ -343,10 +401,11 @@ import type { ParsedVideoInfo } from '@common/types/ipc';
 export default defineComponent({
   name: 'App',
   components: {
-    biliVideoControls,
+    VideoControls,
     showList,
     PlaylistPanel,
     PlaylistManager,
+    VideoListManager,
     SettingsDialog,
     AboutDialog,
     AddVideoDialog,
@@ -358,7 +417,8 @@ export default defineComponent({
     // 所以这里存下的 store 实例在 init() / mounted() 里可以直接用。
     const settingStore = useSettingStore();
     const playlistsStore = usePlaylistStore();
-    return { settingStore, playlistsStore };
+    const videoListsStore = useVideoListStore();
+    return { settingStore, playlistsStore, videoListsStore };
   },
   computed: {
     /**
@@ -442,10 +502,74 @@ export default defineComponent({
     currentSong(): StructuredSong | null {
       return this.songs[this.currentIndex] ?? null;
     },
+    /**
+     * 当前这条的**显示名**
+     *
+     * ⚠️ 不能用 `songName` 顶替：那是**缓存键**（`歌名-歌手`，直连条目更是
+     * `bv:BV1xx`），贴到界面上就是一行内部标识。显示一律从这里取。
+     */
+    songDisplayName(): string {
+      return this.currentSong?.name || '';
+    },
+    /** 当前播放源是不是 B 站视频列表（决定「歌手」列叫 UP 主、刷新叫重新同步） */
+    fromVideoList(): boolean {
+      /**
+       * 两个条件都算「在播视频」：
+       *  1. `activeId` 有值 —— 列表还在；
+       *  2. 正在播的这条**自己带 bvid** —— 列表刚被删掉时 activeId 会清空，
+       *     但视频还在放。只看 `activeId` 会让控制栏当场从「下一个视频」变回「下一首」。
+       */
+      return !!this.videoListsStore.activeId || !!this.songs[this.currentIndex]?.bvid;
+    },
+    /**
+     * 当前工作区：`ov` = B 站视频列表（默认）、`mv` = 音乐歌单
+     *
+     * **只是界面工作区**，不是第二套播放逻辑：
+     * 切模式不改 `songs`、不停播，只换「列表面板在看哪一份」和管理弹窗停在哪一页。
+     * 真正决定播什么的是 `videoListsStore.activeId`（见 `fromVideoList`）。
+     */
+    mode(): 'ov' | 'mv' {
+      return this.settingStore.setting['ui.mode'] === 'mv' ? 'mv' : 'ov';
+    },
+    /** 列表面板在看的那份条目（可能 ≠ 播放队列：切模式时播放不打断） */
+    browseSongs(): StructuredSong[] {
+      if (this.mode === 'ov') return this.ovSongs;
+      return this.playlistsStore.current?.songs ?? [];
+    },
+    /** 列表面板标题 */
+    browseName(): string {
+      if (this.mode === 'ov') {
+        return this.videoListsStore.find(this.browseVideoListId)?.name ?? '';
+      }
+      return this.playlistsStore.current?.name ?? '';
+    },
+    /**
+     * 播放项在「正在看的列表」里的下标（-1 = 不在其中，就不高亮）
+     *
+     * 切模式后播放的是另一边的条目，此时不该在列表里点亮任何一行 ——
+     * 拿 `currentIndex` 直接当高亮用的后果是「在 MV 列表里点亮了第 3 首，
+     * 而实际在播的是 OV 的第 3 条」。
+     */
+    browseIndex(): number {
+      const current = this.songs[this.currentIndex];
+      if (!current) return -1;
+      /** 直连条目（视频列表）的键是 `bv:<bvid>`，不能拿标题拼 —— 会撞 */
+      const key = current.bvid ? directKeyOf(current.bvid) : toCacheKey(current);
+      return this.browseSongs.findIndex((song) =>
+        song.bvid ? directKeyOf(song.bvid) === key : toCacheKey(song) === key,
+      );
+    },
     /** 播放控制栏副标题：歌曲名 - 歌手 · 专辑 */
     controlsSubtitle(): string {
       const song = this.currentSong;
       if (!song) return '';
+      /**
+       * 视频列表：标题已经在主标题（`videoName`）上了，副标题只放 UP 主 + 列表名。
+       * 再拼一次标题会出现「《标题》 - 标题」这种重复。
+       */
+      if (this.fromVideoList) {
+        return [song.singer, this.listName].filter((x): x is string => !!x).join(' · ');
+      }
       // 缺失的部分直接不出现，避免留下「- · 」这种空占位
       const head = [song.name, song.singer].filter((x): x is string => !!x).join(' - ');
       return [head, song.album].filter((x): x is string => !!x).join(' · ');
@@ -546,6 +670,22 @@ export default defineComponent({
       listType: 'none',
       /** 歌单管理弹窗（新建/编辑/同步/曲目浏览都在里面） */
       playlistManagerVisible: false,
+      /** B 站视频列表弹窗（收藏夹 / 合集 / 系列的导入与浏览） */
+      videoListVisible: false,
+      /** 视频管理页当前浏览的列表（≠ 正在播的那个） */
+      browseVideoListId: '',
+      /** 视频管理页当前浏览列表的条目 */
+      ovSongs: [] as StructuredSong[],
+      /** 空库提示只弹一次 */
+      _emptyNotified: false,
+      /** 正拖着东西悬在窗口上（显示「松手导入」遮罩） */
+      dropActive: false,
+      /** 正在导入拖进来的东西（遮罩上转圈，挡住第二次拖入） */
+      dropBusy: false,
+      /** dragenter/dragleave 的进出计数（子元素之间移动也会触发，不能只用布尔） */
+      _dragDepth: 0,
+      /** OV 连续取不到地址的条数 */
+      _ovSkipStreak: 0,
       isMaximized: false,
       isFullscreen: false,
       wallpaperEnabled: false,
@@ -606,6 +746,23 @@ export default defineComponent({
       _videoToken: 0,
       /** 同一个视频的连续失败次数，达到上限就跳过该曲，避免无限重试 */
       _videoErrorCount: 0,
+      /**
+       * 正在播的这条是不是**本地文件**
+       *
+       * 由 `api:resolveVideo` 回的 `isLocal` 决定，渲染层**不自己看 `lf_` 前缀** ——
+       * 那是主进程的命名细节，改一次就得全渲染层跟着改。
+       *
+       * 用途只有一个：`<video>` 报错时分开处理 —— 本地文件只有「丢了」和
+       * 「解不出来」两种可能，不该走 B 站那套「跳过缓存重试 → 跳下一条」。
+       */
+      currentBvidIsLocal: false,
+      /**
+       * 这次会话里已经弹过「文件丢了」的 bvid
+       *
+       * 不记的话，同一首失败会被 `next()` / 重试 / 用户手点反复触发，
+       * 叠出一串一模一样的确认框。
+       */
+      _missingPrompted: [] as string[],
       /** 当前 dash 会话（MSE），不参与渲染所以放实例字段 */
       _dashSession: null as DashSession | null,
       /** dash 连续失败次数，达到阈值就本会话不再尝试 */
@@ -874,6 +1031,63 @@ export default defineComponent({
         this.$message.error('加载歌单失败：' + this.errMsg(err));
       }
 
+      /**
+       * 加载 B 站视频列表（纯读库，不联网）
+       *
+       * 同时恢复「上次在播的是哪个视频列表」：没有这一步，用户今天导入的收藏夹
+       * 明天开机又会回到音乐歌单，等于每次都要重新点一遍。
+       * 列表已经被删掉时必须把设置里的 id 清掉 —— 否则 `fromVideoList`
+       * 永远为真，界面会按视频列表的文案渲染一个空来源。
+       */
+      try {
+        await this.videoListsStore.load();
+        const savedVideoListId = this.settingStore.setting['player.activeVideoListId'] || '';
+        if (savedVideoListId) {
+          if (this.videoListsStore.find(savedVideoListId)) {
+            this.videoListsStore.setActive(savedVideoListId);
+          } else {
+            void this.settingStore.update({ 'player.activeVideoListId': '' });
+          }
+        }
+      } catch (err) {
+        console.warn('[videolist] 加载视频列表失败', err);
+      }
+
+      /**
+       * 视频管理页要显示的那份列表
+       *
+       * 默认模式是 OV：只要库里已经有列表，就把它当成「当前播放源」恢复 ——
+       * 否则用户开机看到的是「视频模式 + 列表名」，播的却是上次的音乐歌单，
+       * 两边对不上（真正的源由 `tryResume` 读取，这里只负责把 activeId 补上）。
+       */
+      await this.loadBrowseList();
+      if (this.mode === 'ov' && !this.videoListsStore.activeId && this.browseVideoListId) {
+        const record = this.videoListsStore.find(this.browseVideoListId);
+        if (record && (record.itemCount ?? 0) > 0) {
+          this.videoListsStore.setActive(record.id);
+        }
+      }
+      /**
+       * 模式与实际可播来源对齐
+       *
+       * 只有一边是完全空的时才兜底：OV 模式但一个视频列表都没有、
+       * 却有音乐歌单 —— 此时按 OV 展示会是一片空白，而播的又是歌单，两边对不上。
+       * 这时把模式改成实际能用的那一边（只改一次，下一次启动就按用户的真实选择来）。
+       */
+      if (
+        this.mode === 'ov' &&
+        this.videoListsStore.lists.length === 0 &&
+        this.playlistsStore.playlists.length > 0
+      ) {
+        await this.settingStore.update({ 'ui.mode': 'mv' });
+      } else if (
+        this.mode === 'mv' &&
+        this.playlistsStore.playlists.length === 0 &&
+        this.videoListsStore.lists.length > 0
+      ) {
+        await this.settingStore.update({ 'ui.mode': 'ov' });
+      }
+
       // 后台做启动同步，不阻塞续播
       void this.runStartupSync();
       // 按歌单的定时同步策略装心跳（记下指纹，免得后续无关的配置广播重建它）
@@ -967,13 +1181,13 @@ export default defineComponent({
         console.warn('[sync] 定时同步失败', err);
       }
     },
-    /** 把 store 里当前歌单的曲目同步到本地播放列表（保留当前下标，越界则归零） */
+    /** 把当前播放源的曲目同步到本地播放列表（保留当前下标，越界则归零） */
     async reloadCurrentPlaylistSongs(): Promise<void> {
-      const record = this.playlistsStore.current;
-      if (!record) return;
+      const source = await this.loadPlaybackSource();
+      if (!source) return;
       const keepIndex = this.currentIndex;
-      this.songs = [...record.songs];
-      this.listName = record.name;
+      this.songs = source.songs;
+      this.listName = source.name;
       // 曲目变了，随机播放的下标表必须跟着重建：
       // 否则同步后曲目变少，随机列表里还留着越界下标，「下一首」会拿到 null 静默不动
       this.resetRandomList();
@@ -986,25 +1200,49 @@ export default defineComponent({
       }
     },
     /**
+     * 取「当前播放源」的曲目
+     *
+     * 两个来源（B 站视频列表 / 音乐歌单）在播放层长得一模一样，
+     * 差别只有两点：`songs` 从哪来、播到第几条记在哪张表。
+     * 这里一次抹平，续播和首启两条路就不用各写一遍分支 ——
+     * 否则「视频列表忘了写 last_index」这种 bug 只会出现在其中一条路上。
+     */
+    async loadPlaybackSource(): Promise<{
+      name: string;
+      songs: StructuredSong[];
+      lastIndex: number;
+    } | null> {
+      const videoListId = this.videoListsStore.activeId;
+      if (videoListId) {
+        const record = this.videoListsStore.find(videoListId);
+        if (!record) return null;
+        const songs = await this.videoListsStore.songs(videoListId);
+        return { name: record.name, songs, lastIndex: record.lastIndex };
+      }
+      const record = this.playlistsStore.current;
+      if (!record) return null;
+      return { name: record.name, songs: [...record.songs], lastIndex: record.lastIndex };
+    },
+    /**
      * 续播：恢复上次的歌单 / 歌曲 / 视频 / 播放进度
      *
      * @returns 是否成功恢复（false 表示调用方应走默认加载流程）
      */
     async tryResume(): Promise<boolean> {
       if (!this.settingStore.setting['player.resumeOnStart']) return false;
-      const record = this.playlistsStore.current;
-      if (!record || record.songs.length === 0) return false;
+      const source = await this.loadPlaybackSource();
+      if (!source || source.songs.length === 0) return false;
 
       /**
        * 回到该歌单上次播放的位置
        *
        * ⚠️ 下标本身会**被同步改变含义**（曲目增删后第 N 个位置可能是别的歌），
-       * 所以主进程在 `syncPlaylist` 里会把它**重算**成新列表里的位置 ——
-       * 这里只需要夹进范围。
+       * 所以主进程在 `syncPlaylist` / `syncVideoList` 里会把它**重算**成
+       * 新列表里的位置 —— 这里只需要夹进范围。
        */
-      const index = Math.min(Math.max(0, record.lastIndex), record.songs.length - 1);
-      this.songs = [...record.songs];
-      this.listName = record.name;
+      const index = Math.min(Math.max(0, source.lastIndex), source.songs.length - 1);
+      this.songs = source.songs;
+      this.listName = source.name;
       this.currentIndex = index;
 
       const songName = this.getSongName(index);
@@ -1015,8 +1253,10 @@ export default defineComponent({
       try {
         // 「记住播放进度」一个开关管到底：歌 + 进度一起回来
         if (await this.restoreSongVideo(index, resumeTime)) {
+          // 视频列表里说「首」很别扭（那是歌的量词），按来源换一个
+          const unit = this.fromVideoList ? '个视频' : '首';
           this.$message.success(
-            `已续播《${this.listName}》第 ${index + 1} 首` +
+            `已续播《${this.listName}》第 ${index + 1} ${unit}` +
               (resumeTime > 3 ? `（${this.formatTime(resumeTime)}）` : ''),
           );
           return true;
@@ -1108,7 +1348,7 @@ export default defineComponent({
       await this.changeVideo(first.bvid, songName);
       return Boolean(this.videoUrl || this.dashSource);
     },
-    /** 循环模式：字符串枚举 -> 数字下标（供 biliVideoControls 使用） */
+    /** 循环模式：字符串枚举 -> 数字下标（供 VideoControls 使用） */
     loopModeToIndex(mode: AppSetting['player.loopMode']): number {
       const idx = PLAY_LOOP_MODES.indexOf(mode);
       return idx >= 0 ? idx : this.MODE.read;
@@ -1189,18 +1429,18 @@ export default defineComponent({
       await electronApi.startLogin();
     },
     /**
-     * 加载当前歌单的曲目
+     * 加载当前播放源的曲目
      *
-     * 多歌单之后，曲目来源是 playlists store 的「当前歌单」，
+     * 多歌单之后，曲目来源是「当前歌单」或「当前 B 站视频列表」，
      * 不再直接读旧版单歌单文件（那个文件已由主进程迁移进集合）。
      */
     async loadPlaylist(): Promise<void> {
-      const record = this.playlistsStore.current;
-      if (record && record.songs.length > 0) {
-        this.listName = record.name;
-        this.songs = [...record.songs];
-        /** 回到该歌单上次播放的位置（下标由主进程在同步时重算，这里夹进范围） */
-        this.currentIndex = Math.min(Math.max(0, record.lastIndex), this.songs.length - 1);
+      const source = await this.loadPlaybackSource();
+      if (source && source.songs.length > 0) {
+        this.listName = source.name;
+        this.songs = source.songs;
+        /** 回到上次播放的位置（下标由主进程在同步时重算，这里夹进范围） */
+        this.currentIndex = Math.min(Math.max(0, source.lastIndex), this.songs.length - 1);
         // 兼顾「播放进度」：走这条兜底路径时（没有已缓存的视频可精确还原）
         // 也要把上次的秒数带上，否则换歌单/首启场景会丢掉进度
         const cfg = this.settingStore.setting;
@@ -1209,14 +1449,17 @@ export default defineComponent({
         void this.playCurrent(resumeTime > 3 ? resumeTime : 0);
         return;
       }
-      // 没有任何歌单：直接打开歌单管理，让用户在里面新建
-      this.playlistManagerVisible = true;
+      // 没有任何来源：**不弹管理器**，只提示一行「从哪开始」（点它才打开管理器）
+      await this.loadBrowseList();
+      this.notifyEmptyLibrary();
     },
     /** 从歌单管理弹窗里点某首歌播放
      *
      * 弹窗内部已负责把该歌单设为当前，这里只需加载曲目并起播。
      */
     async onPlayFromManager(index: number): Promise<void> {
+      // 从「音乐歌单」里点歌 = 播放源切回音乐歌单（原来在播视频列表就要让位）
+      if (this.videoListsStore.activeId) void this.setActiveVideoList('');
       const record = this.playlistsStore.current;
       if (!record || record.songs.length === 0) return;
       this.songs = [...record.songs];
@@ -1232,6 +1475,13 @@ export default defineComponent({
     },
     /** 从歌单面板切换歌单 */
     async onPlaylistSwitch(id: string | null): Promise<void> {
+      /**
+       * 切到音乐歌单 = 播放源从「视频列表」切回来
+       *
+       * 不清的话 `fromVideoList` 会一直是真：界面按视频列表的文案渲染，
+       * 而 songs 已经是音乐歌单的 —— 两边对不上。
+       */
+      if (this.videoListsStore.activeId) void this.setActiveVideoList('');
       if (!id) {
         // 歌单被删光了
         this.songs = [];
@@ -1276,6 +1526,473 @@ export default defineComponent({
       }
       this.$message.success(`已切换到《${record.name}》（${this.songs.length} 首）`);
       void this.playCurrent();
+    },
+    /**
+     * 切换「当前在播的视频列表」（`''` = 切回音乐歌单）
+     *
+     * 两件事必须一起做：store 里的响应式状态（界面文案、列表高亮靠它）+ 落盘的设置
+     * （重启后要知道回哪个来源续播）。**不能只改 store** —— 那样关掉程序就丢。
+     */
+    async setActiveVideoList(id: string): Promise<void> {
+      if (this.videoListsStore.activeId === id) return;
+      this.videoListsStore.setActive(id);
+      try {
+        await this.settingStore.update({ 'player.activeVideoListId': id });
+      } catch (err) {
+        console.warn('[videolist] 记录当前视频列表失败', err);
+      }
+    },
+    /**
+     * 打开「管理器」并切到指定工作区
+     *
+     * 两个管理器（歌单管理 / 视频管理）共用一个弹窗位置：
+     * 打开哪个就等于切到哪个模式 —— 这就是界面上那个左下角切换按钮的全部实现，
+     * 不需要额外的「模式开关」控件。
+     */
+    async openManager(page?: 'mv' | 'ov'): Promise<void> {
+      const target = page ?? this.mode;
+      await this.switchMode(target);
+      this.playlistManagerVisible = target === 'mv';
+      this.videoListVisible = target === 'ov';
+    },
+    /**
+     * 切工作区（`ov` ↔ `mv`）
+     *
+     * **不停播**：只换列表面板在看哪一份、管理弹窗停在哪一页。
+     * 播放队列 `songs` 不动 —— 用户在列表里点一条才会换源。
+     */
+    async switchMode(next: 'ov' | 'mv'): Promise<void> {
+      if (next !== this.mode) {
+        await this.settingStore.update({ 'ui.mode': next });
+      }
+      if (next === 'ov') await this.loadBrowseList();
+    },
+    /** 关掉两个管理弹窗（拖入导入前调用：弹窗挡着，用户看不到画面） */
+    closeManagers(): void {
+      this.playlistManagerVisible = false;
+      this.videoListVisible = false;
+    },
+    /**
+     * 拖入的**文本**是啥？（从 DataTransfer 里取）
+     *
+     * 顺序有讲究：
+     *  1. `text/uri-list` —— 从浏览器地址栏 / 页面链接拖出来最标准的形态；
+     *     多行时只取第一行有效行（`#` 开头的是注释）；
+     *  2. `text/plain` —— 很多页面拖拽只给这个（分享文案、裸链接、纯 BV 号）；
+     *  3. `text/html` —— 最后兜底，从里面抠第一个 `href`。
+     *
+     * ⚠️ 只有 `drop` 事件里才读得到真实内容（浏览器在 dragover 阶段出于安全
+     * 把数据清空，只留 `types`），所以识别不放在 dragover 里做。
+     */
+    dropTextOf(e: DragEvent): string {
+      const dt = e.dataTransfer;
+      if (!dt) return '';
+      try {
+        const uri = dt.getData('text/uri-list');
+        if (uri) {
+          const first = uri
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .find((line) => line && !line.startsWith('#'));
+          if (first) return first;
+        }
+        const text = dt.getData('text/plain');
+        if (text && text.trim()) return text.trim();
+        const html = dt.getData('text/html');
+        if (html) {
+          return /href=["']([^"']+)["']/i.exec(html)?.[1] ?? '';
+        }
+      } catch {
+        /* 读取被拒绝（极少见）：当没拖着东西处理 */
+      }
+      return '';
+    },
+    /** 拖着东西**进入**窗口：只有「像链接/文本/文件」的才算，其他（比如选中的文字）不显示遮罩 */
+    onDocDragEnter(e: DragEvent): void {
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const types = Array.from(dt.types);
+      const wanted = types.some(
+        (t) => t === 'text/uri-list' || t === 'text/plain' || t === 'text/html',
+      );
+      if (!wanted && !types.includes('Files')) return;
+      /**
+       * 计数而不是布尔：`dragenter` 在**子元素之间移动**时也会触发
+       * （进入 video → 进入控制栏），只用一个布尔值会在第一次 dragleave 就误判成「离开窗口」，
+       * 遮罩一闪一闪的。
+       */
+      this._dragDepth += 1;
+      if (!this.dropBusy) this.dropActive = true;
+    },
+    /** 悬停：**必须** preventDefault，否则 Electron 会把拖进来的链接当页面导航（窗口白屏） */
+    onDocDragOver(e: DragEvent): void {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    },
+    /** 离开：减计数，减到 0 才算真的离开窗口 */
+    onDocDragLeave(): void {
+      this._dragDepth = Math.max(0, this._dragDepth - 1);
+      if (this._dragDepth === 0 && !this.dropBusy) this.dropActive = false;
+    },
+    /** 松手 */
+    onDocDrop(e: DragEvent): void {
+      e.preventDefault();
+      this._dragDepth = 0;
+      if (this.dropBusy) return;
+      const dt = e.dataTransfer;
+      const fileCount = dt?.files?.length ?? 0;
+      const text = this.dropTextOf(e);
+      this.dropActive = false;
+      /**
+       * 本地文件优先：拖文件进来时 `text` 一般是空的，但从某些程序拖
+       * 可能会带一段 `text/uri-list`（指向同一个文件），
+       * 那种情况按文件处理才是用户的本意。
+       */
+      if (fileCount > 0) {
+        void this.handleDroppedFiles(Array.from(dt?.files ?? []));
+        return;
+      }
+      void this.handleDroppedText(text);
+    },
+    /**
+     * 拖入的文本 → 识别 → 导入 → 播放
+     *
+     * 识别在主进程（`api:classifyDrop`），这里只按 `type` 分三路：
+     *  - 音乐歌单 → MV 工作区；
+     *  - B 站列表（收藏夹 / 合集 / 系列）→ OV 工作区，导入成视频列表；
+     *  - 单条视频 → OV 工作区，放进默认列表。
+     *
+     * 三路共同的节奏：**先切工作区**（用户立刻看到界面变了）→ 导入 → 起播。
+     * 导入期间整窗一个「正在导入…」遮罩 —— 几百条要跑几秒，没有反馈就像卡死。
+     */
+    async handleDroppedText(text: string): Promise<void> {
+      const raw = (text ?? '').trim();
+      if (!raw) return;
+
+      let target: DropInputTarget;
+      try {
+        target = await electronApi.classifyDrop(raw);
+      } catch (err) {
+        this.$message.error('识别失败：' + this.errMsg(err));
+        return;
+      }
+      if (target.type === 'none') {
+        this.$message.warning(
+          '没认出这是什么：拖 B 站视频 / 合集 / 收藏夹链接，或网易云 / QQ音乐的歌单链接',
+        );
+        return;
+      }
+
+      this.dropBusy = true;
+      this.dropActive = true;
+      try {
+        if (target.type === 'music') await this.dropImportMusic(target.url);
+        else if (target.type === 'list') await this.dropImportList(target);
+        else await this.dropImportVideo(target.input);
+      } catch (err) {
+        this.$message.error('导入失败：' + this.errMsg(err));
+      } finally {
+        this.dropBusy = false;
+        this.dropActive = false;
+      }
+    },
+    /** 拖入的是**音乐歌单**：切 MV → 导入（已有则同步）→ 播第一首 */
+    async dropImportMusic(url: string): Promise<void> {
+      await this.switchMode('mv');
+      this.closeManagers();
+      const { record, existed } = await electronApi.importMusicPlaylist(url);
+      await this.playlistsStore.load();
+      this.$message.success(
+        `${existed ? '已同步' : '已导入'}《${record.name}》（${record.songs.length} 首）`,
+      );
+      await this.onPlaylistSwitch(record.id);
+    },
+    /** 拖入的是 **B 站列表**：切 OV → 导入（已有则同步）→ 从上次那个视频起播 */
+    async dropImportList(target: { kind: 'fav' | 'season' | 'series'; id: string; mid?: string }): Promise<void> {
+      await this.switchMode('ov');
+      this.closeManagers();
+      const { record, skipped, existed } = await this.videoListsStore.add(
+        target.kind,
+        target.id,
+        target.mid,
+      );
+      this.$message.success(
+        `${existed ? '已同步' : '已导入'}《${record.name}》${record.itemCount ?? ''} 条` +
+          (skipped > 0 ? `（跳过 ${skipped} 个不支持的条目）` : ''),
+      );
+      await this.loadBrowseList();
+      await this.onVideoListPlay(record.id, Math.max(0, record.lastIndex || 0));
+    },
+    /**
+     * 拖入的是**单条视频**：切 OV → 加进默认列表（插到最前，所以就是第 1 条）→ 播它
+     *
+     * 默认列表由主进程保证存在（没有就现建，且删不掉），这里只拿 `listId` 去播。
+     */
+    async dropImportVideo(input: string): Promise<void> {
+      await this.switchMode('ov');
+      this.closeManagers();
+      const { listId, listName } = await this.videoListsStore.addItemToDefault(input);
+      this.$message.success(`已加入《${listName}》，正在播放`);
+      await this.loadBrowseList();
+      await this.onVideoListPlay(listId, 0);
+    },
+
+    /**
+     * 拖入的是**本地视频文件**：切 OV → 登记进默认列表 → 播第一个 → 后台补时长
+     *
+     * 和拖入「单条 B 站视频」是同一条路（同样进默认列表、同样置顶、同样续播），
+     * 唯一不同的是地址来源。这也是当初「给本地文件发一个 `lf_` 开头的 bvid」
+     * 那个决定换来的东西：播放、收藏、续播、托盘媒体信息全都不用加分支。
+     */
+    async handleDroppedFiles(files: File[]): Promise<void> {
+      if (this.dropBusy) return;
+
+      /**
+       * 路径只能从 preload 的 `webUtils` 拿 —— Electron 32 起 `File.path` 已被移除。
+       *
+       * 拿不到就**明确说一句**：从某些程序（截图工具、压缩软件预览）拖出来的
+       * 东西不是真实文件，静默什么都不做最让人困惑。
+       */
+      const paths: string[] = [];
+      for (const file of files) {
+        const filePath = electronApi.getPathForFile(file);
+        if (filePath) paths.push(filePath);
+      }
+      if (paths.length === 0) {
+        this.$message.warning('没拿到文件路径，请从资源管理器把视频文件拖进来');
+        return;
+      }
+
+      this.dropBusy = true;
+      this.dropActive = true;
+      try {
+        await this.switchMode('ov');
+        this.closeManagers();
+
+        const { listId, listName, items, skipped } =
+          await this.videoListsStore.importLocal(paths);
+
+        if (items.length === 0) {
+          this.$message.error(
+            skipped.length > 0 ? `没导入任何文件：${skipped[0].reason}` : '没导入任何文件',
+          );
+          return;
+        }
+
+        this.$message.success(
+          `已加入《${listName}》${items.length} 个文件，正在播放` +
+            (skipped.length > 0 ? `（跳过 ${skipped.length} 个）` : ''),
+        );
+        await this.loadBrowseList();
+        await this.onVideoListPlay(listId, 0);
+
+        /**
+         * 时长放**起播之后**补：一个文件几十毫秒，十个就是几百毫秒，
+         * 而用户松手之后想看的是画面，不是「正在导入…」。
+         */
+        void this.probeLocalDurations(listId, items);
+      } catch (err) {
+        this.$message.error('导入失败：' + this.errMsg(err));
+      } finally {
+        this.dropBusy = false;
+        this.dropActive = false;
+      }
+    },
+
+    /**
+     * 给刚拖进来的本地文件补时长（顺带**实测**能不能播）
+     *
+     * 用 `<video preload="metadata">` 探（见 `utils/mediaProbe.ts`）：
+     * 这是唯一和真播放用同一个解码器的判断 —— 而 ffmpeg 说「没问题」
+     * 并不代表 Chromium 能播（HEVC 就是典型）。
+     *
+     * 探不出来（编码不支持 / 路径失效）的**不删也不拦**，只提示一句：
+     * 能播与否的最终裁判还是播放器自己，那时 OV 的连续失败刹车会接住。
+     */
+    async probeLocalDurations(
+      listId: string,
+      items: Array<{ bvid: string; url: string }>,
+    ): Promise<void> {
+      const broken: string[] = [];
+      let changed = false;
+
+      for (const item of items) {
+        const probe = await probeMedia(item.url);
+        if (!probe.ok) {
+          broken.push(item.bvid);
+          continue;
+        }
+        if (probe.duration > 0) {
+          changed = true;
+          void electronApi
+            .fillVideoDuration(directKeyOf(item.bvid), item.bvid, probe.duration)
+            .catch(() => {
+              /* 补时长失败不影响播放，下次拖进来还会再探一次 */
+            });
+        }
+      }
+
+      if (broken.length > 0) {
+        this.$message.warning(
+          `有 ${broken.length} 个文件解不出来（多半是 mkv / HEVC 编码），已照常加入但可能播不了`,
+        );
+      }
+      /** 列表里那一列时长要跟着变（只在用户正看着这个列表时才重读） */
+      if (changed && this.browseVideoListId === listId) await this.loadBrowseList();
+    },
+    /**
+     * 载入「视频管理页正在看的那个列表」的条目
+     *
+     * 优先用上次选中的；它被删了/从没选过就退回「正在播的列表」，再退回第一个。
+     * 纯读库，不联网。
+     */
+    async loadBrowseList(): Promise<void> {
+      if (this.videoListsStore.lists.length === 0) {
+        this.browseVideoListId = '';
+        this.ovSongs = [];
+        return;
+      }
+      const exists = this.videoListsStore.find(this.browseVideoListId);
+      if (!exists) {
+        this.browseVideoListId =
+          this.videoListsStore.activeId || this.videoListsStore.lists[0]?.id || '';
+      }
+      if (!this.browseVideoListId) {
+        this.ovSongs = [];
+        return;
+      }
+      try {
+        this.ovSongs = await this.videoListsStore.songs(this.browseVideoListId);
+      } catch (err) {
+        console.warn('[videolist] 读取列表条目失败', err);
+        this.ovSongs = [];
+      }
+    },
+    /** 视频管理页左侧选中了另一个列表（只换浏览，不动播放） */
+    async onVideoListBrowse(id: string): Promise<void> {
+      this.browseVideoListId = id;
+      await this.loadBrowseList();
+    },
+    /**
+     * 列表面板里点了某一条 = 切换播放源并起播
+     *
+     * `browseSongs` 可以是「不是正在播的那一份」，所以不能直接 `changeSong(index)`
+     * （那个只改播放队列的下标）。这里按模式各自走一次「换源 + 起播」。
+     */
+    async onBrowsePlay(index: number): Promise<void> {
+      if (this.mode === 'ov') {
+        if (!this.browseVideoListId) {
+          this.notifyEmptyLibrary();
+          return;
+        }
+        await this.onVideoListPlay(this.browseVideoListId, index);
+        return;
+      }
+      await this.onPlayFromManager(index);
+    },
+    /**
+     * 视频管理的条目被改过（加/删/收藏/重命名/同步）后重新对齐界面
+     *
+     * 关键在**置顶会重排**：收藏或手动加一条会把它挪到最前，全体下标 +1。
+     * 只重读列表不重算下标的话，正在播的那条在 `songs` 里就换了位置 ——
+     * 用户点一下「下一个视频」会跳到意料之外的一条。
+     */
+    async refreshBrowseAfterEdit(): Promise<void> {
+      await this.loadBrowseList();
+      if (this.mode !== 'ov') return;
+      if (!this.videoListsStore.activeId ||
+          this.videoListsStore.activeId !== this.browseVideoListId) {
+        return;
+      }
+      const bvid = this.songs[this.currentIndex]?.bvid;
+      const index = bvid ? this.ovSongs.findIndex((song) => song.bvid === bvid) : -1;
+      this.songs = this.ovSongs;
+      if (index >= 0) this.currentIndex = index;
+      // 顺序变了：随机表与预热槽位都按下标算，必须一起作废
+      this.resetRandomList();
+      this.clearAllWarm();
+    },
+    /**
+     * 库是不是「空的」（没有任何可播内容）
+     *
+     * ⚠️ **不能只看「有几个列表」**：启动时会自动建一个「默认列表」，
+     * 列表数量从第一次打开起就是 1，用旧判据那句话永远不出现。
+     * 现在按**条目**算：视频侧看所有列表的条目加起来是不是 0，音乐侧看有没有歌单。
+     */
+    isLibraryEmpty(): boolean {
+      if (this.mode === 'mv') return this.playlistsStore.playlists.length === 0;
+      const lists = this.videoListsStore.lists;
+      if (lists.length === 0) return true;
+      return lists.every((item) => (item.itemCount ?? 0) === 0);
+    },
+    /**
+     * 空库提示（不弹窗）
+     *
+     * 用户明确要求：没有数据时**不要**自动打开管理器，一行字告诉他从哪开始。
+     * 点这条提示直接打开管理器 —— 不然「告诉我要导入」却不给入口，等于废话。
+     *
+     * 文案以**拖入**为首选路径（这是最省事的一条），弹窗入口作为兜底；
+     * 点提示仍然打开管理器。
+     */
+    notifyEmptyLibrary(): void {
+      if (this._emptyNotified || !this.isLibraryEmpty()) return;
+      this._emptyNotified = true;
+      this.$notify({
+        title: '还没有任何内容',
+        message:
+          this.mode === 'ov'
+            ? '把 B 站视频 / 合集 / 收藏夹链接拖进窗口就能直接播放；也可以登录 B 站账号导入收藏夹'
+            : '把网易云 / QQ音乐的歌单链接拖进窗口就能直接播放；也可以新建歌单、按行填写「歌名-歌手」',
+        type: 'info',
+        duration: 10000,
+        onClick: () => {
+          void this.openManager(this.mode);
+        },
+      });
+    },
+    /**
+     * 从视频列表里点某条播放
+     *
+     * 这是「视频列表 → 播放引擎」的唯一入口：
+     * 条目被映射成 `PlaylistSong`（带 `bvid`）塞进 `songs`，
+     * 之后切歌 / 续播 / 预热全部沿用既有链路 —— `getSongParts()` 看到 `bvid`
+     * 就返回 `bv:<bvid>`，主进程据此短路，不再搜索。
+     */
+    async onVideoListPlay(id: string, index: number): Promise<void> {
+      const record = this.videoListsStore.find(id);
+      if (!record) return;
+      await this.setActiveVideoList(id);
+
+      const songs = await this.videoListsStore.songs(id);
+      if (songs.length === 0) {
+        this.$message.warning(`《${record.name}》还没有条目`);
+        return;
+      }
+
+      /**
+       * 从这里起它就是「正在看的列表」：面板内容与播放队列保持同一份，
+       * 否则点开列表弹窗会停在切换前的那个列表上（看着像点错了）。
+       */
+      this.browseVideoListId = id;
+      this.ovSongs = songs;
+
+      this.songs = songs;
+      this.listName = record.name;
+      this.currentIndex = Math.min(Math.max(0, index), songs.length - 1);
+      this.videoList = [];
+      this.videoListKeyword = '';
+      this.currentVideoIndex = 0;
+      this.clearNowPlaying();
+      this.songName = '';
+      this.currentTime = 0;
+      this.seekAfterLoad = 0;
+      this.seekAfterLoadFor = '';
+      this.resetRandomList();
+      this.clearAllWarm();
+      // 换列表等于换一首「新歌」，上一份进度（秒数）不能带过来
+      await this.settingStore.update({ 'player.resumeTime': 0 });
+      this.$message.success(`正在播放《${record.name}》第 ${this.currentIndex + 1} 个视频`);
+      await this.playCurrent();
     },
     /**
      * 清掉「正在播放」的视频信息
@@ -1610,6 +2327,8 @@ export default defineComponent({
       this.stopBufferTicker();
       // 已经出画：撤掉还没到点的换源提示
       this.clearBufferOverlayTimer();
+      // 有一条真的播起来了 = 失效条目不是连成片的，跳过计数归零
+      this._ovSkipStreak = 0;
     },
     /** 已经缓冲到第几秒（取**包含当前播放点**的那一段的末尾） */
     lastBufferedEnd(): number {
@@ -1944,6 +2663,15 @@ export default defineComponent({
       if (v.currentTime > 6) void this.warmApi('prev');
       // 接口备好了就把开头拉起来（近片尾时两个方向都要保证是热的）
       const nearEnd = d > 0 && d - v.currentTime <= PREFETCH_AHEAD_S;
+      /**
+       * OV 只**备地址**、不拉流
+       *
+       * 视频列表的「下一条」是确定的 bvid，预热只剩「提前解析一次地址」这一步；
+       * 再额外起一个隐藏的 MSE 会话去拉分片，收益很小（省的是首帧那一两秒），
+       * 代价却是同时对两条流占带宽 —— 而列表里大半条目用户不会看。
+       * 用户明确要的就是这个折中：留着地址预热，别开流。
+       */
+      if (this.fromVideoList) return;
       if (this.bufferSeconds >= 5 || nearEnd) {
         if (this._warm.next) this.warmMedia('next');
         if (this._warm.prev) this.warmMedia('prev');
@@ -2298,6 +3026,31 @@ export default defineComponent({
         return;
       }
 
+      /**
+       * ★ 本地文件：只有两种失败，别混进 B 站那套重试 / 跳过
+       *
+       * 「跳过缓存重试一次」对本地文件是纯浪费（没有缓存、没有签名过期），
+       * 「跳下一条」更糟：文件只是被挪走了，用户要的是**指回去**，不是绕过它。
+       *
+       * 所以先问一句文件还在不在，再分两条：
+       *  - **不在了**（播放中途被删 / 移走 / 盘掉了）→ 弹重新定位；
+       *  - **还在** → 那是解码问题（HEVC / 10bit / mkv 常见），
+       *    说清原因就停住，不要一边报错一边往下跳。
+       */
+      if (this.currentBvidIsLocal && this.currentBvid) {
+        const bvid = this.currentBvid;
+        this._videoErrorCount = 0;
+        const state = await electronApi
+          .localVideoExists(bvid)
+          .catch(() => ({ exists: false, filePath: null as string | null }));
+        if (state.exists) {
+          this.$message.error('这个本地文件解不出画面（多半是编码不支持，比如 HEVC / 10bit）');
+          return;
+        }
+        void this.onLocalFileMissing(bvid, state.filePath ?? '');
+        return;
+      }
+
       this._videoErrorCount += 1;
       const video = this.videoList[this.currentVideoIndex];
       if (this._videoErrorCount === 1 && video) {
@@ -2312,11 +3065,130 @@ export default defineComponent({
         return;
       }
       this._videoErrorCount = 0;
-      /** 用显示名（`songName` 现在是缓存键，形如 `tx_xxx`，不能贴进提示） */
-      this.$message.warning(
-        `《${this.songName || '当前歌曲'}》视频加载失败，已跳过`,
-      );
+      /**
+       * OV 下的「失效条目」保护
+       *
+       * 视频列表的条目是外部数据，已删除 / 私享 / 充电专属 / 地区限制都很常见。
+       * 全部或大半失效时，`next()` 会一条接一条地跳，每条还要重解析两次 ——
+       * 几十条下来就是一批请求，B 站直接 412。
+       * 所以连续跳过 5 条就**停下来**，把决定权交回用户。
+       */
+      if (this.fromVideoList) {
+        this._ovSkipStreak += 1;
+        const label = this.songs[this.currentIndex]?.name || '当前视频';
+        if (this._ovSkipStreak >= OV_MAX_AUTO_SKIP) {
+          this._ovSkipStreak = 0;
+          this.$notify({
+            title: `连续 ${OV_MAX_AUTO_SKIP} 个视频都取不到播放地址`,
+            message: '已暂停自动切换。点这条提示可以再试下一个。',
+            type: 'warning',
+            duration: 0,
+            onClick: () => this.next(),
+          });
+          return;
+        }
+        this.$message.warning(`《${label}》取不到播放地址，已跳过`);
+      } else {
+        /** 用显示名（`songName` 现在是缓存键，形如 `tx_xxx`，不能贴进提示） */
+        this.$message.warning(`《${this.songName || '当前歌曲'}》视频加载失败，已跳过`);
+      }
       if (this.songs.length > 1) this.next();
+    },
+    /**
+     * ★ 本地视频文件找不到了：给两条出路
+     *
+     * 没这个入口的话，用户唯一的办法是「去视频管理删掉这条 → 再拖一次」——
+     * 而拖一次会生成**新的 bvid**（路径哈希变了），列表里的位置、收藏、
+     * 播放进度全丢。所以这里的主路径是**重新定位**：只改路径、不动身份。
+     *
+     * 「从列表移除」是另一条出路，但**默认不选**：文件可能只是在没插上的
+     * 移动硬盘里，过两天插回来还能用。
+     *
+     * 同一个 bvid 一次会话只问一次（`_missingPrompted`）：否则 `next()`、
+     * 手动重点、重试各弹一次，叠出一摞确认框。
+     */
+    async onLocalFileMissing(bvid: string, filePath: string): Promise<void> {
+      if (!bvid || this._missingPrompted.includes(bvid)) return;
+      this._missingPrompted.push(bvid);
+
+      let action = 'close';
+      try {
+        await this.$confirm(
+          `这个本地视频的文件找不到了（可能被删除、改名或移动）。` +
+            (filePath ? `\n\n原来的位置：${filePath}` : '') +
+            `\n\n重新定位后，它在列表里的位置、收藏和播放进度都会保留。`,
+          '视频文件已丢失',
+          {
+            confirmButtonText: '重新定位文件',
+            cancelButtonText: '从列表移除',
+            distinguishCancelAndClose: true,
+            type: 'warning',
+            /**
+             * 点遮罩不关：这个框后面没有「取消」这个中间态 ——
+             * 误点一下就当作用户选了「从列表移除」太危险了。
+             */
+            closeOnClickModal: false,
+          },
+        );
+        action = 'confirm';
+      } catch (err) {
+        // confirm 的 reject 值是 'cancel'（点了取消按钮）或 'close'（右上角 ×）
+        action = typeof err === 'string' ? err : 'close';
+      }
+
+      if (action === 'cancel') {
+        await this.removeLocalItemFromList(bvid);
+        return;
+      }
+      if (action !== 'confirm') return;
+
+      /** 弹系统文件对话框（取消返回空串 —— 什么都不做，别当失败报错） */
+      const picked = await electronApi.pickLocalVideo(filePath).catch(() => '');
+      if (!picked) return;
+
+      const res = await electronApi
+        .relocateLocalVideo(bvid, picked)
+        .catch((err) => ({ ok: false, error: this.errMsg(err) }) as { ok: boolean; error?: string });
+      if (!res.ok) {
+        // 失败允许再试：把它从「已问过」里放出来
+        this._missingPrompted = this._missingPrompted.filter((item) => item !== bvid);
+        this.$message.error(res.error || '重新定位失败');
+        return;
+      }
+
+      this.$message.success('已重新定位，正在播放');
+      /**
+       * 从「已问过」里放出来：这条以后要是**再**丢了（又挪了位置），
+       * 还得能再问一次 —— 不放出来的话这次会话里就再也不会提示了。
+       */
+      this._missingPrompted = this._missingPrompted.filter((item) => item !== bvid);
+      /** 列表里那一行（和视频管理页）都要重读：标题可能刚被补上，失效标也该消掉 */
+      await this.loadBrowseList();
+      await this.changeVideo(bvid, this.videoListKeyword, { skipCache: true });
+    },
+    /**
+     * 把一条本地视频从**正在播的那个列表**里移除
+     *
+     * 只删列表关系，不动 `videos` 那一行（路线与「视频管理 → ×」一致）。
+     * 不知道在哪个列表就不动 —— 猜错列表删掉别的东西，比不删糟得多。
+     */
+    async removeLocalItemFromList(bvid: string): Promise<void> {
+      const listId = this.videoListsStore.activeId;
+      if (!listId) {
+        this.$message.warning('不知道该从哪个列表移除，请到视频管理里删掉这一条');
+        return;
+      }
+      try {
+        const ok = await this.videoListsStore.removeItem(listId, bvid);
+        if (!ok) {
+          this.$message.warning('这一条已经不在列表里了');
+          return;
+        }
+        await this.loadBrowseList();
+        this.$message.success('已从列表移除');
+      } catch (err) {
+        this.$message.error('移除失败：' + this.errMsg(err));
+      }
     },
     onVideoLoaded(): void {
       const v = this.videoEl();
@@ -2982,9 +3854,26 @@ export default defineComponent({
           if (res.error === 'AUTH_FAILED') {
             throw new Error('B 站登录已失效，请重新登录后再试');
           }
+          /**
+           * ★ 本地文件丢了：**不抛**
+           *
+           * 抛出去会走到下面的 catch：清空标题 / 封面 + 弹一条红色「本地文件不存在」，
+           * 然后什么也做不了 —— 用户唯一能做的就是自己去视频管理删掉再重拖。
+           * 这里改成交给善后流程：弹「重新定位 / 从列表移除」，选完还能接着播。
+           *
+           * 也不能走 `videoError` 那条路：那条是给「地址解析失败 / 播放失败」用的，
+           * 会先跳过缓存重试一次（对本地文件毫无意义），再计 OV 的连续失败刹车。
+           */
+          if (res.code === 'LOCAL_MISSING') {
+            this.currentBvidIsLocal = true;
+            void this.onLocalFileMissing(bvid, res.detail ?? '');
+            return;
+          }
           throw new Error(res.error);
         }
         this.currentBvid = bvid;
+        /** 记下这条的「本地」身份，供 `<video>` 报错时分开处理（见 `videoError`） */
+        this.currentBvidIsLocal = res.isLocal === true;
         // dash 双轨（1080P+，需要 MSE 合成）与 durl（720P 混流）二选一
         this.dashSource = res.dash ?? null;
         this.videoUrl = res.videoUrl ?? '';
@@ -3333,6 +4222,41 @@ export default defineComponent({
      */
     async onListRefresh(): Promise<void> {
       if (this.listType === 'list') {
+        /**
+         * 视频列表的「刷新」是**重新拉列表**（不是重新搜索）
+         *
+         * 语义差别很大：这里一条请求打的是 B 站的收藏夹/合集接口，
+         * 回来的是「这个列表现在有哪些视频」。搜索结果那套过滤 / 打分
+         * 对列表条目完全不适用（见方案 4.4）。
+         *
+         * 刷的是**正在看的那份**（`browseVideoListId`）而不是「正在播的」——
+         * 切模式后两者可能不是同一个，刷错列表会让用户以为同步没生效。
+         */
+        if (this.mode === 'ov') {
+          const videoListId = this.browseVideoListId;
+          if (!videoListId) return;
+          const record = this.videoListsStore.find(videoListId);
+          if (record?.kind === 'local') {
+            this.$message.info('本地列表没有远端来源，不需要同步');
+            return;
+          }
+          try {
+            const r = await this.videoListsStore.sync(videoListId);
+            if (!r.ok) {
+              this.$message.warning(`${r.name || '列表'}：${r.error ?? '同步失败'}`);
+            } else {
+              this.$message.success(
+                `${r.name}：+${r.added ?? 0}/-${r.removed ?? 0}` +
+                  (r.skipped ? `（跳过 ${r.skipped} 个）` : ''),
+              );
+            }
+            // 条目可能变了（还可能因置顶重排）：重载浏览列表并按 bvid 重定位播放位置
+            await this.refreshBrowseAfterEdit();
+          } catch (err) {
+            this.$message.error('同步失败：' + this.errMsg(err));
+          }
+          return;
+        }
         const id = this.playlistsStore.currentId;
         if (!id) return;
         try {
@@ -3380,6 +4304,23 @@ export default defineComponent({
      * 如果自己重排，就会和库里的 ord 产生两套顺序。
      */
     async onToggleFavorite(bvid: string): Promise<void> {
+      /**
+       * OV 模式：收藏挂在**条目**上（`videolist_items.favorites`），
+       * 而且收藏 = 置顶（事务里改 ord）。所以只需调一次主进程再重排界面，
+       * 不能走下面那套「这首歌选哪个 bvid」的逻辑 —— 那是 MV 的语义。
+       */
+      if (this.mode === 'ov') {
+        const listId = this.browseVideoListId;
+        if (!listId || !bvid) return;
+        const current = this.ovSongs.find((song) => song.bvid === bvid);
+        try {
+          await this.videoListsStore.setFavorite(listId, bvid, !current?.favorites);
+          await this.refreshBrowseAfterEdit();
+        } catch (err) {
+          this.$message.error(`收藏操作失败：${this.errMsg(err)}`);
+        }
+        return;
+      }
       if (!bvid || !this.songName) return;
       const songName = this.songName;
       const isFav = this.favoriteBvids.includes(bvid);
@@ -3546,13 +4487,33 @@ export default defineComponent({
      * 触发点：切歌、切视频、视频加载完成、时间更新（节流）。
      */
     async persistPlaybackState(): Promise<void> {
-      const record = this.playlistsStore.current;
-      if (!record) return;
+      const hasVideoList = !!this.videoListsStore.activeId;
+      if (!hasVideoList && !this.playlistsStore.current) return;
       const patch: Partial<AppSetting> = {
         'player.resumeTime': Math.floor(this.currentTime || 0),
       };
       void this.settingStore.update(patch);
-      // 歌单自己播到第几首（切歌单时用于回到各自的位置）
+      // 当前播放源播到第几首（切歌单 / 切列表时用于回到各自的位置）
+      this.recordPlayPosition();
+    },
+    /**
+     * 记录「当前播放源播到第几条」
+     *
+     * 两个来源各记各的表：音乐歌单 → `playlists.last_index`，
+     * 视频列表 → `videolists.last_index`（那张表在同步时按 bvid 重定位）。
+     * 写错表不会报错，只会表现成「重启后位置回到第一条」，所以集中在这里一处。
+     */
+    recordPlayPosition(): void {
+      const videoListId = this.videoListsStore.activeId;
+      if (videoListId) {
+        void this.videoListsStore.setIndex(videoListId, this.currentIndex);
+        return;
+      }
+      /**
+       * 视频列表被删了但视频还在播：**不能**写 `playlists.last_index` ——
+       * 那是音乐歌单的下标，写进去只会让下次从歌单续播时跳到一个莫名其妙的第 N 首。
+       */
+      if (this.songs[this.currentIndex]?.bvid) return;
       void this.playlistsStore.setLastIndex(this.currentIndex);
     },
     /** 节流记录进度，避免 timeupdate 每秒写多次 */
@@ -3616,7 +4577,7 @@ export default defineComponent({
         'player.resumeTime': Math.floor(this.currentTime || 0),
       };
       this.settingStore.update(patch);
-      this.playlistsStore.setLastIndex(this.currentIndex);
+      this.recordPlayPosition();
       /**
        * 退出时**不需要**再写 `selectedBvid`
        *
@@ -3633,11 +4594,18 @@ export default defineComponent({
      * 歌名本身可能含 `-`（`下坠Falling` / `R.` / `若是明仔载`），
      * 拼成 `歌名-歌手` 再拆会切错。歌单里本来就是分开存的，直接拿。
      *
+     * ★ **直连条目（B 站视频列表）走另一条路**：`song` 直接给 `bv:<bvid>`，
+     * 主进程的 `api:searchSong` 看到这个前缀就短路，候选只有它自己。
+     * 这一处改完之后，切歌 / 预热 / 续播四个调用点全部自动生效 ——
+     * 它们都只关心「这首歌怎么变成候选列表」。
+     *
      * @returns 歌名与歌手；**歌名为空时为 null**（不用空歌名去搜）
      */
     getSongParts(index: number): { song: string; singer: string } | null {
       const s = this.songs[index];
-      if (!s || !s.name) return null;
+      if (!s) return null;
+      if (s.bvid) return { song: directKeyOf(s.bvid), singer: '' };
+      if (!s.name) return null;
       return { song: s.name, singer: s.singer ?? '' };
     },
     /**
@@ -3647,12 +4615,16 @@ export default defineComponent({
      * 也是判断「这份视频列表属于哪首歌」的标识 —— **不能用于搜索**
      * （搜索走 `getSongParts`，要分开的歌名/歌手）。
      *
+     * 直连条目的键是 `bv:<bvid>`（不是 `歌名-歌手`）—— 同一个视频可能被
+     * 两个不同标题的列表引用，用标题当键会撞成同一份缓存。
+     *
      * 名字里的 `Name` 是历史遗留（早先只有歌名），它装的是「歌名 + 歌手」。
      */
     getSongName(index: number): string | null {
       if (!this.songs || this.songs.length === 0) return null;
       const song = this.songs[index];
-      return song ? toCacheKey(song) : null;
+      if (!song) return null;
+      return song.bvid ? directKeyOf(song.bvid) : toCacheKey(song);
     },
     /** 取第 index 首歌的结构化信息（供界面展示封面/专辑） */
     getSong(index: number): StructuredSong | null {
@@ -3892,6 +4864,17 @@ export default defineComponent({
   mounted() {
     // 配置在 src/main.ts 里已经拉取完成，这里直接初始化播放状态
     void this.init();
+    /**
+     * 拖入导入（B 站视频 / 合集 / 收藏夹 / 音乐歌单）
+     *
+     * 挂在 document 上而不是某个元素上：拖进窗口的任何位置都算，
+     * 包括标题栏、控制栏、视频画面。`dragover` 里必须 preventDefault，
+     * 否则 Electron 会把拖进来的链接当成「导航到这个地址」——窗口直接白屏。
+     */
+    document.addEventListener('dragenter', this.onDocDragEnter);
+    document.addEventListener('dragover', this.onDocDragOver);
+    document.addEventListener('dragleave', this.onDocDragLeave);
+    document.addEventListener('drop', this.onDocDrop);
     this.removeLoginListener = electronApi.onLoginSuccess(() => {
       void this.onLoggedIn();
     });
@@ -3937,14 +4920,19 @@ export default defineComponent({
       this.toggleMute();
     });
     this.removeTrayShowPlaylist = electronApi.onTrayShowPlaylist(() => {
-      // 托盘「设置歌单」-> 直接打开统一的歌单管理弹窗
-      this.playlistManagerVisible = true;
+      /**
+       * 托盘「歌单管理 / 视频管理」-> 打开当前模式对应的管理弹窗
+       *
+       * 不写死哪一页：文案由主进程按 `ui.mode` 决定，这里只负责「打开当前模式的那一页」，
+       * 两句判断都在 `openManager` 里，和弹窗左下角的切换按钮完全同一条路径。
+       */
+      void this.openManager();
     });
     this.removeTrayShowSleepTimer = electronApi.onTrayShowSleepTimer(() => {
       /**
        * 托盘「定时」-> 打开定时面板
        *
-       * 和「设置歌单」同一条路径：主进程已经先把窗口从壁纸层/托盘里叫回来了，
+       * 和「歌单管理 / 视频管理」同一条路径：主进程已经先把窗口从壁纸层/托盘里叫回来了，
        * 这里只负责把面板弹出来。
        */
       this.sleepPanelVisible = true;
@@ -4085,6 +5073,10 @@ export default defineComponent({
     if (this.removeWallpaperUnavailable) this.removeWallpaperUnavailable();
     if (this.removeMaximizedListener) this.removeMaximizedListener();
     if (this.removeFullscreenListener) this.removeFullscreenListener();
+    document.removeEventListener('dragenter', this.onDocDragEnter);
+    document.removeEventListener('dragover', this.onDocDragOver);
+    document.removeEventListener('dragleave', this.onDocDragLeave);
+    document.removeEventListener('drop', this.onDocDrop);
     document.removeEventListener('keydown', this.handleKeydown);
     document.removeEventListener('mousemove', this.onDocMouseMove);
     document.removeEventListener('mouseup', this.onDocMouseUp);
@@ -4250,6 +5242,61 @@ html[data-tint='dark'] {
   object-fit: contain;
   z-index: 0;
 }
+
+/* #region 拖入遮罩 */
+/*
+ * 整窗一层虚线框：拖拽时唯一的反馈就是光标，不盖点东西用户不知道松手会发生什么。
+ * 层级 3000 —— 压过 Element Plus 的弹窗（2000 上下），管理弹窗开着也看得见。
+ */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 只做提示，绝不能吃掉鼠标事件（吃掉就收不到 drop 了） */
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+.drop-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 40px;
+  border-radius: 16px;
+  border: 2px dashed rgba(255, 255, 255, 0.55);
+  background: var(--glass-bg-strong);
+  color: var(--glass-text);
+  user-select: none;
+}
+.drop-ring {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.25);
+  border-top-color: var(--accent);
+  /* 一直转：拖拽时是「准备接收」，导入时是「正在干活」，两种状态都不用额外写样式 */
+  animation: drop-spin 0.9s linear infinite;
+}
+@keyframes drop-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.drop-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+.drop-sub {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+/* #endregion */
 
 /* #region 缓冲提示 */
 .buffer-overlay {

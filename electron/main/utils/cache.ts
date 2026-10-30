@@ -34,7 +34,17 @@
 import type { CacheStats } from '@common/types/cache_stats'
 import { pickNormalCdnUrl } from '../biliApi'
 import { getSetting } from './setting'
-import { getDb, tx } from './db'
+import { getDb, tx, gcOrphanVideos } from './db'
+import { LOCAL_BVID_PREFIX } from './localVideo'
+
+/**
+ * 「不是本地文件条目」的 SQL 判据
+ *
+ * 用 `substr` 而不是 `LIKE 'lf\_%'`：后者里 `_` 是通配符，
+ * 想表达字面下划线还得带 `ESCAPE`，写错一次就静默失效（匹配到 `lfX…` 去了）。
+ * 前缀长度从常量推导，改前缀时这里跟着变，不会漂。
+ */
+const NOT_LOCAL_VIDEO = `substr(bvid, 1, ${LOCAL_BVID_PREFIX.length}) <> '${LOCAL_BVID_PREFIX}'`
 
 /**
  * 「B 站 playurl 响应」的最小形状
@@ -102,10 +112,10 @@ interface VideoMetaDbRow {
 }
 
 /**
- * `videos` 表的**完整行**（含地址列）
+ * 「候选行」的完整形状（含地址列）
  *
- * 只有「解析前要判断地址还能不能用」那条路需要它（`getVideoRow` / `getVideoAddress`）。
- * 地址列加起来约 27 KB/行，能少读就少读 —— 见 `db.ts` 里 `videos_meta` 的注释。
+ * 这是 `song_videos_view` 读出来的形状 —— 列名与旧 `videos` 表**逐字一致**
+ * （视图就是为此存在的），所以上层调用点完全看不出表已经被拆过。
  */
 interface VideoDbRow extends VideoMetaDbRow {
   durl_url: string | null
@@ -115,9 +125,39 @@ interface VideoDbRow extends VideoMetaDbRow {
 }
 
 /**
- * `videos` 的**全列**清单（含地址）—— 只有「解析前要读地址」那条路用它
+ * `videos` 表（视频实体）的一行
  *
- * 顺序与建表语句一致，一眼能对上。
+ * 按 bvid 取地址时用它：没有 `ord` / `favorites` / `search_key` ——
+ * 这些「每首歌独立」的字段已经搬到 `song_videos` 了。
+ */
+interface VideoAddressDbRow {
+  bvid: string
+  title: string | null
+  pic: string | null
+  author: string | null
+  duration: number | null
+  durl_url: string | null
+  dash_video: string | null
+  dash_audio: string | null
+  dash_duration: number | null
+  playurl_login_state: number | null
+  dash_tried: number
+  playurl_at: number | null
+}
+
+/** 地址列清单（`videos` 表按 bvid 读一行时用） */
+const ADDRESS_COLUMNS = `
+  bvid, title, pic, author, duration,
+  durl_url, dash_video, dash_audio, dash_duration,
+  playurl_login_state, dash_tried, playurl_at
+`
+
+/**
+ * `videos` 的**全列**清单（含地址）
+ *
+ * ⚠️ 现在指向的是**视图** `song_videos_view`（由 `song_videos` LEFT JOIN `videos` 组成），
+ * 不是基表。视图的列名与顺序与旧 `videos` 表逐字一致，所以这份常量一个字都不用改 ——
+ * 这正是拆表时特意保留那个视图的原因。
  */
 const VIDEO_COLUMNS = `
   search_key, bvid, ord, title, pic, author, duration, favorites,
@@ -179,6 +219,24 @@ const parseJson = <T>(raw: string | null): T | undefined => {
 }
 
 /**
+ * 去掉搜索结果里的关键词高亮标签，得到**干净标题**
+ *
+ * 拆表后标题有两个归宿：
+ *  - 带 `<em class="keyword">` 的那份进 `song_videos.title_hl`（高亮是「每次搜索」的产物）；
+ *  - 去标签的干净标题进 `videos.title`（视频实体，全局一份）。
+ *
+ * 空标题返回 null 而不是 ''：`videos.title` 的 upsert 用的是
+ * `COALESCE(NULLIF(excluded.title,''), videos.title)`，'' 会被当成「没给」，
+ * 而 NULL 语义更明确（这里确实没有标题）。
+ */
+const stripHighlight = (title: string | null | undefined): string | null => {
+  const raw = typeof title === 'string' ? title : ''
+  if (!raw) return null
+  const clean = raw.replace(/<em class="keyword">/g, '').replace(/<\/em>/g, '')
+  return clean || null
+}
+
+/**
  * 把 `videos` 行的结构化列拼回「B 站 playurl 响应」的最小形状
  *
  * **入参必须是完整行**（含地址列）。元数据行没有地址，调用方要先用
@@ -198,7 +256,9 @@ const parseJson = <T>(raw: string | null): T | undefined => {
  * 在 schema v4 删掉了（durl 档位从 `durl_url` 反推、展示名走内置档位表），
  * 所以这里也不再有它们 —— `readVideoQuality` 改为认 URL。
  */
-const toPlayUrlLike = (row: VideoDbRow): PlayUrlLike | null => {
+const toPlayUrlLike = (
+  row: Pick<VideoAddressDbRow, 'durl_url' | 'dash_video' | 'dash_audio' | 'dash_duration'>,
+): PlayUrlLike | null => {
   if (!row.durl_url && !row.dash_video && !row.dash_audio) return null
 
   const video = parseJson<unknown[]>(row.dash_video)
@@ -308,35 +368,36 @@ const extractPlayurlColumns = (playurl: unknown): PlayurlColumns => {
 /** 该缓存键下现有的最大 ord（空表返回 -1，方便 +1 得到 0） */
 const maxOrdOf = (cacheKey: string): number => {
   const row = getDb()
-    .prepare(`SELECT MAX(ord) AS maxOrd FROM videos WHERE search_key = ?`)
+    .prepare(`SELECT MAX(ord) AS maxOrd FROM song_videos WHERE search_key = ?`)
     .get(cacheKey) as { maxOrd: number | null } | undefined
   return row?.maxOrd ?? -1
 }
 
 /**
- * 按主键取一行**完整行**（内部用：要读到地址那几列）
+ * 按 (search_key, bvid) 取一行**候选行**（含地址）
  *
- * 这是**唯一**会读地址列的内部读取点 —— 地址列约 27 KB/行，
- * 其它地方一律走 `videos_meta` 视图（见 `db.ts` 里视图的注释）。
+ * 走视图：拆表之后「地址」在 `videos`、「顺序/收藏/高亮标题」在 `song_videos`，
+ * 而调用方要的是两者拼起来的旧形状 —— 视图已经把这件事写了一次，
+ * 不需要每个调用点自己 join（漏一处就是「某条候选地址突然变 NULL」这种难查的 bug）。
  */
 const getVideoRow = (cacheKey: string, bvid: string): VideoDbRow | undefined =>
   getDb()
-    .prepare(`SELECT ${VIDEO_COLUMNS} FROM videos WHERE search_key = ? AND bvid = ?`)
+    .prepare(`SELECT ${VIDEO_COLUMNS} FROM song_videos_view WHERE search_key = ? AND bvid = ?`)
     .get(cacheKey, bvid) as VideoDbRow | undefined
 
 /**
  * 取某个 bvid 的**播放地址信息**（给 `api:resolveVideo` 判断能不能直接用缓存）
  *
- * 为什么要单独开一个函数，而不是让调用方从 `get()` 的整包里翻：
- * `get()` 返回的是**整份候选列表**，而解析时只关心**当前这一个 bvid**。
- * 从整包里翻意味着把 300 行的 dash JSON（好几 MB）全读出来只为了用其中一行 ——
- * 实测读全列 9.6 ms、只读一行带地址的行不到 0.1 ms。
+ * ## 为什么参数从 (cacheKey, bvid) 变成只有 bvid
  *
- * 返回值里的 `playurl` 已经拼成 `extractDashStreams` 等函数认识的形状；
- * 没解析过（三个地址列全空）时为 null。
+ * 拆表之后地址列只跟 bvid 有关：同一个视频无论从哪首歌、哪个视频列表进来，
+ * 能播的地址都是同一份。旧签名的 `cacheKey` 唯一作用就是「定位到 (search_key, bvid)
+ * 那一行」，而在新结构里 `videos.bvid` 本身就是主键。
+ *
+ * 少一个参数也顺带让 **B 站列表的直连条目**能直接复用这个函数 ——
+ * 它们在 `song_videos` 里只有 `bv:<bvid>` 这一行，没有音乐那边的键。
  */
 export const getVideoAddress = (
-  cacheKey: string,
   bvid: string,
 ): {
   durlUrl: string | null
@@ -345,9 +406,11 @@ export const getVideoAddress = (
   dashTried: boolean
   playurlAt: number | null
 } | null => {
-  if (!cacheKey || !bvid) return null
+  if (!bvid) return null
   try {
-    const row = getVideoRow(cacheKey, bvid)
+    const row = getDb()
+      .prepare(`SELECT ${ADDRESS_COLUMNS} FROM videos WHERE bvid = ?`)
+      .get(bvid) as VideoAddressDbRow | undefined
     if (!row) return null
     return {
       durlUrl: row.durl_url,
@@ -378,6 +441,42 @@ export const listVideos = (cacheKey: string): VideoRow[] => {
     .prepare(`SELECT ${META_COLUMNS} FROM videos_meta WHERE search_key = ? ORDER BY ord ASC`)
     .all(cacheKey) as VideoMetaDbRow[]
   return rows.map(toVideoRow)
+}
+
+/**
+ * 直连条目的「候选列表」—— **只有一条**，就是它自己
+ *
+ * ## 它为什么存在
+ *
+ * B 站视频列表（收藏夹 / 合集）的条目本来就是视频，不需要搜索、打分、过滤。
+ * 但如果给它们另开一条播放链路，渲染层、预热、换源、续播、壁纸嵌入全都要分支。
+ *
+ * 所以做法是：导入时在 `song_videos` 里给它留一行 `search_key = 'bv:<bvid>'`，
+ * `api:searchSong` 一看到这个前缀就**短路**，直接返回这里的结果。
+ * 于是播放引擎看到的和「已经搜到结果、只有一个候选」完全一样 —— 一行分支都不用加。
+ *
+ * `ord = 0`、`favorites = 0` 是导入时写死的：
+ * **不能**用 `favorites = 1` 表示「唯一候选」—— 用户点一下爱心取消收藏，
+ * 那行就变成 0，任何「清理未收藏候选」的逻辑都会把它删掉，视频就消失了。
+ */
+export const listDirectCandidates = (cacheKey: string, bvid: string): CachedSearchItem[] => {
+  if (!cacheKey || !bvid) return []
+  try {
+    const rows = getDb()
+      .prepare(`SELECT ${META_COLUMNS} FROM videos_meta WHERE search_key = ? AND bvid = ?`)
+      .all(cacheKey, bvid) as VideoMetaDbRow[]
+    return rows.map((row) => ({
+      bvid: row.bvid,
+      title: row.title ?? '',
+      pic: row.pic ?? undefined,
+      author: row.author ?? undefined,
+      duration: row.duration,
+      favorites: row.favorites === 1,
+    }))
+  } catch (err) {
+    console.error('[cache] 读取直连候选失败:', err)
+    return []
+  }
 }
 
 /**
@@ -483,7 +582,7 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
      */
     const existing = new Map<string, VideoDbRow>()
     for (const row of db
-      .prepare(`SELECT ${VIDEO_COLUMNS} FROM videos WHERE search_key = ?`)
+      .prepare(`SELECT ${VIDEO_COLUMNS} FROM song_videos_view WHERE search_key = ?`)
       .all(keyword) as VideoDbRow[]) {
       existing.set(row.bvid, row)
     }
@@ -505,22 +604,46 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
     )
 
     tx(() => {
-      db.prepare(`DELETE FROM videos WHERE search_key = ?`).run(keyword)
+      /**
+       * ★ 只删**关系行**，`videos` 里的实体与地址缓存必须留着
+       *
+       * 这是拆表带来的最大行为变化，也是收益所在：
+       *  - 旧结构里这句 DELETE 会连地址一起删掉，所以必须「先读旧行、再插回去」
+       *    搬运 9 个地址列（漏一个就是「刷新一下，所有地址全丢」）；
+       *  - 现在地址在 `videos`、以 bvid 为主键，**根本不在被删的那张表里** ——
+       *    搬运逻辑整段消失，同一个 bvid 被别的搜索键 / 视频列表引用时也不会被连坐。
+       */
+      db.prepare(`DELETE FROM song_videos WHERE search_key = ?`).run(keyword)
 
       /**
-       * 列清单是**全量**的：展示字段 + 顺序 + 收藏 + 全部地址列。
-       * 少写一个地址列，对应那种地址就会在每次刷新列表时被清成 NULL。
+       * 实体用 upsert：只更新**非空的新值**，缺的保留旧值。
+       *
+       * 不能整体覆盖：`save` 只带来「搜索结果里的展示字段」，
+       * 而 `pic` / `duration` 往往来自 view 响应（更准），搜索结果里可能是空的 ——
+       * 覆盖会把好数据抹成空。
        */
-      const insert = db.prepare(
-        `INSERT INTO videos
-           (search_key, bvid, ord, title, pic, author, duration, favorites,
-            durl_url, dash_video, dash_audio, dash_duration,
-            playurl_login_state, dash_tried, playurl_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      const upsertVideo = db.prepare(
+        `INSERT INTO videos (bvid, title, pic, author, duration)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bvid) DO UPDATE SET
+           title    = COALESCE(NULLIF(excluded.title, ''), videos.title),
+           pic      = COALESCE(excluded.pic, videos.pic),
+           author   = COALESCE(excluded.author, videos.author),
+           duration = COALESCE(excluded.duration, videos.duration)`,
+      )
+      /**
+       * 关系行：`title_hl` 存**带高亮**的标题，空串一律写 NULL
+       *
+       * ⚠️ 必须是 NULL 而不是 ''：视图里是 `COALESCE(sv.title_hl, v.title)`，
+       * 空串会赢过实体表里的干净标题，列表里就变成一条没有标题的候选。
+       */
+      const insertRelation = db.prepare(
+        `INSERT INTO song_videos (search_key, bvid, ord, favorites, title_hl)
+         VALUES (?, ?, ?, ?, ?)`,
       )
 
       /**
-       * 写一行：展示字段取新结果的（缺失回落旧值），其余一律沿用旧行。
+       * 写一行：展示字段取新结果的（缺失回落旧值），其余由实体表的 upsert 兜住。
        *
        * `ord` 永远用本次下标：顺序的权威就是调用方传进来的数组顺序。
        */
@@ -532,27 +655,9 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
         author: string | null,
         duration: number | null,
         favorites: number,
-        old: VideoDbRow | undefined,
       ): void => {
-        insert.run(
-          keyword,
-          bvid,
-          ord,
-          title,
-          pic,
-          author,
-          duration,
-          favorites,
-          // ↓↓ 地址列：唯一来源是旧行（新搜索结果里没有地址）↓↓
-          old?.durl_url ?? null,
-          old?.dash_video ?? null,
-          old?.dash_audio ?? null,
-          old?.dash_duration ?? null,
-          old?.playurl_login_state ?? null,
-          // `dash_tried` 是 NOT NULL：没有旧行（全新条目）就是 0 = 没试过
-          old?.dash_tried ?? 0,
-          old?.playurl_at ?? null,
-        )
+        upsertVideo.run(bvid, stripHighlight(title), pic, author, duration)
+        insertRelation.run(keyword, bvid, ord, favorites, title || null)
       }
 
       incoming.slice(0, MAX_VIDEOS_PER_KEY).forEach((item, index) => {
@@ -569,7 +674,6 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
            */
           item.duration ?? old?.duration ?? null,
           old?.favorites ?? 0,
-          old,
         )
       })
 
@@ -582,7 +686,6 @@ export const save = async (keyword: string, data: unknown): Promise<boolean> => 
           row.author,
           row.duration,
           1,
-          row,
         )
       })
     })
@@ -651,17 +754,22 @@ export const updateVideoResult = (
   noDash: boolean,
   meta?: { title?: string; pic?: string | null; author?: string | null; duration?: number | null },
 ): void => {
-  if (!cacheKey || !bvid) return
+  if (!bvid) return
   try {
     const db = getDb()
     const setPlayurl = playurl !== undefined
     tx(() => {
-      const old = getVideoRow(cacheKey, bvid)
+      /** 地址行（实体）—— 可能不存在（这个视频第一次被解析） */
+      const addressRow = db
+        .prepare(`SELECT dash_tried, playurl_login_state FROM videos WHERE bvid = ?`)
+        .get(bvid) as
+        | { dash_tried: number | null; playurl_login_state: number | null }
+        | undefined
 
       /**
        * 地址列只在真的重新解析过时写；`extractPlayurlColumns` 是整包响应
-       * 转结构化列的**唯一**实现（UPDATE 与 INSERT 两条路共用它，
-       * 避免「一边存全量 dash、一边只存挑中的那条」这种查起来极痛苦的漂移）。
+       * 转结构化列的**唯一**实现（避免「一边存全量 dash、一边只存挑中的那条」
+       * 这种查起来极痛苦的漂移）。
        */
       const cols = setPlayurl ? extractPlayurlColumns(playurl) : null
 
@@ -671,25 +779,53 @@ export const updateVideoResult = (
        * 清了的话下次解析又会去试一遍 dash，而它刚刚才失败过。
        * 反过来 `noDash=false` 且拿到了 dash，自然是 1。
        */
-      const dashTried = setPlayurl ? (!noDash || (old?.dash_tried ?? 0) === 1 ? 1 : 0) : null
+      const dashTried = !noDash || (addressRow?.dash_tried ?? 0) === 1 ? 1 : 0
       /**
        * 登录态：`null`（这次没问到）**保留旧值**。
        * 旧行也没有时写 NULL 而不是 0 ——「未知」和「未登录」必须区分，
        * 理由见函数头注释。
+       *
+       * ⚠️ 拆表后它从 per-song 变成 per-bvid：同一个视频只保留最后一次取地址时的登录态。
+       * 这是**语义变化**（见 ARCHITECTURE 的取舍记录）。
        */
       const loginState =
         playurlLoginState === null
-          ? (old?.playurl_login_state ?? null)
+          ? (addressRow?.playurl_login_state ?? null)
           : playurlLoginState
             ? 1
             : 0
 
+      /**
+       * ① 实体行：展示字段「有值才覆盖空的」，行不存在就新建
+       *
+       * 不整体覆盖 title/pic —— `meta` 的封面来自 view 响应、标题来自搜索结果，
+       * 而库里已有的那份同样是这两个来源写进去的，没必要互相盖。
+       * 只在库里是空的时候补，避免把带 `<em>` 的高亮标题盖成 view 的纯文本标题
+       * （高亮那份本来就在 song_videos.title_hl，实体表只存干净标题）。
+       */
+      db.prepare(
+        `INSERT INTO videos (bvid, title, pic, author, duration)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bvid) DO UPDATE SET
+           title    = COALESCE(NULLIF(videos.title, ''), excluded.title),
+           pic      = COALESCE(videos.pic, excluded.pic),
+           author   = COALESCE(videos.author, excluded.author),
+           duration = COALESCE(videos.duration, excluded.duration)`,
+      ).run(
+        bvid,
+        stripHighlight(meta?.title),
+        meta?.pic ?? null,
+        meta?.author ?? null,
+        meta?.duration ?? null,
+      )
+
+      /** ② 地址列：`WHERE bvid = ?` —— `search_key` 彻底不需要了（拆表的收益之一） */
       if (setPlayurl) {
         db.prepare(
           `UPDATE videos
               SET durl_url = ?, dash_video = ?, dash_audio = ?, dash_duration = ?,
                   playurl_login_state = ?, dash_tried = ?, playurl_at = ?
-            WHERE search_key = ? AND bvid = ?`,
+            WHERE bvid = ?`,
         ).run(
           cols!.durlUrl,
           cols!.dashVideo,
@@ -699,69 +835,40 @@ export const updateVideoResult = (
           dashTried,
           // 地址与时间是**一起**写的：只写地址会让下一轮清理把新地址当成老数据删掉
           Date.now(),
-          cacheKey,
           bvid,
         )
       }
 
       /**
-       * 保证 `videos` 里有这一行
+       * ③ 保证这个 bvid 在**候选关系**里有这一行
        *
-       * 不在库里 = 「正在播的视频不在候选列表里」（缓存被清了 / 该 bvid 不在本次
-       * 搜索结果里）。补一行让它下次能直接命中缓存 —— 这正是「正在播的视频」应有的待遇。
+       * 不在关系里 = 「正在播的视频不在候选列表里」（缓存被清了 / 该 bvid 不在本次
+       * 搜索结果里 / 从视频列表直连进来但关系行被清过）。补一行让它下次能直接命中 ——
+       * 这正是「正在播的视频」应有的待遇。
        * `ord` 取当前最大值 + 1（排在候选列表最后），`favorites` 保持 0：
        * 「播过」不等于「收藏过」，不能顺手给用户加一个收藏。
        */
-      if (old) {
-        /**
-         * 已存在：只补展示字段里「库里还是空的」那些。
-         *
-         * 不整体覆盖 title/pic —— `meta` 的封面来自 view 响应、标题来自搜索结果，
-         * 而库里已有的那份同样是这两个来源写进去的，没必要互相盖。
-         * 只在库里是空的时候补，避免把 `<em>` 高亮的标题盖成 view 的纯文本标题。
-         */
-        db.prepare(
-          `UPDATE videos
-              SET title = COALESCE(NULLIF(title, ''), ?),
-                  pic = COALESCE(pic, ?),
-                  author = COALESCE(author, ?),
-                  duration = COALESCE(duration, ?)
-            WHERE search_key = ? AND bvid = ?`,
-        ).run(
-          meta?.title ?? '',
-          meta?.pic ?? null,
-          meta?.author ?? null,
-          meta?.duration ?? null,
-          cacheKey,
-          bvid,
-        )
-        return
-      }
+      if (cacheKey) {
+        const rel = db
+          .prepare(`SELECT ord FROM song_videos WHERE search_key = ? AND bvid = ?`)
+          .get(cacheKey, bvid) as { ord: number } | undefined
+        const titleHl = stripHighlight(meta?.title)
 
-      db.prepare(
-        `INSERT INTO videos
-           (search_key, bvid, ord, title, pic, author, duration, favorites,
-            durl_url, dash_video, dash_audio, dash_duration,
-            playurl_login_state, dash_tried, playurl_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        cacheKey,
-        bvid,
-        maxOrdOf(cacheKey) + 1,
-        meta?.title ?? '',
-        meta?.pic ?? null,
-        meta?.author ?? null,
-        meta?.duration ?? null,
-        // 地址列：这一行不在库里，第一次写就是「新解析出来的那份」
-        cols?.durlUrl ?? null,
-        cols?.dashVideo ?? null,
-        cols?.dashAudio ?? null,
-        cols?.dashDuration ?? null,
-        loginState,
-        dashTried ?? (!noDash ? 1 : 0),
-        setPlayurl ? Date.now() : null,
-      )
-      console.log(`[cache] 已为「正在播但不在候选列表里」的视频补一条记录: ${bvid}`)
+        if (!rel) {
+          db.prepare(
+            `INSERT INTO song_videos (search_key, bvid, ord, favorites, title_hl)
+             VALUES (?, ?, ?, 0, ?)`,
+          ).run(cacheKey, bvid, maxOrdOf(cacheKey) + 1, titleHl)
+          console.log(`[cache] 已为「正在播但不在候选列表里」的视频补一条记录: ${bvid}`)
+        } else if (titleHl) {
+          /** 只补空的高亮标题，不覆盖已有那份（它可能带 <em> 关键词） */
+          db.prepare(
+            `UPDATE song_videos
+                SET title_hl = COALESCE(NULLIF(title_hl, ''), ?)
+              WHERE search_key = ? AND bvid = ?`,
+          ).run(titleHl, cacheKey, bvid)
+        }
+      }
     })
   } catch (err) {
     console.error('[cache] 写入解析结果失败:', err)
@@ -786,12 +893,25 @@ export const updateVideoResult = (
  */
 export const getStats = (): CacheStats => {
   try {
+    /**
+     * 条数口径是「候选条目数」= `song_videos` 行数
+     *
+     * 不能数 `videos`：拆表后一个 bvid 只有一行实体，同一个视频同时出现在
+     * 两首歌的候选里只算 1，统计会明显偏小。而界面上写的是「N 个视频」，
+     * 用户看到的是候选列表里那些条目。
+     */
     const count =
       (
-        getDb().prepare(`SELECT COUNT(*) AS count FROM videos`).get() as
+        getDb().prepare(`SELECT COUNT(*) AS count FROM song_videos`).get() as
           | { count: number }
           | undefined
       )?.count ?? 0
+    /**
+     * 体积按 `videos` 算（地址列都在它上面）
+     *
+     * bvid 唯一之后这个数字反而更准了：旧结构里同一个 bvid 在 3 首歌里
+     * 会被计 3 份体积（数字虚高）。
+     */
     const row = getDb()
       .prepare(
         `SELECT COALESCE(SUM(LENGTH(durl_url)), 0)   AS durlBytes,
@@ -815,35 +935,54 @@ export const getStats = (): CacheStats => {
  *
  * 「过期」现在只有一种含义：**播放直链过期**（元数据永不过期）。
  * 时长取设置里的 `cache.searchResultExpireMs`（0 = 永久，等于不清）。
- * 处理完成后顺手 `VACUUM` 不必做 —— 只更新字段不删行，不会产生大量碎片。
+ *
+ * 顺手跑一次孤儿 GC：拆表后「删候选关系」不会连带删视频实体
+ * （实体可能被别的搜索键 / 视频列表引用），没人引用的那些只能靠这里回收。
  */
 export const prune = (): CacheStats => {
   const maxAge = Number(getSetting()['cache.searchResultExpireMs']) || 0
   clearExpiredPlayurl(maxAge)
+  gcOrphanVideos()
   return getStats()
 }
 
 /**
- * 清空全部缓存（`videos` + `song_meta`）
+ * 清空全部缓存
  *
- * 语义就是「全部清除」：收藏、选中视频、播放地址一起没了。
- * 界面上那个按钮的文案也是「全部清除」，两边必须一致 ——
- * 用户点「全部清除」的预期就是回到干净状态。
+ * 语义是「回到干净状态」：**搜索候选、收藏、选中视频、播放地址**一起清掉。
+ * 界面上那个按钮的文案也是「全部清除」，两边必须一致。
  *
- * **只需要清两张表**：schema v2 把解析结果合回了 `videos`，`video_details` 已经删掉
- * （以前这里必须三张表一起清，只清 `videos` 会留下一堆没人引用的 `video_details`，
- * 磁盘占用并不会降下来 —— 而用户点这个按钮就是为了腾空间）。
- * `playlists` / `playlist_songs` **不在这里清**：那是歌单本身，不是缓存。
+ * ## ⚠️ 但要保住 B 站视频列表
+ *
+ * 那些条目不是「缓存」，是用户导入的内容（收藏夹 / 合集）。如果按旧实现
+ * 一句 `DELETE FROM videos` 全清，视频列表会变成几百行「只有 bvid、没有标题」的空壳。
+ * 所以分成三步：
+ *
+ *  1. 只删**音乐搜索**的候选关系（`search_key NOT LIKE 'bv:%'`）；
+ *  2. 地址列一律清空 —— 这是体积大头，用户点这个按钮就是为了腾空间；
+ *  3. 实体行只保留「`videolist_items` 还在引用」的那些。
+ *
+ * `playlists` / `playlist_songs` / `videolists` / `videolist_items` **不在这里清**：
+ * 那是歌单与列表本身，不是缓存。
  */
 export const clearAll = async (): Promise<boolean> => {
   try {
     const before = getStats().count
     tx(() => {
       const db = getDb()
-      db.prepare(`DELETE FROM videos`).run()
+      db.prepare(`DELETE FROM song_videos WHERE search_key NOT LIKE 'bv:%'`).run()
       db.prepare(`DELETE FROM song_meta`).run()
+      db.prepare(
+        `UPDATE videos
+            SET durl_url = NULL, dash_video = NULL, dash_audio = NULL,
+                dash_duration = NULL, playurl_at = NULL
+          WHERE ${NOT_LOCAL_VIDEO}`,
+      ).run()
+      db.prepare(
+        `DELETE FROM videos WHERE bvid NOT IN (SELECT bvid FROM videolist_items)`,
+      ).run()
     })
-    console.log(`[cache] 已清空缓存（${before} 条视频记录 + 播放地址与选中记录）`)
+    console.log(`[cache] 已清空缓存（${before} 条候选 + 全部播放地址；视频列表内容保留）`)
     return true
   } catch (err) {
     console.error('[cache] 清空失败:', err)
@@ -891,10 +1030,9 @@ export const setFavorite = (cacheKey: string, bvid: string, favorite: boolean): 
       if (!favorite) {
         /** 库里没这一行就没什么可取消的（新行只可能是"添加视频"，必然已收藏） */
         if (!existing) return
-        db.prepare(`UPDATE videos SET favorites = 0 WHERE search_key = ? AND bvid = ?`).run(
-          cacheKey,
-          bvid,
-        )
+        db.prepare(
+          `UPDATE song_videos SET favorites = 0 WHERE search_key = ? AND bvid = ?`,
+        ).run(cacheKey, bvid)
         return
       }
 
@@ -932,7 +1070,7 @@ export const setFavorite = (cacheKey: string, bvid: string, favorite: boolean): 
        * 已经在第一位时第一条命中 0 行、第二条置 0，整体幂等。
        */
       const bound = maxOrdOf(cacheKey) + 1
-      db.prepare(`UPDATE videos SET ord = ord + 1 WHERE search_key = ? AND ord < ?`).run(
+      db.prepare(`UPDATE song_videos SET ord = ord + 1 WHERE search_key = ? AND ord < ?`).run(
         cacheKey,
         bound,
       )
@@ -940,19 +1078,23 @@ export const setFavorite = (cacheKey: string, bvid: string, favorite: boolean): 
       if (existing) {
         /** 已有行：只改标记 + 挪位置（标题封面等原样保留） */
         db.prepare(
-          `UPDATE videos SET favorites = 1, ord = 0 WHERE search_key = ? AND bvid = ?`,
+          `UPDATE song_videos SET favorites = 1, ord = 0 WHERE search_key = ? AND bvid = ?`,
         ).run(cacheKey, bvid)
       } else {
         /**
-         * 库里没有这一行（「添加视频」加了个搜索没搜到的 BV 号）：
+         * 关系行不存在（「添加视频」加了个搜索没搜到的 BV 号）：
          * 在这里**新插一行**并把 `ord` 直接写成 0。
          *
          * 标题 / 封面 / 时长先留空 —— 调用方（`api:setFavorite`）会先用
          * `api:parseVideo` 拿到的信息调 `upsertVideoMeta` 补上。
+         *
+         * 顺带保证 `videos` 里有一行空实体：视图是 LEFT JOIN，没有它也能查到，
+         * 但先建出来能让后续「按 bvid 读地址」的路径少一次判空。
          */
+        db.prepare(`INSERT OR IGNORE INTO videos (bvid) VALUES (?)`).run(bvid)
         db.prepare(
-          `INSERT INTO videos (search_key, bvid, ord, title, pic, author, duration, favorites)
-           VALUES (?, ?, 0, '', NULL, NULL, NULL, 1)`,
+          `INSERT INTO song_videos (search_key, bvid, ord, favorites, title_hl)
+           VALUES (?, ?, 0, 1, NULL)`,
         ).run(cacheKey, bvid)
       }
     })
@@ -980,25 +1122,49 @@ export const upsertVideoMeta = (
   try {
     tx(() => {
       const db = getDb()
-      const existing = getVideoRow(cacheKey, video.bvid)
-      const title = video.title || existing?.title || ''
-      const pic = video.pic ?? existing?.pic ?? null
-      const author = video.author ?? existing?.author ?? null
-      const duration = video.duration ?? existing?.duration ?? null
+      /**
+       * 拆表后「元数据」跨两张表：
+       *  - 标题 / 封面 / UP 主 / 时长 → `videos`（按 bvid，全局一份）；
+       *  - 「它在某个候选列表里」→ `song_videos`（关系行）。
+       *
+       * 两个都要保证存在：只写实体的话，视频列表 / 候选列表里看不到它；
+       * 只写关系的话，视图 LEFT JOIN 出来是一条没标题的空壳。
+       */
+      const entity = db
+        .prepare(`SELECT title, pic, author, duration FROM videos WHERE bvid = ?`)
+        .get(video.bvid) as
+        | {
+            title: string | null
+            pic: string | null
+            author: string | null
+            duration: number | null
+          }
+        | undefined
 
-      if (existing) {
-        db.prepare(
-          `UPDATE videos SET title = ?, pic = ?, author = ?, duration = ?
-            WHERE search_key = ? AND bvid = ?`,
-        ).run(title, pic, author, duration, cacheKey, video.bvid)
-        return
-      }
+      const title = stripHighlight(video.title) ?? entity?.title ?? null
+      const pic = video.pic ?? entity?.pic ?? null
+      const author = video.author ?? entity?.author ?? null
+      const duration = video.duration ?? entity?.duration ?? null
 
       db.prepare(
-        `INSERT INTO videos
-           (search_key, bvid, ord, title, pic, author, duration, favorites)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-      ).run(cacheKey, video.bvid, maxOrdOf(cacheKey) + 1, title, pic, author, duration)
+        `INSERT INTO videos (bvid, title, pic, author, duration)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bvid) DO UPDATE SET
+           title    = COALESCE(excluded.title, videos.title),
+           pic      = COALESCE(excluded.pic, videos.pic),
+           author   = COALESCE(excluded.author, videos.author),
+           duration = COALESCE(excluded.duration, videos.duration)`,
+      ).run(video.bvid, title, pic, author, duration)
+
+      const rel = db
+        .prepare(`SELECT ord FROM song_videos WHERE search_key = ? AND bvid = ?`)
+        .get(cacheKey, video.bvid) as { ord: number } | undefined
+      if (!rel) {
+        db.prepare(
+          `INSERT INTO song_videos (search_key, bvid, ord, favorites, title_hl)
+           VALUES (?, ?, ?, 0, NULL)`,
+        ).run(cacheKey, video.bvid, maxOrdOf(cacheKey) + 1)
+      }
     })
   } catch (err) {
     console.error('[cache] 写入视频元数据失败:', err)
@@ -1011,7 +1177,7 @@ export const getFavorites = (cacheKey: string): string[] => {
   try {
     const rows = getDb()
       .prepare(
-        `SELECT bvid FROM videos WHERE search_key = ? AND favorites = 1 ORDER BY ord ASC`,
+        `SELECT bvid FROM song_videos WHERE search_key = ? AND favorites = 1 ORDER BY ord ASC`,
       )
       .all(cacheKey) as Array<{ bvid: string }>
     return rows.map((r) => r.bvid)
@@ -1155,7 +1321,8 @@ export const clearExpiredPlayurl = (maxAgeMs: number): void => {
                 dash_duration = NULL, playurl_at = NULL
           WHERE (durl_url IS NOT NULL OR dash_video IS NOT NULL OR dash_audio IS NOT NULL
                  OR dash_duration IS NOT NULL)
-            AND (playurl_at IS NULL OR playurl_at < ?)`,
+            AND (playurl_at IS NULL OR playurl_at < ?)
+            AND ${NOT_LOCAL_VIDEO}`,
       )
       .run(cutoff)
     const changed = Number(result.changes) || 0

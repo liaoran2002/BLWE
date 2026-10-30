@@ -1664,7 +1664,7 @@ const firstDurl = (res: BiliResponse | null): string | null => {
  * 用户可能直接粘 BV 号，也可能粘整段分享文案（含标题、短链、?p=2 之类），
  * 所以先找 BV 号；找不到再把文本当链接去跟随跳转（b23.tv 短链）。
  */
-const BV_PATTERN = /BV[0-9A-Za-z]{10}/
+export const BV_PATTERN = /BV[0-9A-Za-z]{10}/
 
 /**
  * 跟随短链拿到最终 URL（b23.tv -> www.bilibili.com/video/BVxxx）
@@ -1723,6 +1723,437 @@ export const parseVideoInput = async (input: string): Promise<ParsedVideoInfo> =
     duration: typeof data?.duration === 'number' ? data.duration : null,
   }
 }
+
+// #region 视频列表（收藏夹 / 合集 / 系列）
+
+/**
+ * 视频列表的来源
+ *
+ * 与 `@common/types/playlist` 的 `VideoListKind` 保持一致 ——
+ * 那边是主/渲染共用的类型，这里的接口实现不能引入渲染层依赖，所以各自声明一份。
+ */
+export type BiliListKind = 'fav' | 'season' | 'series'
+
+const FAV_RESOURCE_API = 'https://api.bilibili.com/x/v3/fav/resource/list'
+const FAV_CREATED_API = 'https://api.bilibili.com/x/v3/fav/folder/created/list-all'
+
+/**
+ * 「订阅合集」的接口：**我收藏的（别人做的）列表**
+ *
+ * 一次请求同时带回两种东西，靠每条上的 `type` 区分：
+ * ```
+ * type = 21  视频合集（UGC season）   id = season_id，mid = **原作者** mid
+ * type = 11  收藏的收藏夹             id = 全局 fav id，fid = 收藏夹 id
+ * ```
+ * 我们只收 `type = 21`（这个入口就叫「订阅合集」）；`type = 11` 的 media_id
+ * 语义和合集不同，而且实测这一列里多半是「收藏夹失效」，收了也拉不到内容。
+ *
+ * ⚠️ **不要照名字去猜路径**。曾经按「收藏的合集 / 收藏的系列」各拼了一个
+ * `x/space/fav/season/list`、`x/space/fav/series/list` —— 前者返回
+ * `-404 啥都木有`，后者直接是 HTML 404 页面（路由根本不存在）。
+ * 真正的入口是这个 `x/v3/fav/folder/collected/list`（见 `Bili23-Downloader_B站接口清单.md` 3.2）。
+ */
+const FAV_COLLECTED_API = 'https://api.bilibili.com/x/v3/fav/folder/collected/list'
+const SEASON_ARCHIVES_API =
+  'https://api.bilibili.com/x/polymer/web-space/seasons_archives_list'
+const SERIES_ARCHIVES_API = 'https://api.bilibili.com/x/series/archives'
+const SERIES_META_API = 'https://api.bilibili.com/x/series/series'
+
+/** 列表里的一条视频（字段已经归一，主进程内部使用） */
+export interface BiliListItem {
+  bvid: string
+  title: string
+  cover: string | null
+  author: string | null
+  /** 秒。列表接口有的给数字、有的给 "04:03"，统一在这里转好 */
+  duration: number | null
+}
+
+/** 一个列表的元信息 + 内容 */
+export interface BiliListDetail {
+  kind: BiliListKind
+  id: string
+  mid?: string
+  name: string
+  cover: string | null
+  itemCount: number | null
+  items: BiliListItem[]
+  /** 跳过的条目数（合集条目 / 番剧 / 课程等第一版不支持的） */
+  skipped: number
+}
+
+/** 分页之间等一会：串行 + 300~500ms 是 B 站批量拉列表的经验值 */
+const LIST_PAGE_DELAY_MS = 380
+
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 把接口里的 duration / length 归一成**秒**（数字或 "04:03" 两种形状都有） */
+const readDuration = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
+  if (typeof value === 'string' && value.trim()) return durationToSeconds(value)
+  return null
+}
+
+/** 列表接口的错误码翻成人话（不把接口原文抛到界面上） */
+const listErrorMessage = (code: number, fallback: string): string => {
+  if (code === -403) return '没有权限访问这个列表：私密收藏夹需要先登录，而且必须是本人'
+  if (code === -404) return '这个列表不存在，或者已经被删除了'
+  if (code === -400) return '链接里的列表 id 不对，请重新复制一次'
+  if (code === -412) return '请求太频繁被拦截了，请等一会儿再试'
+  console.warn(`[list] 接口返回非 0（code=${code}）：${fallback}`)
+  return '读取列表失败，请稍后再试'
+}
+
+/**
+ * 拉一个视频列表（内部自己分页 + 限速）
+ *
+ * ## 为什么三种来源写在一个函数里而不是三个导出
+ *
+ * 它们的**返回形状必须一致**（`BiliListItem[]`），差异只在「打哪个接口、字段叫什么」。
+ * 分成三个函数的话，上层 `utils/videolist.ts` 就要写三个分支，
+ * 而「分页 / 限速 / 跳过不支持条目 / 归一字段」这些逻辑会在三处各写一遍。
+ *
+ * ## 必须限条数
+ *
+ * 一个收藏夹可能有几千条。`max` 默认 500（够用且不至于打十几个请求触发风控）；
+ * 想全量就显式传更大的值。
+ */
+export const fetchBiliList = async (
+  kind: BiliListKind,
+  id: string,
+  options: { mid?: string; max?: number } = {},
+): Promise<BiliListDetail> => {
+  const max = Math.max(1, options.max ?? 500)
+  const items: BiliListItem[] = []
+  let skipped = 0
+  let name = ''
+  let cover: string | null = null
+  let itemCount: number | null = null
+
+  /** 一条一条推进来（带「是否合集条目 / 番剧」的判断，统一在这里做） */
+  const push = (raw: {
+    bvid?: unknown
+    title?: unknown
+    cover?: unknown
+    author?: unknown
+    duration?: unknown
+    type?: unknown
+  }): void => {
+    const bvid = typeof raw.bvid === 'string' ? raw.bvid.trim() : ''
+    if (!bvid) {
+      skipped += 1
+      return
+    }
+    /**
+     * `type === 21` 是**合集条目**：它的 bvid 是指向合集的占位，直接拿去播会失败。
+     * 第一版跳过并计数（提示用户），不静默忽略。
+     */
+    if (Number(raw.type) === 21) {
+      skipped += 1
+      return
+    }
+    items.push({
+      bvid,
+      title: typeof raw.title === 'string' ? raw.title : '',
+      cover: typeof raw.cover === 'string' && raw.cover ? raw.cover : null,
+      author: typeof raw.author === 'string' && raw.author ? raw.author : null,
+      duration: readDuration(raw.duration),
+    })
+  }
+
+  if (kind === 'fav') {
+    const pageSize = 40
+    for (let page = 1; items.length < max; page += 1) {
+      const res = await biliGet(
+        `${FAV_RESOURCE_API}?media_id=${encodeURIComponent(id)}&pn=${page}` +
+          `&ps=${pageSize}&order=mtime&type=0&tid=0&platform=web&web_location=333.1387`,
+      )
+      if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+      const data = res.data as
+        | {
+            info?: { title?: unknown; cover?: unknown; media_count?: unknown }
+            medias?: unknown
+            has_more?: unknown
+          }
+        | undefined
+      if (!name) {
+        name = typeof data?.info?.title === 'string' ? data.info.title : ''
+        cover = typeof data?.info?.cover === 'string' ? data.info.cover : null
+        itemCount =
+          typeof data?.info?.media_count === 'number' ? data.info.media_count : null
+      }
+      const medias = Array.isArray(data?.medias) ? (data.medias as Array<Record<string, unknown>>) : []
+      for (const media of medias) {
+        const upper = media['upper'] as { name?: unknown } | undefined
+        push({
+          bvid: media['bvid'],
+          title: media['title'],
+          cover: media['cover'],
+          author: typeof upper?.name === 'string' ? upper.name : undefined,
+          duration: media['duration'],
+          type: media['type'],
+        })
+        if (items.length >= max) break
+      }
+      if (data?.has_more !== true || medias.length === 0) break
+      await sleepMs(LIST_PAGE_DELAY_MS)
+    }
+  } else if (kind === 'season') {
+    if (!options.mid) throw new Error('合集链接里缺少 UP 主 id，请换一条完整链接')
+    const pageSize = 30
+    for (let page = 1; items.length < max; page += 1) {
+      const res = await biliGet(
+        `${SEASON_ARCHIVES_API}?mid=${encodeURIComponent(options.mid)}` +
+          `&season_id=${encodeURIComponent(id)}&sort_reverse=false` +
+          `&page_size=${pageSize}&page_num=${page}&web_location=333.1387`,
+      )
+      if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+      const data = res.data as
+        | {
+            archives?: unknown
+            meta?: { name?: unknown; cover?: unknown; total?: unknown }
+            page?: { total?: unknown }
+          }
+        | undefined
+      if (!name) {
+        name = typeof data?.meta?.name === 'string' ? data.meta.name : ''
+        cover = typeof data?.meta?.cover === 'string' ? data.meta.cover : null
+        itemCount =
+          typeof data?.meta?.total === 'number'
+            ? data.meta.total
+            : typeof data?.page?.total === 'number'
+              ? (data.page.total as number)
+              : null
+      }
+      const archives = Array.isArray(data?.archives)
+        ? (data.archives as Array<Record<string, unknown>>)
+        : []
+      for (const arc of archives) {
+        push({
+          bvid: arc['bvid'],
+          title: arc['title'],
+          cover: arc['pic'],
+          duration: arc['duration'],
+        })
+        if (items.length >= max) break
+      }
+      if (archives.length === 0) break
+      await sleepMs(LIST_PAGE_DELAY_MS)
+    }
+  } else {
+    if (!options.mid) throw new Error('系列链接里缺少 UP 主 id，请换一条完整链接')
+    /** 系列内容接口**不返回标题**，元信息要单独打一次（Bili23 也是这么做的） */
+    const meta = await biliGet(
+      `${SERIES_META_API}?series_id=${encodeURIComponent(id)}&web_location=333.1387`,
+    )
+    if (meta.code === 0) {
+      const m = meta.data?.['meta'] as
+        | { name?: unknown; total?: unknown; mid?: unknown }
+        | undefined
+      name = typeof m?.name === 'string' ? m.name : ''
+      itemCount = typeof m?.total === 'number' ? m.total : null
+    }
+    const pageSize = 30
+    for (let page = 1; items.length < max; page += 1) {
+      const res = await biliGet(
+        `${SERIES_ARCHIVES_API}?mid=${encodeURIComponent(options.mid)}&current_mid=0` +
+          `&series_id=${encodeURIComponent(id)}&only_normal=true&sort=desc` +
+          `&ps=${pageSize}&pn=${page}`,
+      )
+      if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+      const data = res.data as { archives?: unknown } | undefined
+      const archives = Array.isArray(data?.archives)
+        ? (data.archives as Array<Record<string, unknown>>)
+        : []
+      for (const arc of archives) {
+        push({
+          bvid: arc['bvid'],
+          title: arc['title'],
+          cover: arc['pic'],
+          duration: arc['duration'],
+        })
+        if (items.length >= max) break
+      }
+      if (archives.length === 0) break
+      await sleepMs(LIST_PAGE_DELAY_MS)
+    }
+  }
+
+  return {
+    kind,
+    id,
+    mid: options.mid,
+    name: name || '未命名列表',
+    cover,
+    itemCount: itemCount ?? items.length,
+    items,
+    skipped,
+  }
+}
+
+/**
+ * 「我创建的收藏夹」列表（给导入弹窗里的选集入口）
+ *
+ * 一次拿全，不用翻页；要求登录（未登录拿不到 mid）。
+ *
+ * ## `cover` 是给界面用的，不是给逻辑用的
+ *
+ * 界面上这个入口是个**封面网格**（和视频列表里的条目一样），不是下拉菜单 ——
+ * 十几个收藏夹靠名字区分很费眼，封面一眼就能认出来。所以顺手把 `cover` 带出去。
+ *
+ * 拿不到就是 `null`（老收藏夹没设封面的情况真实存在），界面那边退化成纯色块，
+ * **不要**在主进程这里补一个占位图 URL —— 那是界面的事，而且 B 站没有稳定的
+ * 「默认封面」地址可拼。
+ */
+export const fetchMyFavFolders = async (): Promise<
+  { id: string; title: string; count: number; cover: string | null }[]
+> => {
+  const nav = await biliGet(NAV_API)
+  const mid = Number(nav.data?.['mid'])
+  if (!Number.isFinite(mid) || mid <= 0) throw new Error('请先登录后再读取收藏夹')
+
+  const res = await biliGet(`${FAV_CREATED_API}?up_mid=${mid}`)
+  if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+  const list = res.data?.['list']
+  if (!Array.isArray(list)) return []
+  return (list as Array<Record<string, unknown>>)
+    .map((item) => ({
+      id: String(item['id'] ?? ''),
+      title: typeof item['title'] === 'string' ? item['title'] : '未命名收藏夹',
+      count: typeof item['media_count'] === 'number' ? item['media_count'] : 0,
+      /**
+       * B 站给的是 `//i0.hdslb.com/bfs/...` 这种**协议相对**地址。
+       * 这里**原样返回**，交给渲染层的 `normalizeImageUrl` 补协议 ——
+       * 主进程已经有一处（`upsertVideoMeta` 存封面）也是这么分工的，
+       * 两边各补一次迟早会出现「一处补了 http、一处补了 https」的差异。
+       */
+      cover: typeof item['cover'] === 'string' && item['cover'] ? item['cover'] : null,
+    }))
+    .filter((item) => item.id)
+}
+
+/** 订阅合集里的一项（合集，带**作者** mid —— 拉合集内容必须用它） */
+export interface MySubList {
+  kind: 'season' | 'series'
+  id: string
+  mid: string
+  title: string
+  count: number
+  /** 合集封面（和 `fetchMyFavFolders` 一样原样返回协议相对地址，由渲染层补协议） */
+  cover: string | null
+}
+
+/**
+ * 「订阅合集」列表（我**收藏的**别人做的合集）
+ *
+ * 走 `x/v3/fav/folder/collected/list`，一次请求就能拿全，并且**不需要**额外参数
+ * 之外的东西（`up_mid` 传自己）。返回的每条里 `type = 21` 才是合集，
+ * `mid` 是**原作者**的 mid —— 拉合集内容（`seasons_archives_list`）必须带它，
+ * 补不出来就等于拉不到内容，所以这两条是硬条件，缺一条就跳过这一项。
+ *
+ * ## 分页
+ *
+ * 一页 50 条，最多翻 4 页（200 个订阅合集）。实测正常用户几十个就到底了；
+ * 上限在这里是**兜底**而不是功能 —— 真想导几百个，直接粘链接更省事。
+ *
+ * ## 失效的合集（`mid = 0` / `media_count = 0`）
+ *
+ * 收藏夹里被删掉的合集仍然会留在列表里，标题还叫「该合集已失效」。
+ * 这种**不进下拉**：它的 `mid` 是 0，导进来只会得到一句「读取合集失败」，
+ * 不如干脆不出现。
+ */
+export const fetchMySubscribedLists = async (): Promise<MySubList[]> => {
+  const nav = await biliGet(NAV_API)
+  const mid = Number(nav.data?.['mid'])
+  if (!Number.isFinite(mid) || mid <= 0) throw new Error('请先登录后再读取订阅合集')
+
+  const PAGE_SIZE = 50
+  const MAX_PAGES = 4
+  const out: MySubList[] = []
+  const seen = new Set<string>()
+
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const res = await biliGet(
+      `${FAV_COLLECTED_API}?up_mid=${mid}&pn=${page}&ps=${PAGE_SIZE}` +
+        `&platform=web&web_location=333.1387`,
+    )
+    /**
+     * 这里**不吞错误**：这个接口是「订阅合集」的唯一来源，
+     * 失败了就是没有内容可显示，把原文抛出去（「请先登录」/「请求过于频繁」）
+     * 远好过给一个空下拉让用户以为自己的收藏没了。
+     */
+    if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+
+    const data = res.data as { list?: unknown; has_more?: unknown } | undefined
+    const rows = Array.isArray(data?.list) ? (data.list as Array<Record<string, unknown>>) : []
+    if (rows.length === 0) break
+
+    for (const raw of rows) {
+      /** 只要合集；`type = 11` 是「收藏的收藏夹」，media_id 语义不同，不收 */
+      if (Number(raw['type']) !== 21) continue
+
+      const idRaw = raw['id'] ?? raw['season_id']
+      const id = idRaw === undefined || idRaw === null ? '' : String(idRaw)
+      const authorRaw = Number(raw['mid'] ?? 0)
+      if (!id || !Number.isFinite(authorRaw) || authorRaw <= 0) continue
+      if (seen.has(id)) continue
+      seen.add(id)
+
+      out.push({
+        kind: 'season',
+        id,
+        mid: String(authorRaw),
+        title:
+          (typeof raw['title'] === 'string' && raw['title']) ||
+          (typeof raw['name'] === 'string' && (raw['name'] as string)) ||
+          '未命名合集',
+        count: typeof raw['media_count'] === 'number' ? raw['media_count'] : 0,
+        cover: typeof raw['cover'] === 'string' && raw['cover'] ? raw['cover'] : null,
+      })
+    }
+
+    if (data?.has_more !== true) break
+  }
+
+  console.log(`[bili] 订阅合集 ${out.length} 个`)
+  return out
+}
+
+/**
+ * 从用户粘贴的链接 / 文本里识别「列表类型 + id」
+ *
+ * 正则照抄 Bili23 的 `url_pattern.py`（那套已经覆盖了 B 站各种入口形态）。
+ * 识别不出来返回 null —— 调用方要给用户一句「没认出这是列表链接」，
+ * 而不是拿空 id 去打接口。
+ */
+export const parseListInput = (text: string): { kind: BiliListKind; id: string; mid?: string } | null => {
+  const raw = String(text ?? '').trim()
+  if (!raw) return null
+
+  /** 收藏夹：www.bilibili.com/list/ml{fid} */
+  let m = /bilibili\.com\/list\/ml(\d+)/i.exec(raw)
+  if (m) return { kind: 'fav', id: m[1] }
+
+  /** 收藏夹：space.bilibili.com/{mid}/favlist?fid={fid} */
+  m = /[?&]fid=(\d+)/i.exec(raw)
+  if (m) return { kind: 'fav', id: m[1] }
+
+  /** 合集 / 系列：space.bilibili.com/{mid}/lists/{id}?type=season|series */
+  m = /space\.bilibili\.com\/(\d+)\/lists\/(\d+)\?(?:[^\s]*&)?type=(season|series)/i.exec(raw)
+  if (m) return { kind: m[3].toLowerCase() === 'series' ? 'series' : 'season', id: m[2], mid: m[1] }
+
+  /** 合集（播放页形态）：www.bilibili.com/list/{mid}?sid={id} */
+  m = /bilibili\.com\/list\/(\d+)\?(?:[^\s]*&)?sid=(\d+)/i.exec(raw)
+  if (m) return { kind: 'season', id: m[2], mid: m[1] }
+
+  /** 系列详情页：space.bilibili.com/{mid}/channel/seriesdetail?sid={id} */
+  m = /space\.bilibili\.com\/(\d+)\/channel\/seriesdetail\?(?:[^\s]*&)?sid=(\d+)/i.exec(raw)
+  if (m) return { kind: 'series', id: m[2], mid: m[1] }
+
+  return null
+}
+
+// #endregion
 
 export async function resolveVideoUrl(
   bvid: string,

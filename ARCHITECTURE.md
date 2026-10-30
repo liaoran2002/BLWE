@@ -11,6 +11,7 @@
 | 代码怎么组织的 | 架构设计（目录结构 / 配置数据流 / 类型链路 / 别名） |
 | 界面怎么拼的 | 界面布局、图标（iconfont）、界面颜色与毛玻璃（CSS 令牌） |
 | 播放链路怎么走的 | 清晰度 / 音质切换、清晰度角标、dash + MSE、缓冲提示、缓存里的播放地址 |
+| B 站视频列表（第二条进料管） | B 站视频列表：收藏夹 / 合集 / 系列（直连键 `bv:`、四张表、为什么不打分） |
 | 几个难搞的状态 | 登录态、切歌后播放器信息不刷新、续播、全屏与桌面壁纸 |
 | 数据与打包 | 数据存储、歌单解析、便携版数据目录、图标路径、为什么用 JSON、搜索缓存策略 |
 
@@ -47,10 +48,10 @@
 │   ├── main/
 │   │   ├── index.ts                # 入口：便携模式 → 初始化配置/歌单 → 注册 IPC → 建窗口
 │   │   ├── ipcHandlers.ts          # 组装各领域 handler（IpcContext 依赖注入）
-│   │   ├── protection.ts           # ★ 打包后渲染层资源的 blmv:// 解密协议
+│   │   ├── protection.ts           # ★ 打包后渲染层资源的 blwe:// 解密协议
 │   │   ├── bundleKey.ts            # 打包加密用的对称密钥（会被编进主进程字节码）
 │   │   ├── winWallpaper.ts         # ★ 桌面壁纸层（koffi 直调 Win32：WorkerW / SetParent）
-│   │   ├── portable.ts             # 便携版数据目录（%APPDATA% 优先，否则 exe 同级 blmvdata/）
+│   │   ├── portable.ts             # 便携版数据目录（%APPDATA% 优先，否则 exe 同级 blwedata/）
 │   │   ├── biliApi.ts              # B站 API（搜索/视频解析/WBI 签名/登录态）
 │   │   ├── music/                  # ★ 多平台歌单解析（移植自 LX 的 musicSdk）
 │   │   │   ├── index.ts            #   音源总表 + 按链接自动识别平台
@@ -97,7 +98,7 @@
 │       ├── SettingsDialog.vue      # ★ 设置弹窗
 │       ├── AboutDialog.vue         # ★ 关于弹窗（仓库地址 / 作者与 DeepSeek·大肥鱼头像）
 │       ├── AddVideoDialog.vue      # ★ 「添加视频」弹窗（粘贴链接 → 解析 → 收藏）
-│       ├── biliVideoControls.vue   #   播放控制栏
+│       ├── VideoControls.vue   #   播放控制栏
 │       └── showList.vue            #   歌曲/视频列表弹窗（放大镜搜索 / 刷新 / 爱心收藏）
 ├── scripts/protect.mjs             # ★ 打包保护流水线：字节码 + 混淆 + 资源加密
 ├── index.html / tray-menu.html     # 两个渲染入口
@@ -225,7 +226,7 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 > ⚠️ 改用 SQLite 之后这个闸门随 `playlists.json` 一起废弃了（且**不做迁移**），
 > 所以这个一次性升级现在**不会**再执行。见「数据存储（SQLite）」。
 
-底部的播放控制栏（播放、进度、音量、循环模式）由 `biliVideoControls` 负责，鼠标移上去才显现。
+底部的播放控制栏（播放、进度、音量、循环模式）由 `VideoControls` 负责，鼠标移上去才显现。
 音量按钮悬停时会弹出竖向音量条，**此时滚轮可调音量**（上滚 +5、下滚 −5）—— 滚轮监听挂在 `.audio-control` 上，判据就是「音量条显示着」，不用另外判断（那个 `.audio-control:hover` 同时决定条子显示和滚轮生效）。
 信息区两行：上行是 B 站视频标题，下行是 `歌曲名 - 歌手 · 专辑`，
 **行尾是清晰度和音质两个角标，点开即可切换**。
@@ -244,7 +245,7 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 
 - 两个角按钮共用 `.corner-btn` 外观（毛玻璃令牌 + 平时 `opacity: .2`、悬停到 1），
   只是 `left: 16px` / `right: 16px`。图标字体里没有锁，**用内联 SVG**（开锁/闭锁两种画法）。
-- **锁定 = 复用 `.wm-hidden`**：给标题栏和 `<biliVideoControls>` 加同一个 `display: none !important`
+- **锁定 = 复用 `.wm-hidden`**：给标题栏和 `<VideoControls>` 加同一个 `display: none !important`
   的类（壁纸模式也是这套），组件不卸载、内部状态（音量拖动等）不丢。
 - 踩过的坑：
 
@@ -393,7 +394,7 @@ Element Plus 的 `close-on-click-modal` 要求 mousedown/mouseup 都落在遮罩
 > 默认仍是 `10`（= 原来的 `0.1`），所以老用户观感不变。
 >
 > 存的是**百分比**，写进 CSS 时除 100（`opacity` 收小数）；悬停时 CSS 直接写死
-> `opacity: 1`（见 `biliVideoControls.vue`），所以这个设置只管闲置态。
+> `opacity: 1`（见 `VideoControls.vue`），所以这个设置只管闲置态。
 
 唯一不受淡出影响的是**左上角歌单按钮**：它常显（`opacity: 1`），悬停只让玻璃底实一点，
 不做透明度变化 —— 那个位置忽明忽暗很烦人。
@@ -1054,7 +1055,7 @@ if (this.frozenRemainMs !== null) {    // ← 恢复分支永远走不到
 - 壁纸模式下 `win:toggleFullscreen` 直接返回（几何由壁纸层接管）。
 - **壁纸模式 = 纯背景**：标题栏和控制栏都挂 `.wm-hidden`（`display: none`），窗口里没有可点的东西，
   所以原生层**不做鼠标 / 键盘转发**（那本来是为了把系统事件合成进壁纸窗口，现在没有可点的东西）。
-  操作全部走托盘菜单；「设置歌单」「退出登录」这类需要窗口的项会先 `restoreWindow()` 再执行。
+  操作全部走托盘菜单；「歌单管理 / 视频管理」「退出登录」这类需要窗口的项会先 `restoreWindow()` 再执行。
   另外进入时 `setSkipTaskbar(true)`、退出时恢复 `false`：壁纸是「桌面的一部分」，
   任务栏上不该多一个按钮（和最小化到托盘一样干净），要回窗口就左键点托盘图标。
 - **进壁纸模式先收掉所有弹窗**：壁纸模式下标题栏/控制栏都隐藏了，弹窗留在那儿既点不动也关不掉
@@ -1283,7 +1284,7 @@ GetAncestor(hwnd, GA_PARENT)  = 788750   ← 真实父窗口
 已播时长                视频时长        ← 两端对齐，中间不加 `/`
 [音量(悬停出横向条)] [上一首] [播放/暂停] [下一首] [模式切换]
 ──────────
-设置歌单 / 定时（有定时时显示倒计时）/ 壁纸模式·窗口模式 / 退出登录 / 退出程序
+歌单管理·视频管理（按当前 `ui.mode` 显示）/ 定时（有定时时显示倒计时）/ 壁纸模式·窗口模式 / 退出登录 / 退出程序
 ```
 
 > 菜单里所有文字**居中**（`.now` 与 `.item`）；「定时」那一项在倒计时期间是**蓝字**，
@@ -1301,10 +1302,11 @@ GetAncestor(hwnd, GA_PARENT)  = 788750   ← 真实父窗口
 | 音量 | 按钮点了静音（菜单**不收起**，方便接着调）；悬停出**横向**条，数字在条左边，拖动实时生效。**悬停时滚轮也能调**（上滚 +5、下滚 −5，和控制栏、键盘 ↑↓ 同一个步长）—— 监听挂在 `.volume` 外层，和「横条显示」的 `:hover` 范围完全重合，`passive: false` 才能 `preventDefault` |
 | **哪些动作不收起菜单** | 判据是「**这个动作会不会被连续使用**」，见下面单独一条 |
 | **悬停条不能竖着放** | 竖条会伸出面板、被窗口边界裁掉（窗口高度是按 `#menu` 量的，绝对定位的弹出条不算进去）。所以弹出条做成**横向**、留在面板内部 |
-| 收起 | 下面那几项（设置歌单 / 定时 / 壁纸模式 / 退出登录 / 退出程序）执行后收起；另外 `Esc`、失焦且**光标已经不在菜单上**、主窗口关闭时一起销毁 |
+| 收起 | 下面那几项（歌单管理·视频管理 / 定时 / 壁纸模式 / 退出登录 / 退出程序）执行后收起；另外 `Esc`、失焦且**光标已经不在菜单上**、主窗口关闭时一起销毁 |
 | 顶部一行 | 显示 `歌曲名 - 歌手名`（不是视频标题：B 站标题又长又带 `【4K】` 这类前缀） |
 | **定时的倒计时** | 计时器在渲染层（要读 `<video>` 判断暂停冻结 / 等视频播完），主进程**不自己算时间**：渲染层把 `sleepActive` + `sleepRemainSec` 随 `tray:updateState` 一起送上来，主进程原样塞进 `TrayMenuState`。菜单开着时渲染层每秒（`SleepTimer` 的订阅回调）推一次，暂停时也能跳 |
 | 关闭到托盘 | 菜单里「壁纸模式」那一项在窗口被藏起来时变成**「恢复窗口」**，动作也跟着换 |
+| **管理项文案跟工作区走** | 那一项按 `TrayMenuState.mode`（= 设置项 `ui.mode`）显示「歌单管理」或「视频管理」，点下去渲染层统一走 `openManager()` 打开当前模式的弹窗 —— 文案与落地页由**同一份** `ui.mode` 决定，不会出现"写着视频管理、打开的是歌单"。主进程 `onSettingChange` 里 `keys.includes('ui.mode')` 时补推一次 `trayMenu:state`，否则切换过模式后菜单文案会停在旧值 |
 | **动作必须跟着状态走** | 踩过：登录那一项的文案会随登录态变成「退出登录」，但动作写死成 `'login'` —— 点「退出登录」发的还是 login，用户看到的就是「点了又登录上了」。凡是文案会变的项，`action` 也要是函数 |
 | **每次弹出都要装兜底显示** | 踩过：页面「高度没变就不回报」，而显示这件事绑在 `trayMenu:ready` 上 —— 第一次右键能弹（高度 0→N），第二次开始不再回报，菜单就再也不出现（「进了壁纸模式后右键弹不出来」）。现在 `showTrayMenu` 每次都装兜底显示：**高度已知**（第二次以后）等 120ms 抢速度，**首次**（`trayMenuHeight` 还是 0、页面正在加载）等 1s，让页面先回报高度 |
 | **首屏不能抢跑 + 已显示也要能自纠** | 踩过：首次右键时兜底用了硬编码 `300`，而菜单真实高度约 240，内容是**从窗口顶部往下排**的，多出来的 60px 全是底部透明 → 第一次右键菜单像悬在半空、离任务栏很远，从第二次起才对（那时 `trayMenuHeight` 已是真实值）。根因不止常量写错：`sizeTrayMenu` 里原来是 `if (trayMenuShown) return`，**已显示就再也不重定位**，真实高度回报来也被吃掉。现在改成「高度变了就重定位」（1px 以内当没变，免得取整差造出假变化白挪一次），兜底常量取 `TRAY_MENU_DEFAULT_HEIGHT`（272，实测页面回报 271），首次多等 1s |
@@ -1335,7 +1337,7 @@ GetAncestor(hwnd, GA_PARENT)  = 788750   ← 真实父窗口
 
 | 不收菜单（连续操作） | 收起（一次性命令） |
 | --- | --- |
-| `seek`（拖动进度） | `showPlaylist`（设置歌单，要切回窗口） |
+| `seek`（拖动进度） | `showPlaylist`（歌单管理 / 视频管理，要切回窗口） |
 | `volume` / `toggleMute` | `toggleWallpaper`（切模式） |
 | `playControl` / `prev` / `next` / `toggleMode` | `login` / `logout` / `quit` |
 
@@ -1471,8 +1473,9 @@ targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
   关掉弹窗时同样清空。匹配规则和歌单管理里的过滤是同一套。
 - **爱心**（行尾，只有视频列表有）→ 收藏 / 取消收藏，空心得实心。
 
-**数据存在哪**：SQLite 的 `videos` 表一行一个候选，收藏就是这个行上的
-`favorites = 1` 标记（详见「数据存储（SQLite）」一节）。
+**数据存在哪**：SQLite 的 `song_videos` 表一行一个**候选关系**（哪首歌的候选里有它、排第几、
+收藏没有），视频本身和播放地址在 `videos`（`bvid` 主键，全局只有一份）。
+收藏就是关系行上的 `favorites = 1` 标记（详见「数据存储（SQLite）」一节）。
 
 - **没有这个字段就是 false** —— 只有收藏的条目才带这个标记，不浪费空间给每条都写
   （库里落成 `0`/`1` 整数，IPC 出去是 `boolean`）。
@@ -1505,13 +1508,403 @@ targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
    从**最终 URL** 里再抠一次；
 3. 拿到 bvid 后请求 view 接口取标题 / 封面 / UP 主 / 时长，返回给弹窗预览。
 
+### B 站视频列表：收藏夹 / 合集 / 系列（第二条进料管）
+
+音乐歌单的链路是「歌名 + 歌手 → **搜索** → 一堆候选 → 选一个」。
+视频列表的链路是「条目**本来就是视频**（带 `bvid`）」。两者在数据层是**两组不相交的表**，
+但**共用同一个播放引擎** —— 这一节讲怎么做到「播放层一行分支都不加」。
+
+#### 1. 直连键 `bv:<bvid>`：整条链路的枢纽
+
+视频列表的每个条目在 `song_videos` 里占一行，`search_key = 'bv:<bvid>'`。
+渲染层的 `getSongParts()` 看到条目上有 `bvid` 就返回 `bv:<bvid>`：
+
+```
+getSongParts(i)  →  { song: 'bv:BV1xx411c7mD', singer: '' }
+                          ↓ 渲染层原样传给 api:searchSong
+joinCacheKey('bv:BV1xx…', '') = 'bv:BV1xx…'   ← 缓存键与 search_key 逐字一致
+                          ↓
+bvidOfDirectKey() 命中 → 不搜索、不打分、不过滤，候选就是它自己
+```
+
+**为什么键用 bvid 而不是标题**：同一个标题会撞（「第 1 集」遍地都是），
+而 `:` 在歌名里出现概率极低，所以 `bv:` 前缀**永远不可能和「歌名-歌手」撞**。
+
+**为什么改一处就够**：`getSongParts()` 只有 4 个调用点（切歌 / 预热 / 续播 / 重搜），
+它们都只关心「这首歌怎么变成候选列表」。这里一短路，选视频、取地址、切档位、
+壁纸嵌入全部照旧 —— 播放引擎**不知道**自己在播歌单还是收藏夹。
+
+#### 2. 四张表各管什么
+
+| 表 | 一行代表 | 关键列 |
+| --- | --- | --- |
+| `videolists` | 一个列表 | `id`（`bv_fav_123` / `bv_local_xxx`）、`kind`（`fav`/`season`/`series`/**`local`**）、`source_id`、`mid`、`last_index` |
+| `videolist_items` | 列表里的第 N 条 | PK `(list_id, bvid)`；`ord`、`favorites`、`origin`（`sync`/`local`） |
+| `song_videos` | `bv:<bvid>` 的**唯一候选关系** | `ord = 0`、`favorites = 0` |
+| `videos` | 视频实体 + 播放地址 | `bvid` 主键，全局一份 |
+
+**`favorites` 必须是 0，不能拿它当「唯一候选」的标记**：用户点一下爱心就把它取消收藏了，
+任何「清理未收藏候选」的逻辑都会顺手把这个条目删掉。列表归属看 `videolist_items`。
+
+**而 OV 里的收藏是另一回事，挂在 `videolist_items.favorites` 上**：
+同一个 bvid 可以同时在收藏夹 A 和本地列表 B 里，在 A 收藏了不该让 B 也变实心。
+收藏 = 置顶（事务里 `ord` 归零、其余 +1），取消收藏位置不动 —— 与 `cache.setFavorite` 同一套。
+
+`origin = 'local'` 是「手动添加」，同步时**必须保留**（B 站上根本没有它，删了就再也找不回来）。
+合并规则：`保留 = favorites=1 OR origin='local'`，其后接本次拉到的新条目。
+
+**导入只写关系、不写地址**：500 条 = 500 行很窄的关系 + 500 行很窄的实体，
+**不是** 500 份 dash（那是几十 MB + 500 次请求，必被风控）。地址在第一次播放时由
+`cache.updateVideoResult()` 自动补。
+
+#### 3. 硬过滤 / 打分必须绕过
+
+`rankVideos` 里三条规则对列表条目全是致命的：
+
+- 「标题必须含歌名」→ 收藏夹里的标题和「歌名」毫无关系；
+- 「时长窗口 ±90s」→ 一条 45 分钟的游戏录播直接判死；
+- 「歌手名命中 +100」→ 列表条目没有「歌手」这个概念。
+
+所以 `api:searchSong` 的 `bv:` 分支在**进入任何过滤/排序之前**就返回了。
+**不要**在这里「顺手复用一下 rankVideos」—— 那等于把音乐场景的规则硬套到视频上。
+
+#### 4. `last_index` 必须按 bvid 重定位
+
+`videolists.last_index` 是**下标**。收藏夹按收藏时间倒序，用户新收藏一条，全体原点 +1 ——
+不同步的话下次打开就在播「上一条」。
+
+`syncVideoList()` 的做法：同步前记住「现在播的那条的 **bvid**」，
+同步后在**新列表**里找它的下标；找不到（被移出列表）就保留原下标并夹进范围
+（效果是「下一条顶上来」）。这与音乐歌单 `syncPlaylist` 里那段是同一个坑，
+只是那边靠 `toCacheKey` 反查、这边靠 bvid（更简单，条目天然唯一）。
+
+#### 5. 「当前在播哪个来源」落在设置里
+
+`songs` 只有一个数组，所以「这次打开该从哪个来源续播」必须有落盘的地方：
+`player.activeVideoListId`（`''` = 音乐歌单）。启动时：
+
+```
+读设置 → 找到那个列表 → videoListsStore.setActive(id) → tryResume() 走同一条路
+                        ↘ 列表已被删 → 把设置清回 ''（否则 fromVideoList 永远为真，
+                                        界面会按视频列表的文案渲染一个空来源）
+```
+
+`App.vue` 里两件事因此必须**成对**做：`setActiveVideoList()` 同时改 store 与设置；
+`recordPlayPosition()` 按来源分别写 `playlists.last_index` / `videolists.last_index`。
+写错表不会报错，只会表现成「重启后位置回到第一条」—— 所以都收敛在一个函数里。
+
+#### 6. 渲染层：两种条目共用一套展示
+
+`songs` 里可能混着「搜索结果」（`VideoListItem`：`title`/`pic`/`author`）和
+「视频列表条目」（`PlaylistSong`：`name`/`cover`/`singer`），而且**两者都有 `bvid`** ——
+`isVideoItem()` 分不开它们。所以 `showList.vue` 里取值统一走 `fieldsOf()`：
+
+```ts
+const fieldsOf = (item) => item as unknown as ListItemFields
+nameOf  → f.title ?? f.name ?? ''
+singerOf → f.author ?? f.singer ?? ''      // 搜索结果用 author，列表条目用 singer（装的是 UP 主）
+coverOf → normalizeImageUrl(f.pic ?? f.cover)
+```
+
+漏了这条会表现成「视频列表里所有行标题空白 / 封面兜底图标 / UP 主为空」——
+因为 `PlaylistSong` 上没有 `title` / `pic` / `author` 三个字段。
+
+#### 7. 界面入口：两个工作区共用一个管理器位置
+
+`ui.mode` 是**工作区**，不是第二套播放逻辑。它只决定三件事：
+管理弹窗停在哪一页、主界面列表面板显示哪一份、控制栏那个「候选视频」按钮显不显示。
+
+```
+openManager(page)  =  switchMode(page)  +  打开该页的管理器
+switchMode(next)   =  写 ui.mode  +  loadBrowseList()   // 不停播、不改 songs
+```
+
+- **左下角按钮就是唯一的模式开关**：歌单管理底下是「视频管理 →」，视频管理底下是「← 歌单管理」。
+  点它=切模式+换页，不需要第二个开关。
+- **切模式不打断播放**：`songs`（播放队列）不动，只有点新列表里的一条才会换源。
+  因此渲染层有**两份列表**：`songs`（在播）与 `browseSongs`（在看）。
+  `browseIndex` 用键（`bv:` 或 `歌名-歌手`）在 `browseSongs` 里找正在播的那一项，
+  找不到就返回 -1 —— 直接拿 `currentIndex` 当高亮会点亮错的那一行。
+- **浏览哪个列表**单独记在 `browseVideoListId`，与「正在播哪个列表」（`activeVideoListId`）分开：
+  切模式时播放源不动，浏览位置要跟着模式走。
+
+左上角入口（`PlaylistPanel`）显示的名字按模式走，点开的管理页也跟着模式走。
+
+**「新建列表」是视频管理唯一的建列表入口**（和歌单管理的「新建歌单」对称）：
+一张内联表单，选「内容来源」四选一，其余字段跟着变。
+
+| 来源 | 走哪条路 | 是否需要登录 |
+| --- | --- | --- |
+| 空列表 | `videolists:createLocal` | 否 |
+| 粘贴链接 | `api:parseListInput` → `videolists:add(kind, sourceId, mid)` | 否 |
+| 收藏夹 | `api:myFavFolders` → `videolists:add('fav', fid)` | 是（只读自己的收藏夹） |
+| 订阅合集 | `api:mySubLists` → `videolists:add(kind, id, mid)` | 是 |
+
+**「收藏夹」和「订阅合集」的清单是封面网格，不是下拉菜单**：两个清单的标题高度同质
+（「默认收藏夹」「我的收藏」「收藏夹1」…），下拉里只剩一行字，选一次得逐行读；
+封面能一眼认出来。所以两个接口都额外带一个 `cover`（协议相对地址原样返回，
+渲染层用 `normalizeImageUrl` 补协议 —— 和 `upsertVideoMeta` 存封面同一套分工）。
+选中项加边框 + 底色 + 标题变强调色，和左边列表行的 `.sel` 是同一套观感。
+
+**为什么「收藏夹」和「订阅合集」是两个来源而不是一个**：它们是 B 站上**两件不同的事**，
+接口也不同（一个是「我创建的」，一个是「我收藏的」）：
+
+```
+我创建的收藏夹   x/v3/fav/folder/created/list-all?up_mid={自己}   → data.list[] { id, title, media_count }
+我收藏的（别人做的）列表
+                 x/v3/fav/folder/collected/list?up_mid={自己}&pn&ps&platform=web
+                                                                  → data.list[] { id, fid, mid, title, media_count, type }
+```
+
+**`collected/list` 一个接口带回两种东西，靠 `type` 分**：
+
+| `type` | 是什么 | 怎么用 |
+| --- | --- | --- |
+| `21` | 视频合集（UGC season） | `id` = season_id，`mid` = **原作者** mid → 走 `videolists:add('season', id, mid)` |
+| `11` | 收藏的收藏夹 | `id` 是全局 fav id、`fid` 是收藏夹 id，media_id 语义和合集不同 —— **不收** |
+
+⚠️ **这里踩过一个坑，记下来别再犯**：一开始按名字猜了两个路径
+（`x/space/fav/season/list`、`x/space/fav/series/list`），前者返回 `-404 啥都木有`，
+后者直接是一个 HTML 404 页面 —— 于是「订阅合集」整个入口点开就是 404。
+真实的入口就是上面那个 `x/v3/fav/folder/collected/list`（`Bili23-Downloader_B站接口清单.md` 3.2）。
+**猜接口路径的代价是「功能看起来做了、其实没通」，而单测和 typecheck 都发现不了。**
+
+**失效的合集（`mid = 0` / `media_count = 0`）不进清单**：收藏夹里被删掉的合集仍留在列表里
+（标题就叫「该合集已失效」），它的 `mid` 是 0，导进来只会得到「读取合集失败」。
+
+**`mid` 必须是作者 mid，不是自己的**：拉合集内容（`seasons_archives_list` / `series/archives`）
+要的是**作者**的 mid，而这个值只有主进程拉清单时才知道。所以渲染层拿到的是
+`{ kind, id, mid, title, count }` 整套，不能只回传一个 id —— 补不出 mid 就等于拉不到内容。
+
+**下拉的 value 带 kind 前缀**（`season_456`）：现在只会出现 `season`，但前缀留着 ——
+将来若真接上「系列」，两套 id 是不同命名空间、会撞号。
+
+#### 8. OV 下的播放控制：只换文案 + 一道刹车
+
+`next()` / `prev()` 的**结构没有第二套**，仍是「算下标 → `changeSong(index)`」，
+环绕规则也一样（最后一条再点下一个回到第一条）。差别只有三处：
+
+| 位置 | MV | OV |
+| --- | --- | --- |
+| 控制栏文案 | 上一首 / 下一首 | 上一个视频 / 下一个视频 |
+| 候选视频按钮 | 显示 | 隐藏（条目本身即视频，没有候选） |
+| 预热 | 搜索 + 解析 + 拉起开头两秒 | **只解析地址**，不开隐藏流 |
+
+**失效刹车**（`OV_MAX_AUTO_SKIP = 5`）：列表条目是外部数据，已删除 / 私享 /
+充电专属 / 地区限制很常见，而 `videoError` 的既有行为是「失败两次 → `next()`」。
+整片失效时会一条接一条地跳、每条发两次解析请求，几轮就踩 412。
+所以 OV 下连续 5 条取不到地址就停下，留一条提示（点它继续）。
+计数在 `onVideoPlaying` 里归零 —— 只要有一条真的播起来，就说明不是连片失效。
+
+**置顶重排后必须按 bvid 重新定位**：收藏 / 手动添加会把条目挪到 `ord = 0`，
+全体下标 +1。`refreshBrowseAfterEdit()` 重读列表后，按 bvid 找回正在播的那一条并
+修正 `currentIndex`，同时重建随机表与预热槽位（它们都按下标算）。
+不做这一步，用户点「下一个视频」会跳到意料之外的一条。
+
+#### 9. 拖入导入（把链接扔进窗口）
+
+拖进来的东西有三种可能，各自对应一条**不同的进料管**，所以第一步必须是「认出它是什么」：
+
+```
+drop → api:classifyDrop（主进程，只读不联网）
+        ├─ music  : detectSource() 认得音乐平台 host  → 切 MV → music:importPlaylist → 播第一首
+        ├─ list   : parseListInput() 认得收藏夹/合集/系列 → 切 OV → videolists:add → 从 last_index 播
+        └─ video  : 文本里有 BV 号 / b23.tv 短链        → 切 OV → videolists:addItemToDefault → 播第 1 条
+```
+
+**为什么识别放主进程**：三类链接的规则本来就都在那边（`detectSource` 按 host 判平台、
+`parseListInput` 认七八种地址形态、`parseVideoInput` 处理短链跳转）。
+渲染层再抄一份正则，迟早会出现「粘贴能导入、拖进来认不出」。
+
+**顺序**：音乐 → 列表 → 视频。越具体的规则越先跑：B 站列表链接里也可能带 `?bvid=`，
+而音乐平台的分享文案里也可能有纯数字 id。三类 host 互斥，实际不会抢。
+
+**渲染层只做三件事**：拦事件、给遮罩、按 `type` 调一个接口。
+
+| 事情 | 做法 |
+| --- | --- |
+| 为什么必须 `preventDefault` | `dragover` 不拦，Electron 会把拖进来的链接当**页面导航** → 窗口白屏 |
+| 遮罩 `pointer-events: none` | 它只是提示；吃掉鼠标事件就连 `drop` 都收不到 |
+| `_dragDepth` 计数 | `dragenter` 在**子元素之间移动**时也触发，只用布尔值会在第一次 `dragleave` 就误判「离开窗口」，遮罩一闪一闪 |
+| `drop` 里才读 `getData` | `dragover` 阶段浏览器出于安全把内容清空，只留 `types` |
+| 取文本顺序 | `text/uri-list` → `text/plain` → 从 `text/html` 抠第一个 `href` |
+| 本地文件 | **不支持**：播放链是围着「bvid → dash → MSE」建的，多一条本地文件源要动缓存键 / 封面 / 续播 / 托盘媒体信息，留给单独一期 |
+
+**「已有就同步」不另写一套**：视频列表的主键是 `平台kind_平台id` 拼出来的，
+`addVideoList` 天然幂等（`ON CONFLICT(id) DO UPDATE` + `applyRemoteItems` 的合并规则），
+所以重复拖同一个收藏夹 = 先同步再切过去播。音乐歌单靠 `music:importPlaylist`
+在**主进程**里按「主键或 sourceUrl」找已有记录，只刷新曲目、保留名字 / 同步设置 / 播放位置。
+
+#### 10. 默认列表（拖入单条视频的落点）
+
+单条视频进来总得有个列表放。每次问「放哪个」太啰嗦，随手新建又会攒一堆「本地列表N」，
+所以固定一个落点：
+
+```
+ensureDefaultVideoList():
+  ① 设置 player.defaultVideoListId 有值且那一行还在 → 就是它
+  ② 没有 / 失效 → 认「最早的本地列表」（老库升级上来就是这条），并把 id 写回设置
+  ③ 一个本地列表都没有 → 建一个「默认列表」（create:false 时跳过）
+```
+
+- **启动时**：只在 `videolists` 彻底为空（第一次打开）时 `create: true` ——
+  老用户已经有列表了，不该被硬塞一个。
+- **删不掉**：`removeVideoList` 里先比 `defaultListId()`，命中直接返回 false；
+  界面上按 `VideoListRecord.isDefault`（主进程填）把删除按钮禁用。
+  删了它下次拖视频还得悄悄再建一个，用户看到的是「刚删又冒出来」。
+- **改名不影响身份**：标记存在设置项里，不是靠名字匹配 —— 改叫「我的片子」它还是默认列表。
+- **`isDefault` 不是在 SQL 里算的**：`toRecord` 拿调用方传进来的 `defId` 比对，
+  `getVideoLists` 只读一次设置（否则每行都 `structuredClone` 一遍整个配置）。
+
+**空库提示的判据跟着改了**：原来是「列表数量 = 0」，现在自动建了默认列表，这个条件永远不成立。
+改成按**条目**算（OV：所有列表的 `itemCount` 加起来是不是 0；MV：有没有歌单），
+文案也换成了「把链接拖进窗口」为首选路径。
+
+#### 11. 本地视频文件（拖自己的片子进来）
+
+这一节的结论一句话：**本地文件被当成「一条 bvid 长得像 `lf_xxx` 的视频」**，
+所以播放、收藏、置顶、续播、托盘媒体信息全部继承现成的链路，一条分支都没加。
+
+```
+拖入 mp4 → webUtils.getPathForFile() 拿真实路径
+        → videolists:importLocal（主进程：登记 + 挂进默认列表）
+        → bvid = 'lf_' + sha1(规范化路径)[0:16]
+        → 起播（走的是和「拖单条 B 站视频」完全相同的那条路）
+```
+
+**身份为什么是路径哈希，不是文件名 / 大小 / inode**：用户心里的「这个是同一个片子」
+就是那个文件。路径哈希天然满足「重复拖不会攒出两条」，而 inode 换个盘就变、
+文件名可以撞。Windows 上还先转小写（`D://A.mp4` 和 `d://a.mp4` 是同一个文件）。
+
+**路径存在 `videos.durl_url`，不新增列**。`durl_url` 的语义本来就是「一个能直接塞进
+`<video src>` 的完整地址」，本地文件是同一语义，只是地址由我们自己的协议生成。
+这一条换来的是：**表结构不变 → 指纹不变 → 不触发整库重建**，现有歌单 / 列表 / 收藏无损。
+代价是「`durl_url` 里可能是路径」这件事必须让三处知道，见下。
+
+**库里存路径、不存 URL**：路径是事实、URL 是派生的（换协议名不该让全库数据失效）；
+文件名里可能有 `#` / `?` / `%` / 中文，塞进 URL 要 encode，存进去再读出来容易二次编码 ——
+而 `#` 之后会被当成 fragment，直接播错文件。
+
+**地址怎么给播放器：`blwe-media://local/<bvid>`**
+
+渲染层 origin 是 `blwe://app`（打包）或 `http://localhost`（开发），两种都读不了
+`file:///D:/x.mp4`。所以主进程开一个自己的协议，查库拿路径、流式吐回去：
+
+| 要点 | 为什么 |
+| --- | --- |
+| 自己实现 `Range` → 206 | 拖进度条时 Chromium 发 `Range: bytes=N-`；`net.fetch(file://)` 只给整份 200，每次 seek 都从第 0 字节重读 |
+| URL 里只放 bvid，路径回查库 | 这个协议只放得出去「用户登记过的文件」，不是任意文件读取器 |
+| 声明 `Accept-Ranges: bytes` | 不声明的话 Chromium 连 Range 都不发，直接整份读 |
+| `standard + secure + stream` | `stream` 是视频流必需；前两个让它的行为等价于 https 页面 |
+| 文件不存在 → 404，**不删库里的行** | 可能只是拔了移动硬盘；界面上的「重新定位」见下一节 |
+
+⚠️ **踩过的坑：`protocol.registerSchemesAsPrivileged` 一生只能调一次**，第二次会被
+**静默忽略**（不报错、不警告）。原来 `blwe://` 是在 `protection.ts` 里自己注册的，
+新的 `blwe-media://` 再调一次的话，后者根本没注册成 standard / secure / stream ——
+表现是「能导入、点了没画面」，控制台一片安静。现在各模块只交出 `*SchemeDescriptor()`，
+`main/index.ts` 里**合并成唯一一次**注册。
+
+**三处必须让路**（都不改 schema，只是加判据）：
+
+| 位置 | 不改会怎样 |
+| --- | --- |
+| `cache.clearExpiredPlayurl` | 本地文件没有 `playurl_at` → 每轮清理都把路径当过期地址抹掉 |
+| `cache.clearAll`（设置里「全部清除」） | 无条件清地址列 → 一点就把所有本地条目的路径洗掉；现在按 `lf_` 前缀豁免 |
+| `api:resolveVideo` 开头 | 不短路的话会先 `ensureLoginState()`（打 B 站 nav）、再把 `lf_` 的 bvid 当 B 站视频去解析；并且 `updateVideoResult` 会把路径覆盖成 B 站直链 |
+
+短路位置**必须在 `ensureLoginState()` 之前**：本地文件跟账号无关，
+断网 / 未登录时播自己硬盘上的片子不该先卡一次网络。
+
+**时长与「能不能播」：不用 ffmpeg，用探针**
+
+`<video preload="metadata">` 挂上 `blwe-media://` 等 `loadedmetadata`，一次拿到时长，
+顺便**实测**容器能不能解。不引 `ffmpeg-static` 的理由：
+
+- **它换不来格式支持**：播放器是 Chromium，ffmpeg 在不在，mkv / HEVC 该播不了还是播不了
+  （要做「转封装」那是另一整套后台任务）；
+- 体积：单平台 ~80MB，三平台两三百 MB，而整个依赖才 4 个轻包；
+- **一致性**：探针用的就是待会儿真播放的那个解码器，结论必然一致；
+  ffmpeg 说「没问题」不代表 Chromium 能播。
+
+探针在渲染层（媒体元素只在渲染层），但它只**测量**：时长通过现成的
+`api:fillVideoDuration` 回写主进程。用完必须 `removeAttribute('src')` + `load()` ——
+Windows 上媒体元素只要还持有文件句柄，用户就删不掉 / 改不了名。
+
+**拖入取路径必须走 preload**：Electron 32 起 `File.path` 已移除，
+渲染层拿到的是个没有任何路径信息的 File。preload 里 `webUtils.getPathForFile(file)`
+同步换一下即可（无 IPC）。
+
+**格式认不认得出 ≠ 能不能播**：扩展名白名单（`VIDEO_EXTS`）只用来别把 zip / jpg 当视频，
+真正的判据是探针。所以 `mkv` / `avi` / `ts` 也照收 —— 解不出来时提示编码不支持，
+比「连列表都进不去、且不知道为什么」好。
+
+#### 12. 本地文件被删 / 移走了怎么办
+
+本地文件的地址是**用户硬盘上的一个路径**，所以「播不了」是常态而非异常：删了、
+改名了、移动硬盘没插、网络盘掉线，全会让同一个 `lf_xxx` 从能播变成播不了。
+这一节的原则只有两条：
+
+1. **永远不自动删库里的行** —— 文件暂时不在 ≠ 用户不要这条。删不删由用户点。
+2. **给得出退路** —— 「重新定位」是主路径，「从列表移除」是备选，
+   而不是「弹个红条然后让用户自己去视频管理删掉重拖」。
+
+**三个时机，三层处理**：
+
+| 时机 | 谁发现 | 用户看到什么 |
+| --- | --- | --- |
+| 打开视频管理 / 切列表 | `videolists:getItems` 顺手 `stat` 一遍，回填 `missing` | 那一行压暗 + 红色「文件丢失」标 + 「定位」按钮 |
+| 点开播 / 自动切到它 | `api:resolveVideo` 的 `stat` 失败 → 回 `code: 'LOCAL_MISSING'` | 弹「重新定位文件 / 从列表移除」确认框 |
+| 播放中途文件被删 / 移走 | `blwe-media://` 404 → `<video>` 报错 → `videoError` | 先问一次 `local:exists` 再决定弹哪个（见下） |
+
+**为什么「丢失」要单独一个错误码，而不是看错误文案**：界面要靠它决定弹哪个框。
+拿中文字符串当契约，改一次文案就断一处逻辑，而且 `typecheck` / `build` 一个字都不会提醒。
+`code: 'LOCAL_MISSING'` 也顺便让它**不占用 OV 的连续失败刹车** ——
+那个刹车是给「B 站条目失效（已删 / 私享 / 充电专属）」用的，文件丢了跟它不是一回事，
+混在一起只会让「跳 5 条就停」的规则被本地文件提前触发。
+
+**播放中失败必须再问一句 `local:exists`**，因为 `<video>` 的 `error` 事件分不清两种原因：
+
+- 文件**不在了** → 弹重新定位；
+- 文件**还在** → 是解码不支持（HEVC / 10bit / mkv 在 Chromium 里就是黑的），
+  这时弹「重新定位」是误导，用户会去挑另一个文件，问题依旧。所以只报一句编码不支持。
+
+顺带一个连带结论：**本地条目不走 `videoError` 那条「跳过缓存重试一次 → 跳下一条」**。
+对本地文件，重试是纯粹浪费（没有缓存、没有签名过期），跳下一条更糟 ——
+用户要的是把文件指回去，不是绕过它。
+
+**重新定位只改 `durl_url`，不改 bvid**
+
+bvid 是身份的锚点：`videolist_items.bvid`（列表位置）、`videolist_items.favorites`（收藏）、
+`song_meta.selected_bvid`（续播）、`bv:<bvid>` 直连键全都引着它。为了「路径变了身份也变」
+去做一次主键迁移，就要把这些引用逐个跟着改 —— 漏一处就是一条孤儿数据。
+而用户的语义本来就是「**同一条**记录，文件换了个位置」，不是「换了一条视频」。
+所以路径只是记录的一个属性，改它就行：列表顺序、收藏、播放进度**一处都不用动**。
+
+**代价（已知取舍）**：bvid 是路径哈希，所以同一份文件如果**再次从新位置被拖进来**，
+会算出另一个 bvid，得到第二条记录（老那条也指向同一文件）。这个无法在重定位那一刻
+消除（老记录的列表引用还在），因此只回报 `duplicate: true` 让界面提一句，不影响播放。
+真要做合并，得先把两个 bvid 的列表引用 / 续播指针统一，那是另一个量级的改动。
+
+**为什么 `missing` 只在 IPC 层异步算、不落库**：
+
+- `getVideoListItems()` 是**同步**函数，内部还有同步流程在用。`stat` 一个掉线的网络盘
+  能阻塞好几秒，同步版会直接把主进程冻住（连带界面卡死）。所以在
+  `videolists:getItems` 这层 `Promise.all` 并发摸一遍，B 站条目一次 IO 都不做。
+- **不落库**：文件可能只是暂时不在（拔了硬盘、盘符没挂上），落库就要维护一套
+  「什么时候重算」的逻辑，而且一次误判会把「这条坏了」永久写进数据里。
+  现在这一屏的标记只活在这一屏，插回来重新打开列表就自动恢复了。
+
+**没有做「文件系统监听」**（`fs.watch` / `chokidar`）：跨盘 / 网络盘不稳，
+几百个文件的监听器开销也不小，而收益只是「不用重新打开列表就能看到状态变化」。
+失效判定放在「用户要看的时候」已经够了。
+
 ### 数据存储（SQLite）
 
 > **⚠️ 字段仍在调整中** —— 这份 schema 是当前实现，用户（本人）后续还要再看一遍字段设计。
 > 改字段时**不需要**手动升版本号：`user_version` 存的是建表语句的**哈希指纹**（见下），
 > 改了 `CREATE_TABLES_SQL` 指纹就变，重启即自动重建。但记得同步这一节。
 
-数据层是 **SQLite 单库**（`better-sqlite3`），库文件在 `userData/blmv.db`，
+数据层是 **SQLite 单库**（`better-sqlite3`），库文件在 `userData/blwe.db`，
 连接 / 建表 / 事务都在 `electron/main/utils/db.ts`。
 
 **为什么从 JSON 换成 SQLite**：原来的数据被拆在「一堆 `search-cache/*.json`」和
@@ -1714,7 +2107,7 @@ videos.search_key 泪海-许茹芸               ← 拿去搜 B 站、当缓存
 JSON 要重新拆成列」三种情况，出错面远大于丢掉重来。
 
 > **副作用要说清楚**：重建会清空**收藏、顺序、选中视频，以及歌单本身**。
-> 要保留就得自己先备份 `blmv.db`。
+> 要保留就得自己先备份 `blwe.db`。
 
 > ⚠️ **DROP 列表必须是动态的，不能手写**
 >
@@ -2342,7 +2735,7 @@ if (finalList.length === 0) {
   代码量和出错面都远大于丢掉重来，而收益只是省几次重新解析。
 
 > **副作用要说清楚**：重建会清空**收藏、顺序、选中视频，以及歌单本身**
-> （都在同一个库里）。要保留就得自己先备份 `blmv.db`。
+> （都在同一个库里）。要保留就得自己先备份 `blwe.db`。
 >
 > 本轮就真的清过一次库（`playlists.id` 的语义从随机 UUID 改成
 > `平台_平台歌单id`，属于 schema 变化）—— 用户明确要求「不用管我，不要迁移，直接清库」。
@@ -2501,30 +2894,30 @@ wy: `song.id`，kw: `item.id`）。它是 `songs.id` 的来源，**不能丢**�
 
 | 情况 | 用哪个目录 |
 | --- | --- |
-| `%APPDATA%/BiLiMusicVideo` 里**已经有本应用数据** | 就用它（安装版 / 便携版共用一份，换版本不会「数据不见了」） |
-| 没有数据，且当前是便携版（运行时带 `PORTABLE_EXECUTABLE_DIR`） | exe 同级的 **`blmvdata/`**（自动创建，数据跟着程序走） |
-| 没有数据，且是安装版（全新环境） | 默认的 `%APPDATA%/BiLiMusicVideo` |
+| `%APPDATA%/BiLiWallpaperEngine` 里**已经有本应用数据** | 就用它（安装版 / 便携版共用一份，换版本不会「数据不见了」） |
+| 没有数据，且当前是便携版（运行时带 `PORTABLE_EXECUTABLE_DIR`） | exe 同级的 **`blwedata/`**（自动创建，数据跟着程序走） |
+| 没有数据，且是安装版（全新环境） | 默认的 `%APPDATA%/BiLiWallpaperEngine` |
 
-> **⚠️ 目录名是 `BiLiMusicVideo`**
+> **⚠️ 目录名是 `BiLiWallpaperEngine`**
 >
 > Electron 的 `app.getPath('userData')` = `%APPDATA%/<app name>`，
-> 而 app name 取自 `package.json` 的 **`name`**（= `BiLiMusicVideo`）。
-> `build.productName` 是 `BLMV`，但那是 **electron-builder** 的字段，**Electron 不读它**。
+> 而 app name 取自 `package.json` 的 **`name`**（= `BiLiWallpaperEngine`）。
+> `build.productName` 是 `BLWE`，但那是 **electron-builder** 的字段，**Electron 不读它**。
 > 代码里也没有 `app.setName(...)`，所以目录就跟着 `name` 走。
 >
 
 判断「已经有数据」看的是我们自己的文件（`setting.json` / `playlists.json` / `playlist.json` /
-`search-cache` / **`blmv.db`**），**不能只看目录存不存在** —— Electron 一启动就会把 userData
+`search-cache` / **`blwe.db`**），**不能只看目录存不存在** —— Electron 一启动就会把 userData
 目录建出来，那样全新机器上永远走不到便携分支。
 
-> `blmv.db` 也在标记列表里，因为**现在真正承载用户数据的就是它**
+> `blwe.db` 也在标记列表里，因为**现在真正承载用户数据的就是它**
 > （歌单、收藏、选中视频）。少了它，一个「只有 SQLite 数据」的目录会被判成「没有数据」，
 > 于是在便携版里又去 exe 同级建一个空库，用户会看到歌单全没了。
 
-**目录名是 `blmvdata` 而不是 `data`**：`data/` 太通用，绿色版常被丢在同一个文件夹里，容易和别的软件撞。
+**目录名是 `blwedata` 而不是 `data`**：`data/` 太通用，绿色版常被丢在同一个文件夹里，容易和别的软件撞。
 
 > **刻意不做旧目录迁移**：早期版本用的是 `data/`，改名后旧目录原样留着、不读不写也不删。
-> 用户如果需要老数据，手动把 `setting.json` / `playlists.json` 拷进 `blmvdata/` 就行。
+> 用户如果需要老数据，手动把 `setting.json` / `playlists.json` 拷进 `blwedata/` 就行。
 > 这是有意的取舍 —— 自动 `rename` 一个可能正在被占用 / 权限受限的目录，
 > 失败路径（改名失败、跨盘、部分成功）比「让用户手动拷一次」麻烦得多，
 > 而且一旦出错就是数据事故。
@@ -2628,7 +3021,7 @@ wy: `song.id`，kw: `item.id`）。它是 `songs.id` 的来源，**不能丢**�
 >
 > 已实跑验证：`npm run pack` 生成 `release/win-unpacked` → 用
 > `@electron/asar` 确认 `node_modules/opencc-js/dist/umd/t2cn.js` 在里面 →
-> 跑 `BLMV.exe` **无 opencc 告警**（拿不到 opencc 时 `videoRank` 会打
+> 跑 `BLWE.exe` **无 opencc 告警**（拿不到 opencc 时 `videoRank` 会打
 > `[videoRank] opencc 不可用…` 的 warn，所以「没有这条告警」= 加载成功）。
 
 > `toSimplified()` 有**退化路径**：`require` 失败只打一行 warn、
@@ -2781,15 +3174,15 @@ build:only（electron-vite 三个目标）→ out/            ← 保护前必�
 protect（scripts/protect.mjs）**就地改写 out/**
    1. 主进程 / 预加载 → V8 字节码（bytenode）      index.js 变成几百字节加载器 + index.jsc
    2. 渲染层 js → 混淆（javascript-obfuscator）     字符串数组 + 十六进制标识符
-   3. 渲染层 html/js/css → AES-256-GCM 加密         文件头 BLMV1
+   3. 渲染层 html/js/css → AES-256-GCM 加密         文件头 BLWE1
    ↓
 electron-builder（asar）→ 打包 out/
 ```
 
-运行时：主进程注册 `blmv://` 协议（`electron/main/protection.ts`），页面请求哪个资源就解密哪个，
-只解密到内存；页面地址从 `file://` 变成 `blmv://app/index.html`。
+运行时：主进程注册 `blwe://` 协议（`electron/main/protection.ts`），页面请求哪个资源就解密哪个，
+只解密到内存；页面地址从 `file://` 变成 `blwe://app/index.html`。
 密钥在 `electron/main/bundleKey.ts`（会被编进主进程字节码，不是明文躺在 asar 里），
-打包时可用 `BLMV_BUNDLE_KEY` 覆盖。
+打包时可用 `BLWE_BUNDLE_KEY` 覆盖。
 
 > **为什么 `protect` 必须先检查 `out/` 是不是干净明文（这是踩出来的）**：保护是**就地改写**，
 > 所以它既不能在已经保护过的产物上再跑一遍（会把加载器当源码再编、把密文再加密一层），
@@ -2813,18 +3206,18 @@ electron-builder（asar）→ 打包 out/
 | --- | --- | --- |
 | **模块模式字节码不能用 `runBytecodeFile`** | 加载器执行了、`require` 也返回成功，但**窗口永远不出现**，而且不报任何错（`compileAsModule: true` 编出来的只是模块包装函数，没被调用） | 加载器写成 bytenode 官方那种 CommonJS 形式：`require('bytenode')` + `module.exports = require('./index.jsc')` —— `.jsc` 的模块扩展由 bytenode 挂上，这样才会真正执行 |
 | **环境里的 `ELECTRON_RUN_AS_NODE=1`** | bytenode 要拉起 Electron 自己来编译（必须同一套 V8），命令形如 `ELECTRON_RUN_AS_NODE=1 electron.exe --no-sandbox …`；环境里本来就带着这个变量时 Electron 退化成纯 Node，报 **`bad option: --no-sandbox`**（完全看不出真因） | 脚本开头 `delete process.env.ELECTRON_RUN_AS_NODE` |
-| **保护脚本崩了却没人发现** | 改加载器时在**模板字符串里用了反引号**，脚本直接语法报错；而 `build:only` 已经把明文写进 `out/`，于是「保护后的 asar」里全是明文。更糟的是**验证是瞎的**：解密函数对明文原样返回，`blmv://` 那条路照跑不误、测试全绿 | ①别用管道把 stderr 和退出码一起吞掉；②验收改成**字节级**：`out/renderer/index.html` 头必须是 `BLMV1`、`out/main/index.js` 只有几百字节且存在 `index.jsc` |
-| **`registerSchemesAsPrivileged` 的时机** | 必须在 `app.whenReady()` **之前**调用，否则 `blmv://` 不是标准/安全上下文，fetch、MSE、CORS 全按普通自定义协议处理 | 放在模块顶层（`setupUserDataPath()` 之后、`whenReady` 之前） |
-| **换协议把跨域取流搞挂** | 页面 origin 从 `file://` 变成 `blmv://app` 后 dash 音视频流的 `fetch` 开始报 CORS；实测 B 站 CDN 会把**第一个请求者的 Origin** 写进 `Access-Control-Allow-Origin` 并按 URL 缓存（报错原话：`has a value 'http://localhost:5173' that is not equal to the supplied origin`） | 在 `onHeadersReceived` 里对媒体域**统一改**成 `*`（并删掉 `Access-Control-Allow-Credentials`）。**必须大小写不敏感地先删再加**：CDN 回的是小写键，直接赋值等于又加一条，浏览器看到 `ACAO: blmv://app, *` 两个值会判非法（第一版就这么写的，报错从 1 条变 20 条） |
+| **保护脚本崩了却没人发现** | 改加载器时在**模板字符串里用了反引号**，脚本直接语法报错；而 `build:only` 已经把明文写进 `out/`，于是「保护后的 asar」里全是明文。更糟的是**验证是瞎的**：解密函数对明文原样返回，`blwe://` 那条路照跑不误、测试全绿 | ①别用管道把 stderr 和退出码一起吞掉；②验收改成**字节级**：`out/renderer/index.html` 头必须是 `BLWE1`、`out/main/index.js` 只有几百字节且存在 `index.jsc` |
+| **`registerSchemesAsPrivileged` 的时机** | 必须在 `app.whenReady()` **之前**调用，否则 `blwe://` 不是标准/安全上下文，fetch、MSE、CORS 全按普通自定义协议处理 | 放在模块顶层（`setupUserDataPath()` 之后、`whenReady` 之前） |
+| **换协议把跨域取流搞挂** | 页面 origin 从 `file://` 变成 `blwe://app` 后 dash 音视频流的 `fetch` 开始报 CORS；实测 B 站 CDN 会把**第一个请求者的 Origin** 写进 `Access-Control-Allow-Origin` 并按 URL 缓存（报错原话：`has a value 'http://localhost:5173' that is not equal to the supplied origin`） | 在 `onHeadersReceived` 里对媒体域**统一改**成 `*`（并删掉 `Access-Control-Allow-Credentials`）。**必须大小写不敏感地先删再加**：CDN 回的是小写键，直接赋值等于又加一条，浏览器看到 `ACAO: blwe://app, *` 两个值会判非法（第一版就这么写的，报错从 1 条变 20 条） |
 | **asar 本身没有加密** | `asar` 只打包不加密；`asarUnpack` 更是把文件原样摊在磁盘上 | 自己加密 + 自定义协议解密。`bytenode` 必须进 `dependencies`（加载器运行时要用）；koffi 的原生二进制走 `asarUnpack`（见下面「打包体积」） |
 
 **验收方式**（以后改这块照这个来）：
 
 1. `npm run build:protected` 后做字节级检查（密文头 + `.jsc` 存在 + 加载器只有几百字节）；
-2. 用 `BLMV_FORCE_PROTECT=1` 跑开发态验证：页面 URL 是 `blmv://app/`、DOM 完整、`electronAPI` 可用、
+2. 用 `BLWE_FORCE_PROTECT=1` 跑开发态验证：页面 URL 是 `blwe://app/`、DOM 完整、`electronAPI` 可用、
    能搜到歌、能起播 —— **并且要断言音频真解码**（只看 `duration` 会漏掉 CORS 问题）；
-3. `npx electron-builder --dir` 后用 `@electron/asar` 抽文件看头是不是 `BLMV1`；
-4. 直接启动 `release/win-unpacked/BLMV.exe`，看窗口标题出不出来
+3. `npx electron-builder --dir` 后用 `@electron/asar` 抽文件看头是不是 `BLWE1`；
+4. 直接启动 `release/win-unpacked/BLWE.exe`，看窗口标题出不出来
    （标题来自渲染层，等于「解密 + 混淆后仍能跑」的端到端证明）。
 
 ### 打包体积（踩坑记录：一个 `**` 通配符让安装包多了 47 MB）
@@ -2873,7 +3266,7 @@ electron-builder（asar）→ 打包 out/
 | `win-unpacked` 总计 | 492 MB | **314 MB** |
 | **portable 安装包** | **130.8 MB** | **83.9 MB（−36%）** |
 
-剩下的 314 MB 里，Electron 内核自己占约 307 MB（`BLMV.exe` 一个就 221 MB，
+剩下的 314 MB 里，Electron 内核自己占约 307 MB（`BLWE.exe` 一个就 221 MB，
 带 ICU + V8 snapshot），**这才是硬成本** —— 想再降只能换运行时（见下面「框架选型」）。
 
 > **别把 Element Plus 当体积元凶**：实测它的产物约 2.4 MB JS + 0.4 MB CSS，
@@ -2971,7 +3364,7 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
 | 主窗口可能被导航到站外（preload 会跟过去） | `will-navigate` 白名单 + `setWindowOpenHandler` 拒绝 |
 | 打开外链没有白名单 | `app:openExternal` 只放行 http/https |
 | **用户可见文案里写满了内部细节** | 提示语原来长这样：「被 B 站限流了」「B 站把请求拦下来了」「SourceBuffer 配额超限」「无法获取视频 CID」「HTTP 500」。用户会**截图**，等于把「我们在按接口规则大量请求 + 怎么实现的」写在屏幕上；而且对用户毫无帮助（他只需要知道「怎么办」）。现在**统一收口**：`errMsg()` 加一道技术文案过滤（状态码 / 全大写错误码 / `SourceBuffer` 等内部词命中就换成「操作失败，请稍后再试」，原文只进控制台）；各处 `throw` 的文案改成人话；`RateLimitError` 的 message 也改成中性措辞，识别靠**类型**而不是靠匹配「风控」这种词 |
-| **同时开两个实例 → 第二个窗口里一个歌单都没有** | 原来**没有单实例锁**。第二个实例完整跑起来、也去开同一个 `blmv.db` —— 而 **SQLite 允许多个连接打开同一文件**（`new Database()` 根本不会失败），于是它读到的歌单是空的（WAL 里第一个实例还没 checkpoint 的部分它看不见）。用户看到的就是「再开一个窗口，里面啥都没有」。<br>修法：`app.requestSingleInstanceLock()`，拿不到就 `app.quit()`；第一个实例监听 `second-instance` 用 `restoreWindow()` 把窗口拉到前台（顺带处理「窗口最小化了」「壁纸模式下挂在桌面层」两种状态 —— 裸 `show()` 对 WorkerW 子窗口是无效的）。<br>⚠️ **光 quit 不够**：`app.quit()` 是**异步**的，不会中断执行流，排队的 `whenReady` 回调照样跑完、照样 `initSetting` / `initPlaylists`（实测第二个实例日志里能看见 `[playlist] 已加载 0 个歌单`）。所以 `whenReady` 回调开头还要一道 `if (!singleInstanceLockHeld) return`。<br>⚠️ 顺序：锁必须在 `setupUserDataPath()` **之后**（便携版会改写 userData 路径，锁得跟着用同一个路径，否则便携版和安装版会被当成两个不同实例）、在 `initSetting()` **之前** |
+| **同时开两个实例 → 第二个窗口里一个歌单都没有** | 原来**没有单实例锁**。第二个实例完整跑起来、也去开同一个 `blwe.db` —— 而 **SQLite 允许多个连接打开同一文件**（`new Database()` 根本不会失败），于是它读到的歌单是空的（WAL 里第一个实例还没 checkpoint 的部分它看不见）。用户看到的就是「再开一个窗口，里面啥都没有」。<br>修法：`app.requestSingleInstanceLock()`，拿不到就 `app.quit()`；第一个实例监听 `second-instance` 用 `restoreWindow()` 把窗口拉到前台（顺带处理「窗口最小化了」「壁纸模式下挂在桌面层」两种状态 —— 裸 `show()` 对 WorkerW 子窗口是无效的）。<br>⚠️ **光 quit 不够**：`app.quit()` 是**异步**的，不会中断执行流，排队的 `whenReady` 回调照样跑完、照样 `initSetting` / `initPlaylists`（实测第二个实例日志里能看见 `[playlist] 已加载 0 个歌单`）。所以 `whenReady` 回调开头还要一道 `if (!singleInstanceLockHeld) return`。<br>⚠️ 顺序：锁必须在 `setupUserDataPath()` **之后**（便携版会改写 userData 路径，锁得跟着用同一个路径，否则便携版和安装版会被当成两个不同实例）、在 `initSetting()` **之前** |
 
 **顺手删掉的死代码**：`common/index.ts`（没人 import 的 barrel）、`wallpaperDetect.ts`
 （WorkerW 检测没人调用，当时壁纸走的是 `electron-as-wallpaper`）、三个「声明了但从没被读取」的设置
@@ -3019,11 +3412,11 @@ cmd /c "set ELECTRON_RUN_AS_NODE=&& node_modules\electron\dist\electron.exe veri
   **那是另一个空库**，读出来当然和真实数据对不上，得出完全不同的结论。
   两种写法都行：
   ```js
-  app.setPath('userData', path.join(process.env.APPDATA, 'BiLiMusicVideo'))
-  // 或： app.setName('BiLiMusicVideo')   ← userData 跟着 app name 走
+  app.setPath('userData', path.join(process.env.APPDATA, 'BiLiWallpaperEngine'))
+  // 或： app.setName('BiLiWallpaperEngine')   ← userData 跟着 app name 走
   ```
-  **目录名以 `package.json` 的 `name` 为准（= `BiLiMusicVideo`）**，
-  不是 `build.productName`（`BLMV`，那是 electron-builder 字段，Electron 不读）。
+  **目录名以 `package.json` 的 `name` 为准（= `BiLiWallpaperEngine`）**，
+  不是 `build.productName`（`BLWE`，那是 electron-builder 字段，Electron 不读）。
   想验证**便携版**行为时反过来 —— 要显式指到临时目录，别碰真实库。
 - **临时插桩**：自绘托盘菜单的「弹出/收起」是模块内私有函数，没法从外部调用。
   验证时**在构建产物 `out/main/index.js` 末尾临时追加** `globalThis.__showTrayMenu = showTrayMenu`

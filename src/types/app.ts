@@ -21,7 +21,7 @@ export interface LoopModeIndex {
 /** 列表弹层类型：none 关闭 / list 歌单 / vList 视频列表 */
 export type ListType = 'none' | 'list' | 'vList'
 
-/** biliVideoControls 派发的控制动作 */
+/** VideoControls 派发的控制动作 */
 export type VideoControlAction =
   | 'list'
   | 'vList'
@@ -120,6 +120,27 @@ export interface AppData {
   // ---- 歌单管理弹窗 ----
   /** 统一的歌单管理弹窗（新建/编辑/同步/曲目浏览都在里面） */
   playlistManagerVisible: boolean
+  /** B 站视频列表弹窗（收藏夹 / 合集 / 系列的导入与浏览） */
+  videoListVisible: boolean
+  /**
+   * 视频管理页当前**浏览**的列表 id
+   *
+   * 与 `videoListsStore.activeId`（正在播的那个）刻意分开：
+   * 切模式时播放不打断，所以「在看哪个列表」和「在播哪个列表」可以不是同一个。
+   */
+  browseVideoListId: string
+  /** 视频管理页当前浏览列表的条目（从库里读，切换 / 编辑后重载） */
+  ovSongs: PlaylistSong[]
+  /** 已经提示过「还没有任何列表」（避免每次兜底加载都再弹一次） */
+  _emptyNotified: boolean
+  /** OV 下连续「取不到播放地址」的条数（达到上限就停止自动跳过） */
+  _ovSkipStreak: number
+  /** 正拖着东西悬在窗口上：显示整窗「松手导入并播放」遮罩 */
+  dropActive: boolean
+  /** 正在导入拖进来的东西（遮罩上转圈，同时挡住第二次拖入） */
+  dropBusy: boolean
+  /** dragenter / dragleave 的进出计数（在子元素之间移动也会触发，不能只用布尔） */
+  _dragDepth: number
 
   // ---- 窗口状态 ----
   isMaximized: boolean
@@ -205,6 +226,10 @@ export interface AppData {
   _videoToken: number
   /** 同一个视频的连续失败次数，达到上限就跳过该曲，避免无限重试 */
   _videoErrorCount: number
+  /** 正在播的这条是不是本地视频文件（由 `resolveVideo` 回的 `isLocal` 决定） */
+  currentBvidIsLocal: boolean
+  /** 这次会话里已经弹过「文件丢了」的 bvid（同一个只问一次） */
+  _missingPrompted: string[]
   /** 视频加载完成后要跳转到的秒数（续播用） */
   seekAfterLoad: number
   /** `seekAfterLoad` 是为哪一首歌设的，防止跨歌曲误用 */

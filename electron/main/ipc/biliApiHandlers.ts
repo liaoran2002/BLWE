@@ -13,12 +13,14 @@
 import { mainHandle } from '@common/mainIpc'
 import { AUDIO_QUALITY_OPTIONS, findQualityOption, qualityLabelOf } from '@common/constants'
 import { rankVideos, baseSongName } from '@common/utils/videoRank'
-import { joinCacheKey } from '@common/types/playlist'
+import { joinCacheKey, bvidOfDirectKey } from '@common/types/playlist'
 import { durationToSeconds } from '@common/utils/duration'
 import * as biliApi from '../biliApi'
 import { isUrlUsable, readQualityOptions } from '../biliApi'
 import type { DashStreams } from '../biliApi'
 import { getSetting } from '../utils/setting'
+import { getLocalVideo, isLocalBvid, localMediaUrl } from '../utils/localVideo'
+import fs from 'node:fs'
 import { findSongDuration } from '../utils/playlist'
 import { readVideoQuality } from '../utils/quality'
 // 暂时停用 dev dump（要启用就把下面这行和中间那段调用一起放开）
@@ -200,6 +202,39 @@ export const registerApiHandlers = (context: ApiContext): void => {
      * 格式仍是 `"歌名-歌手"`（与历史数据一致），只在这里拼一次。
      */
     const cacheKey = joinCacheKey(songName, singerName)
+
+    /**
+     * ★ 直连条目（B 站视频列表）：不搜索、不打分、不过滤，候选就是它自己
+     *
+     * 这是整套「视频列表」方案最关键的**一处**改动：
+     * 列表条目在 `song_videos` 里占一行、键是 `bv:<bvid>`，
+     * 这里一短路，播放引擎看到的就和「已经搜到结果、只有一个候选」完全一样 ——
+     * 选视频、取地址、续播、预热、壁纸嵌入全部照旧，下游一行分支都不用加。
+     *
+     * ⚠️ 不要在这条分支上「顺手复用一下 rankVideos」：`videoRank` 里有
+     * 「标题必须含歌名」「时长窗口 ±90s」「歌手名命中 +100」这些规则，
+     * 对一条 45 分钟的游戏录播全是致命的（会把它判死）。
+     */
+    const directBvid = bvidOfDirectKey(songName)
+    if (directBvid) {
+      const result = cacheEnabled()
+        ? cacheManager.listDirectCandidates(cacheKey, directBvid)
+        : []
+      if (result.length === 0) {
+        /**
+         * 关系行丢了（重新同步时被清过 / 库被手工动过）—— 现场补一条，
+         * 不然这条视频在列表里点一下就没反应。地址仍然等解析时再取。
+         */
+        cacheManager.upsertVideoMeta(cacheKey, { bvid: directBvid })
+        return {
+          data: {
+            code: 0,
+            result: cacheManager.listDirectCandidates(cacheKey, directBvid),
+          },
+        }
+      }
+      return { data: { code: 0, result } }
+    }
 
     /**
      * 缓存命中**直接返回**（`skipCache` 是视频列表的刷新按钮，会真的重搜）
@@ -641,7 +676,13 @@ export const registerApiHandlers = (context: ApiContext): void => {
     if (!cacheKey || !bvid) return
     const sec = Math.round(Number(duration))
     if (!Number.isFinite(sec) || sec <= 0) return
-    if (!cacheEnabled()) return
+    /**
+     * 关掉缓存也要写**本地文件**的时长
+     *
+     * 时长不是「缓存」：B 站视频的时长重解析一次就有，本地文件没有 ffmpeg
+     * 只能靠探针读一次。跟着缓存开关一起失效，等于每次拖进来都要重探。
+     */
+    if (!cacheEnabled() && !isLocalBvid(bvid)) return
     cacheManager.upsertVideoMeta(cacheKey, { bvid, duration: sec })
   })
 
@@ -653,6 +694,64 @@ export const registerApiHandlers = (context: ApiContext): void => {
 
   mainHandle('api:resolveVideo', async ({ bvid, keyword, skipCache, noDash, qn, audioId }) => {
     try {
+      /**
+       * ★ 本地视频文件：**在最前面短路**，一步都不往后走
+       *
+       * 位置很关键，三个都必须绕开：
+       *  1. `ensureLoginState()` —— 它每次都会（必要时）打 B 站 nav 接口。
+       *     放在后面的话，「没登录 / 断网」时播自己硬盘上的文件也会先卡一次网络，
+       *     而且失败会影响登录态判断。本地文件跟 B 站账号毫无关系。
+       *  2. 「缓存地址是否过期」那段 —— 本地文件没有签名时效，
+       *     但它的 `playurl_at` 是 NULL（导入时不写），会被判成「过期」而重新解析，
+       *     也就是拿 `lf_xxx` 去请求 B 站 playurl，必然失败。
+       *  3. `updateVideoResult()` —— 那会把 `durl_url`（= 路径）当成 B 站直链覆盖掉。
+       *
+       * 地址由 `blwe-media://` 协议给（见 `mediaProtocol.ts`），
+       * 渲染层拿到的仍然是一个普通 URL，`<video src>` 那条路一行都不用改。
+       *
+       * `stat` 一次是为了「文件被移走 / 删掉」时给一句人话。
+       * 失败**不删库里的行**：用户可能只是拔了移动硬盘，过两天还要用；
+       * OV 的连续失败刹车会接住，不会一路跳过去。
+       */
+      if (isLocalBvid(bvid)) {
+        const local = getLocalVideo(bvid)
+        if (!local) {
+          return { videoUrl: null, error: '这个本地视频没有登记记录', isLocal: true }
+        }
+        try {
+          const stat = await fs.promises.stat(local.filePath)
+          if (!stat.isFile()) throw new Error('not a file')
+        } catch {
+          /**
+           * 文件不在了 —— 带**机器可读的错误码**回去
+           *
+           * 渲染层据此弹「重新定位 / 从列表移除」，而不是笼统地「取不到播放地址」。
+           * 只给一句人话（`error`）是不够的：文案随时会改，而界面要靠它决定
+           * 弹哪个框，不能拿中文字符串当契约。
+           */
+          return {
+            videoUrl: null,
+            error: `本地文件不存在：${local.filePath}（可能已被移动或删除）`,
+            code: 'LOCAL_MISSING' as const,
+            detail: local.filePath,
+            isLocal: true,
+          }
+        }
+        return {
+          videoUrl: localMediaUrl(bvid),
+          dash: null,
+          title: local.title,
+          pic: null,
+          duration: local.duration,
+          /** 本地文件没有「清晰度档位」可言：菜单自然空着，不去猜 */
+          quality: null,
+          qualityDesc: null,
+          audioQuality: null,
+          audioQualityDesc: null,
+          isLocal: true,
+        }
+      }
+
       /**
        * 每次解析前都确认一次登录态（必要时重拉 nav）。
        *
@@ -700,12 +799,11 @@ export const registerApiHandlers = (context: ApiContext): void => {
       /**
        * 这个 bvid 的**地址**（单独读一行，避免把整份列表的 dash 都拖出来）。
        *
-       * 只在「列表里有这一项」时才有意义 —— 不在列表里说明没缓存过，
-       * 直接走下面的重新解析分支。
+       * 拆表之后只按 bvid 取 —— 地址跟「哪首歌的候选」无关，
+       * 同一个视频从音乐歌单或视频列表进来，能播的都是同一份地址。
+       * 参数里那个 `keyword` 现在只用于「写回关系行」（见下面的 updateVideoResult）。
        */
-      const cachedAddress = keyword && targetVideo
-        ? cacheManager.getVideoAddress(keyword, bvid)
-        : null
+      const cachedAddress = targetVideo ? cacheManager.getVideoAddress(bvid) : null
 
       // 分支：使用缓存 / 重新解析
       if (targetVideo && cachedAddress && !skipCache) {

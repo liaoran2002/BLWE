@@ -108,6 +108,22 @@ const defaultSetting = {
   'player.resumeOnStart': true,
   /** 上次播放到的秒数 */
   'player.resumeTime': 0,
+  /** 当前在播的 B 站视频列表 id；空 = 在播音乐歌单 */
+  'player.activeVideoListId': '',
+  /**
+   * 默认列表的 id（拖入单条视频的落点）
+   *
+   * 空 = 还没定过（第一次启动时会自动建一个「默认列表」并写进来）。
+   * 它**删不掉**（可以改名）：拖视频进来总要有个地方放，删了下次还得再建一个，
+   * 不如把「哪个是默认的」记死在这里，而不是靠名字去猜。
+   */
+  'player.defaultVideoListId': '',
+  /**
+   * 当前模式：`ov` = 视频列表（默认），`mv` = 音乐歌单
+   *
+   * 只决定「界面在哪个工作区」，不改变播放引擎（只有一套 `songs`）。
+   */
+  'ui.mode': 'ov' as 'ov' | 'mv',
   /** 声音输出设备变化时暂停，默认开（避免声音跑到刚插上的设备上） */
   'player.pauseOnDeviceChange': true,
   /**

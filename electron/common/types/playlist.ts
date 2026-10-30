@@ -62,7 +62,50 @@ export interface PlaylistSong {
   platformId?: string | null
   /** 来源音源（`wy` / `tx` / `kw`），与 `platformId` 配对 */
   source?: string
+  /**
+   * ★ B 站视频列表条目的 bvid
+   *
+   * 只有「视频列表」来源的条目才有这个字段。渲染层据此判断：
+   *  - `getSongParts()` 直接返回 `bv:<bvid>`（主进程据此短路，不联网搜索）；
+   *  - 歌曲的缓存键 = `bv:<bvid>`，而不是 `歌名-歌手`。
+   *
+   * 音乐平台的歌单条目**永远没有**它 —— 那是两条互不相交的通道。
+   */
+  bvid?: string
+  /**
+   * 这条在**它所在的那个视频列表**里是否被收藏
+   *
+   * 只有视频列表来源的条目会带它。界面的爱心靠它显示实心 / 空心，
+   * 值来自 `videolist_items.favorites`（同一个 bvid 换个列表就可能是另一回事）。
+   */
+  favorites?: boolean
+  /**
+   * 本地视频文件的条目**此刻文件不在了**
+   *
+   * 只由 `VideoListItem` 带过来（见那边的注释），主列表据此把那一行打上
+   * 「文件丢失」角标 —— 播到它之前就能看见，而不是等播放失败才知道。
+   */
+  missing?: boolean
 }
+
+/**
+ * 直连条目的缓存键前缀
+ *
+ * 「视频列表 → 一个条目就是一个视频」在数据层表现为「一个只有唯一候选的条目」：
+ * 它在 `song_videos` 里占一行，`search_key = 'bv:<bvid>'`，
+ * `api:searchSong` 一看到这个前缀就短路，直接返回那一条。
+ *
+ * 用 bvid 而不是视频标题当键的理由很硬：同一个标题会撞（「第 1 集」遍地都是）。
+ * `:` 在歌名里出现概率极低，所以这个前缀**永远不可能和「歌名-歌手」撞**。
+ */
+export const DIRECT_KEY_PREFIX = 'bv:'
+
+/** 生成直连条目的缓存键 */
+export const directKeyOf = (bvid: string): string => `${DIRECT_KEY_PREFIX}${bvid}`
+
+/** 从缓存键反推 bvid；不是直连键时返回 null */
+export const bvidOfDirectKey = (key: string): string | null =>
+  key.startsWith(DIRECT_KEY_PREFIX) ? key.slice(DIRECT_KEY_PREFIX.length) : null
 
 /**
  * 合法的音源前缀（`songs.id` / `playlists.id` 的前缀部分）
@@ -297,3 +340,150 @@ export interface PlaylistSaveParams {
   playlists: PlaylistRecord[]
   currentId: string | null
 }
+
+// #region 视频列表（B 站收藏夹 / 合集 / 系列）
+
+/**
+ * 视频列表的来源类型
+ *
+ * 刻意**不包含**「稍后再看 / 历史 / UP 主投稿」：那些接口的鉴权与分页各不相同，
+ * 第一版只做「公开可访问、且返回字段最规整」的三种。
+ */
+export type VideoListKind = 'fav' | 'season' | 'series' | 'local'
+
+/**
+ * 条目来源
+ *
+ *  - `sync`：从 B 站列表拉下来的，下次同步以远端为准；
+ *  - `local`：用户手动「添加视频」加进来的，B 站上没有它 ——
+ *    同步时**必须保留**，否则一次同步就把它删了（而且再也找不回来）。
+ */
+export type VideoListOrigin = 'sync' | 'local'
+
+/**
+ * 一个视频列表（对应 `videolists` 表一行）
+ *
+ * 与 `PlaylistRecord` **不是**同一个东西，也不该合并：
+ *  - `PlaylistRecord.songs` 是「歌」，还要再经过搜索才能变成视频；
+ *  - 这里的成员**直接就是视频**（bvid），成员存在 `videolist_items`。
+ */
+export interface VideoListRecord {
+  /** 'bv_fav_123456' / 'bv_season_789' / 'bv_series_456' */
+  id: string
+  kind: VideoListKind
+  /** 平台侧 id：media_id / season_id / series_id */
+  sourceId: string | null
+  /** UP 主 mid（合集 / 系列重新同步时必带；收藏夹不需要） */
+  mid?: string | null
+  /** 列表名（收藏夹标题 / 合集名） */
+  name: string
+  cover: string | null
+  /** 远端报告的总条数（可能大于实际拉到的条数） */
+  itemCount: number | null
+  /** 重新同步策略：默认 off（手动刷新），避免每次启动都打一串接口 */
+  syncMode: 'off' | 'manual'
+  lastSyncAt: number | null
+  /** 播到第几条（下标）；同步后由主进程按 bvid 重定位 */
+  lastIndex: number
+  createdAt: number
+  updatedAt: number
+  /**
+   * 是不是**默认列表**（拖入单条视频的落点）
+   *
+   * 判断依据是设置项 `player.defaultVideoListId`，不是「名字叫默认列表」——
+   * 用户改名之后它还是默认列表，删不掉（可以改名）。
+   * 由主进程填，渲染层只拿它决定「这条不要显示删除按钮」。
+   */
+  isDefault?: boolean
+}
+
+/** 视频列表里的一条（= 一个视频） */
+export interface VideoListItem {
+  bvid: string
+  title: string
+  cover: string | null
+  /** UP 主名（音乐那边的「歌手」在界面上的对应物） */
+  author: string | null
+  /** 时长（秒） */
+  duration: number | null
+  /**
+   * 是否收藏（= 在置顶区）
+   *
+   * 收藏属于「列表 ✕ 条目」的关系，不属于视频本身：同一个 BV 号在两个列表里
+   * 可以一个收藏、一个没收藏。所以它在 `videolist_items.favorites` 上，
+   * **不是** `videos` 上的列（那会让列表 B 跟着显示成收藏）。
+   */
+  favorites?: boolean
+  /** 来源（同步来的 / 手动加的）；手动加的同样在置顶区 */
+  origin?: VideoListOrigin
+  /**
+   * 本地视频文件的绝对路径（**只有** `lf_` 条目有）
+   *
+   * 给界面用：丢了文件时能告诉用户「本来在哪」，重新定位时也能拿它当对话框的
+   * 默认目录。B 站条目恒为 null。
+   */
+  localPath?: string | null
+  /**
+   * 文件此刻不在了（**只有** `lf_` 条目会被检查）
+   *
+   * 由主进程在 `videolists:getItems` 里并发 `stat` 一次得出，**不落库** ——
+   * 文件可能只是暂时不在（拔了移动硬盘），下次插回来自然又「存在」了。
+   * 界面据此置灰、打「文件丢失」标、把点击行为改成「重新定位」。
+   */
+  missing?: boolean
+}
+
+/** 导入 / 同步一个视频列表的结果 */
+export interface VideoListSyncResult {
+  id: string
+  name: string
+  ok: boolean
+  /** 列表里最终有几条可用视频 */
+  count?: number
+  /** 这次同步新增 / 移除的条数 */
+  added?: number
+  removed?: number
+  /** 跳过的条目数（合集条目 / 番剧 / 课程等第一版不支持的） */
+  skipped?: number
+  error?: string
+}
+
+/**
+ * 解析出来的列表标识（用户粘贴链接后先得出它，再去拉内容）
+ *
+ * `mid` 只有合集 / 系列需要（`seasons_archives_list` 必须带 UP 主 mid），
+ * 收藏夹不需要。
+ */
+export interface ParsedListInput {
+  kind: VideoListKind
+  id: string
+  mid?: string
+  /** 原样回显给用户看的规范化链接（可空） */
+  url?: string
+}
+
+/**
+ * 「拖进窗口的那个东西」被认成了什么
+ *
+ * 拖入只有三种有意义的结果，各自对应一条完全不同的进料管：
+ *  - `music` —— **音乐歌单**链接（网易云 / QQ音乐 / 酷我）→ 切 MV，导入歌单；
+ *  - `list`  —— **B 站列表**（收藏夹 / 合集 / 系列）→ 切 OV，导入视频列表；
+ *  - `video` —— **单条 B 站视频** → 切 OV，塞进默认列表。
+ *
+ * 识别放在**主进程**（`utils/dropInput.ts`）：链接的正则、音源判定、BV 号规则
+ * 本来就都在主进程，渲染层只负责按 `type` 调对应的一个接口。
+ */
+export type DropInputTarget =
+  | { type: 'music'; url: string }
+  | { type: 'list'; kind: 'fav' | 'season' | 'series'; id: string; mid?: string }
+  /**
+   * 单条视频：`input` 原样带回去交给 `parseVideoInput`
+   *
+   * 不返回 bvid 是因为**还没解析**（短链 `b23.tv` 要跟随 302 才知道是哪个视频），
+   * 而那一套逻辑已经在 `parseVideoInput` 里了 —— 这里重复一遍只会多一处会漂的实现。
+   */
+  | { type: 'video'; input: string }
+  /** 没认出来（普通文字、本地文件、别的网站链接）—— 什么都不做 */
+  | { type: 'none' }
+
+// #endregion

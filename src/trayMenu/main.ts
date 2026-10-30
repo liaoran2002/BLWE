@@ -8,7 +8,7 @@
  *   已播时长 / 视频时长
  *   [音量(悬停出条)] [上一首] [播放/暂停] [下一首] [模式切换]
  *   ────────────
- *   设置歌单 / 定时（有定时时显示倒计时）/ 壁纸模式·窗口模式 / 退出登录 / 退出程序
+ *   歌单管理·视频管理 / 定时（有定时时显示倒计时）/ 壁纸模式·窗口模式 / 退出登录 / 退出程序
  *
  * 为什么不用原生 `Menu.popup`：壁纸模式下窗口嵌在桌面层、界面按钮又都隐藏了，
  * 原生菜单在那种环境里点不动（详见 ARCHITECTURE 里那段 `RIDEV_INPUTSINK` 的分析）。
@@ -113,7 +113,7 @@ for (const el of [volumeWrap, prevBtn, playBtn, nextBtn, modeBtn]) {
   controlsEl.appendChild(el)
 }
 
-/** 下面那几项（设置歌单 / 壁纸模式 / 退出登录 / 退出程序） */
+/** 下面那几项（歌单管理·视频管理 / 壁纸模式 / 退出登录 / 退出程序） */
 const listEl = document.createElement('div')
 listEl.className = 'list'
 
@@ -137,12 +137,23 @@ interface Item {
 }
 
 const ITEMS: Item[] = [
-  { action: 'showPlaylist', label: () => '设置歌单' },
+  {
+    /**
+     * 打开管理器（和弹窗左下角那个切换按钮同一件事）
+     *
+     * 文案跟着当前工作区变：`mv` 模式是「歌单管理」，`ov` 模式是「视频管理」——
+     * 点下去打开的就是当前模式对应的那个页面，文案和落地页必须一致。
+     * 所以这一项**同时**依赖 `ui.mode`（文案）和渲染层的 `openManager()`（行为），
+     * 主进程在 `ui.mode` 变化时会重新推一次状态（见 `onSettingChange`）。
+     */
+    action: 'showPlaylist',
+    label: (s) => (s.mode === 'mv' ? '歌单管理' : '视频管理'),
+  },
   {
     /**
      * 定时（睡觉定时器）
      *
-     * 和「设置歌单」同一条路径：点击后主进程先把窗口叫回窗口模式，再让渲染层
+     * 和「歌单管理 / 视频管理」同一条路径：点击后主进程先把窗口叫回窗口模式，再让渲染层
      * 弹出定时面板 —— 壁纸模式下窗口在桌面层，直接弹面板是看不见的。
      *
      * 文案随状态变：
@@ -217,7 +228,7 @@ const listEls: { el: HTMLElement; current: TrayMenuAction }[] = ITEMS.map((item)
    * down / up 不在同一元素上时浏览器不合成 `click`。mouseup 一定收得到。
    *
    * 但正因为靠 `mouseup`，必须自己校验「按下与抬起是同一项」：
-   * 从「设置歌单」按下、滑到「退出程序」再松手（托盘菜单这种小面板很常见），
+   * 从「视频管理」按下、滑到「退出程序」再松手（托盘菜单这种小面板很常见），
    * 原来会执行抬起那一项 —— 直接把应用退掉。所以记下按下的元素，抬起时比对。
    */
   let pressedOn: HTMLElement | null = null

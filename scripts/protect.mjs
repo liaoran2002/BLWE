@@ -7,7 +7,7 @@
  *      所以 bytenode 会拉起 Electron 自己来编译（`electronMain` / `electronRenderer`），
  *      而且主进程与预加载的 V8 不是同一套 flags，**不能混用**（bytenode 会直接报错拒绝）。
  *   2. **混淆**：渲染层的 js 过一遍 javascript-obfuscator（字符串数组 + 十六进制标识符）。
- *   3. **加密**：html / js / css 用 AES-256-GCM 就地加密，运行时由 `blmv://` 协议解密。
+ *   3. **加密**：html / js / css 用 AES-256-GCM 就地加密，运行时由 `blwe://` 协议解密。
  *      （混淆必须在加密之前 —— 加密之后就是密文了，混淆器读不懂。）
  *
  * 为什么步骤 1 里保留加载器而不是直接换入口：electron-builder 的 `files` 与 `package.json main`
@@ -33,7 +33,7 @@ const bytenode = require('bytenode')
  */
 delete process.env.ELECTRON_RUN_AS_NODE
 
-const MAGIC = Buffer.from('BLMV1')
+const MAGIC = Buffer.from('BLWE1')
 const IV_LEN = 12
 const TAG_LEN = 16
 
@@ -43,7 +43,7 @@ const size = (n) => `${(n / 1024).toFixed(1)} KB`
 
 /** 从 bundleKey.ts 里读密钥（和运行时是同一个常量），环境变量优先 */
 const readKey = () => {
-  if (process.env.BLMV_BUNDLE_KEY) return process.env.BLMV_BUNDLE_KEY
+  if (process.env.BLWE_BUNDLE_KEY) return process.env.BLWE_BUNDLE_KEY
   const src = fs.readFileSync(path.join(root, 'electron/main/bundleKey.ts'), 'utf8')
   const m = /BUNDLE_KEY\s*=\s*'([0-9a-fA-F]+)'/.exec(src)
   if (!m) throw new Error('读不到 BUNDLE_KEY（electron/main/bundleKey.ts）')

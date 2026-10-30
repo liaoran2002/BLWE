@@ -207,8 +207,223 @@ export interface IpcChannelMap {
       audioQualityDesc?: string | null
       /** 这个视频当前可选的清晰度 / 音质（用于播放器上的切换菜单） */
       options?: QualityOptionsPayload | null
+      /**
+       * 正在解析的是**本地文件**（`lf_` 条目）
+       *
+       * 渲染层不自己看 bvid 前缀（那是主进程的命名细节）：它只需要知道
+       * 「这条播不了的时候该不该弹『重新定位文件』」。本地文件的失败面
+       * 和 B 站条目完全不同 —— 没有网络、没有风控、没有失效条目，只有
+       * 「文件不在了」和「解不出来」两种。
+       */
+      isLocal?: boolean
+      /**
+       * 机器可读的错误码（给人看的那句话在 `error` 里）
+       *
+       * - `LOCAL_MISSING`：本地文件不存在（路径在 `detail` 里），值得弹修复入口；
+       * - `AUTH_FAILED`：B 站登录失效（历史原因这个码一直放在 `error` 里）。
+       */
+      code?: 'LOCAL_MISSING' | 'AUTH_FAILED'
+      /** 错误细节（目前只有 `LOCAL_MISSING` 用：文件原本的绝对路径） */
+      detail?: string
       error?: string
     }
+  }
+  // #endregion
+
+  // #region B 站视频列表（收藏夹 / 合集 / 系列）
+  /**
+   * 识别用户粘贴的链接是哪种列表
+   *
+   * 先识别、再去拉内容：识别失败时能直接告诉用户「这不是列表链接」，
+   * 而不是拿空 id 去打接口换一个看不懂的错误。
+   */
+  'api:parseListInput': {
+    params: { text: string }
+    result: import('./playlist').ParsedListInput | null
+  }
+  /** 「我创建的收藏夹」（导入弹窗里的选集入口；需要登录） */
+  'api:myFavFolders': {
+    params: void
+    /** `cover` 供界面的封面网格用（协议相对地址，渲染层补协议） */
+    result: Array<{ id: string; title: string; count: number; cover: string | null }>
+  }
+  /**
+   * 「订阅合集」（我**收藏的**别人做的合集；需要登录）
+   *
+   * 和「我创建的收藏夹」并列的另一类来源。数据来自 `x/v3/fav/folder/collected/list`，
+   * 里面 `type = 21` 的才是合集；`mid` 是**作者**的 mid，拉合集内容必须带它。
+   */
+  'api:mySubLists': {
+    params: void
+    result: Array<{
+      kind: 'season' | 'series'
+      id: string
+      mid: string
+      title: string
+      count: number
+      cover: string | null
+    }>
+  }
+  /**
+   * 拖入窗口的内容是什么（音乐歌单 / B 站列表 / 单条视频 / 没认出来）
+   *
+   * 纯识别、**不联网也不写库**：拖入时要先知道「该切到哪个工作区」，
+   * 这一步必须快到用户松手就出结果。真正的导入由调用方接着调对应接口。
+   */
+  'api:classifyDrop': {
+    params: { text: string }
+    result: import('./playlist').DropInputTarget
+  }
+  /**
+   * 导入一个音乐歌单（**已有就同步**）
+   *
+   * 解析在主进程（`resolvePlaylist`），落库也在主进程：按 `平台_歌单id`
+   * 或原始链接找已有记录 —— 找到就只刷新曲目，**保留**名字 / 同步设置 / 播放位置；
+   * 找不到才新建。渲染层拿到的 `existed` 只用来决定提示语「已导入」还是「已同步」。
+   */
+  'music:importPlaylist': {
+    params: { url: string }
+    result: { record: import('./playlist').PlaylistRecord; existed: boolean }
+  }
+  /** 全部视频列表（侧边栏 / 管理弹窗） */
+  'videolists:list': {
+    params: void
+    result: import('./playlist').VideoListRecord[]
+  }
+  /**
+   * 导入（内部拉取 + 落库，几百条会跑几秒）
+   *
+   * 同一个列表重复导入会**命中同一行**并走同步那套合并规则（收藏 / 手动添加的条目保留），
+   * 所以「拖入一个已经存在的列表」等价于「先同步一下」。
+   * `existed` 是给提示语用的（「已导入」还是「已同步」）。
+   */
+  'videolists:add': {
+    params: {
+      kind: import('./playlist').VideoListKind
+      sourceId: string
+      mid?: string
+    }
+    result: {
+      record: import('./playlist').VideoListRecord
+      skipped: number
+      existed: boolean
+    }
+  }
+  'videolists:remove': { params: { id: string }; result: boolean }
+  /** 新建一个**本地列表**（没有远端来源，条目靠手动添加；名字为空则自动编号） */
+  'videolists:createLocal': {
+    params: { name?: string }
+    result: import('./playlist').VideoListRecord
+  }
+  /** 给列表改名（本地列表常用；同步来的列表下次同步会被远端名覆盖） */
+  'videolists:rename': { params: { id: string; name: string }; result: boolean }
+  /**
+   * 「添加视频」：解析链接 / BV 号后**插到列表最前**
+   *
+   * 与音乐歌单那边的 `api:parseVideo` + `api:setFavorite` 是同一套思路：
+   * 收藏 / 手动添加都进置顶区，区别只是 `origin`。
+   */
+  'videolists:addItem': {
+    params: { id: string; input: string }
+    result: import('./playlist').VideoListItem
+  }
+  /** 从列表里删掉一条（只删关系，不动 `videos` 的地址缓存） */
+  'videolists:removeItem': { params: { id: string; bvid: string }; result: boolean }
+  /**
+   * 「拖入单条视频」的落点：加进**默认列表**并返回它
+   *
+   * 为什么不让渲染层先问「默认列表是哪个」再调 `addItem`：
+   * 哪一个是默认列表、没有时要不要现建一个，都是**数据层的事**（设置项 + 建表），
+   * 渲染层不该知道。这里一次调用搞定，返回 `listId` 供它去播放。
+   */
+  'videolists:addItemToDefault': {
+    params: { input: string }
+    result: {
+      listId: string
+      listName: string
+      item: import('./playlist').VideoListItem
+    }
+  }
+  /**
+   * 「拖入本地视频文件」：登记 + 挂进默认列表（整批置顶）
+   *
+   * 和 `addItemToDefault` 是同一件事的另一种入参 —— 落点、置顶规则、
+   * 续播全都一样，只有「地址从哪来」不同（那边是 B 站解析，这边是文件路径）。
+   *
+   * `url` 由主进程拼好（`blwe-media://local/<bvid>`）随条目一起给渲染层：
+   * 渲染层拿它去**探针**（`<video preload="metadata">` 读时长、顺便实测能不能播），
+   * 不该由它自己拼协议名 —— 协议名是主进程的实现细节。
+   */
+  'videolists:importLocal': {
+    params: { paths: string[] }
+    result: {
+      listId: string
+      listName: string
+      items: Array<import('./playlist').VideoListItem & { url: string }>
+      /** 没进列表的（不是视频 / 文件读不到），带原因给界面拼提示 */
+      skipped: Array<{ path: string; reason: string }>
+    }
+  }
+  /** 收藏 / 取消收藏某一条：收藏会**置顶**，取消收藏位置不动 */
+  'videolists:setFavorite': {
+    params: { id: string; bvid: string; favorite: boolean }
+    result: void
+  }
+  /** 重新同步（重新拉列表；`last_index` 按 bvid 重定位） */
+  'videolists:sync': {
+    params: { id: string }
+    result: import('./playlist').VideoListSyncResult
+  }
+  /**
+   * 取某个列表的条目（**已在库里，不联网**）
+   *
+   * 但对**本地文件**条目会顺手 `stat` 一次，回填 `missing` —— 打开视频管理时
+   * 就能看见哪几条文件已经不在，而不是等播到它才失败。B 站条目一次 IO 都不做。
+   */
+  'videolists:getItems': {
+    params: { id: string }
+    result: import('./playlist').VideoListItem[]
+  }
+  /** 记录播到第几条 */
+  'videolists:setIndex': { params: { id: string; index: number }; result: void }
+  // #endregion
+
+  // #region 本地视频文件（丢了之后怎么救）
+  /**
+   * 弹系统的「打开文件」对话框选一个视频文件
+   *
+   * 放主进程是因为渲染层拿不到 `dialog`；`currentPath` 只用来把对话框的
+   * 起始目录定在文件原来所在的那个文件夹，省得用户从盘符开始点。
+   * 用户取消返回空串（**不是错误**，调用方静默即可）。
+   */
+  'local:pickVideo': { params: { currentPath?: string }; result: string }
+  /**
+   * 重新定位：把某条本地视频指向新路径
+   *
+   * 只改 `videos.durl_url`，**bvid 不变** —— 列表顺序、收藏、续播位置全部原样保留
+   * （理由见 `utils/localVideo.ts` 的 `relocateLocalVideo`）。
+   */
+  'local:relocate': {
+    params: { bvid: string; newPath: string }
+    result: {
+      ok: boolean
+      bvid: string
+      title: string
+      /** 新路径本身已经有一条别的记录（同一文件曾从新位置拖进来过） */
+      duplicate: boolean
+      error?: string
+    }
+  }
+  /**
+   * 这条本地视频的文件此刻还在不在
+   *
+   * 渲染层在 `<video>` 报错**之后**问这一句，用来分开两种失败：
+   *  - 文件没了 → 弹「重新定位 / 移除」；
+   *  - 文件还在 → 是解码不支持（HEVC / 10bit / mkv），说清原因就行，别误报成丢失。
+   */
+  'local:exists': {
+    params: { bvid: string }
+    result: { exists: boolean; filePath: string | null }
   }
   // #endregion
 
@@ -400,7 +615,7 @@ export interface TrayState {
  * 自绘托盘菜单能执行的动作
  *
  * 菜单是一个迷你控制台：进度条 / 音量 / 上一首 / 播放暂停 / 下一首 / 循环模式，
- * 再加设置歌单、壁纸模式、退出登录、退出程序。
+ * 再加歌单管理/视频管理、壁纸模式、退出登录、退出程序。
  */
 export type TrayMenuAction =
   | 'playControl'
@@ -443,6 +658,13 @@ export interface TrayMenuState {
   /** 当前音量（0~100） */
   volume: number
   muted: boolean
+  /**
+   * 当前工作区（设置项 `ui.mode`）
+   *
+   * 菜单里那一项「歌单管理 / 视频管理」据此换文案 —— 点开的就是当前模式的
+   * 那个管理弹窗，文案必须和它一致，否则用户会以为点错了。
+   */
+  mode: 'ov' | 'mv'
   /**
    * 有没有在倒计时（含「已归零、在等视频播完」那段）
    *

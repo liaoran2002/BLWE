@@ -17,7 +17,9 @@ import {
   screen,
   Tray,
   nativeImage,
+  protocol,
 } from 'electron'
+import type { CustomScheme } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import { registerIpcHandlers } from './ipcHandlers'
@@ -31,12 +33,14 @@ import {
 import * as biliApi from './biliApi'
 import * as cacheManager from './utils/cache'
 import { initPlaylists, flushPlaylists } from './utils/playlist'
+import { ensureDefaultVideoList, getVideoLists } from './utils/videolist'
+import { installMediaProtocol, mediaSchemeDescriptor } from './mediaProtocol'
 import { PLAY_LOOP_MODES, parseAspectRatio } from '@common/constants'
 import {
   installProtectedProtocol,
   protectionEnabled,
   protectedRendererUrl,
-  registerProtectedScheme,
+  protectedSchemeDescriptor,
 } from './protection'
 import type { IpcEvent, IpcEventPayload, TrayMenuAction, TrayMenuState } from '@common/types/ipc'
 
@@ -1267,8 +1271,8 @@ function refreshTray(): void {
    * 用户按提示点了一下，结果窗口直接跳出来 —— 提示与实际不一致比没有提示更糟。
    */
   const tip = wallpaperEnabled
-    ? `BiLiMusicVideo · 壁纸模式\n${title}\n单击：回到窗口　右键：菜单`
-    : `BiLiMusicVideo\n${title}\n单击：显示窗口　右键：菜单`
+    ? `BiLiWallpaperEngine · 壁纸模式\n${title}\n单击：回到窗口　右键：菜单`
+    : `BiLiWallpaperEngine\n${title}\n单击：显示窗口　右键：菜单`
   if (tip !== lastTrayTip) {
     tray.setToolTip(tip)
     lastTrayTip = tip
@@ -1498,6 +1502,8 @@ function getTrayMenuState(): TrayMenuState {
     duration: trayDuration,
     volume: trayVolume,
     muted: trayMuted,
+    // 工作区：菜单里那一项按它显示「歌单管理」还是「视频管理」
+    mode: getSetting()['ui.mode'] === 'mv' ? 'mv' : 'ov',
     sleepActive: traySleepActive,
     sleepRemainSec: traySleepRemainSec,
   }
@@ -1726,7 +1732,7 @@ function scheduleHideAfterBlur(recheck = 0): void {
  *    连着切两首、或者暂停后顺手换个模式再播。收起菜单等于每点一下
  *    都要重新右键托盘图标，很难用。
  *
- * 与之相对，下面那几项（设置歌单 / 壁纸模式 / 退出登录 / 退出程序）
+ * 与之相对，下面那几项（歌单管理/视频管理 / 壁纸模式 / 退出登录 / 退出程序）
  * 都是**一次性的跳转或命令**，执行完就该收起来。
  *
  * 菜单不收起时，用户仍然可以：按 `Esc`、点菜单外面、或左键点托盘图标来关掉它。
@@ -1776,16 +1782,19 @@ function runTrayMenuAction(action: TrayMenuAction, value?: number): void {
       break
     case 'showPlaylist':
       /**
-       * 设置歌单：壁纸模式下**先退出壁纸模式**再打开（用户要求）
+       * 歌单管理 / 视频管理：壁纸模式下**先退出壁纸模式**再打开（用户要求）
        *
-       * 壁纸模式下窗口在桌面层、标题栏控制栏又都是隐藏的，直接弹歌单管理会看不见，
+       * 壁纸模式下窗口在桌面层、标题栏控制栏又都是隐藏的，直接弹管理窗会看不见，
        * 所以先把窗口恢复出来，再让渲染层打开弹窗。
+       *
+       * 打开哪一页由渲染层决定（它更清楚当前工作区）：`openManager()` 会按
+       * `ui.mode` 打开「歌单管理」或「视频管理」，和弹窗左下角那个切换按钮同一条路径。
        */
       void restoreWindow().then(() => sendToMain('tray:showPlaylist'))
       break
     case 'showSleepTimer':
       /**
-       * 定时：和「设置歌单」完全同一套跳转 —— **先回到窗口模式，再打开面板**
+       * 定时：和「歌单管理 / 视频管理」完全同一套跳转 —— **先回到窗口模式，再打开面板**
        *
        * 壁纸模式下窗口在桌面层、标题栏和弹窗都看不见，所以必须先 `restoreWindow`；
        * 面板本身（`SleepTimerPanel`）由渲染层管，这里只发一条「请打开」的事件。
@@ -1988,7 +1997,7 @@ setupUserDataPath()
  *
  * ## 不加会怎样（踩过）
  *
- * 双击第二次图标 → 第二个实例完整跑起来 → 它也去开同一个 `blmv.db`。
+ * 双击第二次图标 → 第二个实例完整跑起来 → 它也去开同一个 `blwe.db`。
  * 而 **SQLite 允许多个连接打开同一个文件**（`new Database()` 根本不会失败），
  * 于是第二个实例读到的歌单是空的（WAL 里第一个实例还没 checkpoint 的部分
  * 它看不见）—— 用户看到的就是「再开一个窗口，里面一个歌单都没有」。
@@ -2032,12 +2041,29 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 /**
- * 第 1.5 步：注册加密资源协议
+ * 第 1.5 步：注册**全部**自定义协议（一次注册完）
  *
- * 必须在 `app.whenReady()` **之前** —— 只有这时注册的 privileges（standard / secure）才生效，
- * 否则 `blmv://` 会被当成普通自定义协议，页面拿不到正常的安全上下文（fetch / MSE 都会受限）。
+ * 两个约束叠在一起，才有这段「看起来多此一举」的合并：
+ *  1. `privileges`（standard / secure / stream）**只有在 `app.whenReady()` 之前**
+ *     注册才生效 —— 否则协议会被当成普通自定义协议，页面拿不到安全上下文，
+ *     fetch / MSE / 媒体流全都受限；
+ *  2. `registerSchemesAsPrivileged` **一生只能调用一次**，第二次会被
+ *     **静默忽略**（不报错、不警告）。所以「各模块自己注册各的」这种写法
+ *     会在加了第二个协议那天悄悄坏掉 —— 表现是「能导入、点了没画面」。
+ *
+ * 因此各模块只交出描述（`*SchemeDescriptor()`），这里统一注册一次。
+ *
+ * 两个协议分别是：
+ *  - `blwe://`        加密后的渲染层产物（只在打包构建里启用）；
+ *  - `blwe-media://`  本地视频文件的流（开发 / 打包都要）。
  */
-registerProtectedScheme()
+const CUSTOM_SCHEMES: CustomScheme[] = []
+{
+  const protectedScheme = protectedSchemeDescriptor()
+  if (protectedScheme) CUSTOM_SCHEMES.push(protectedScheme)
+  CUSTOM_SCHEMES.push(mediaSchemeDescriptor())
+  protocol.registerSchemesAsPrivileged(CUSTOM_SCHEMES)
+}
 
 void app.whenReady().then(async () => {
   /**
@@ -2060,6 +2086,16 @@ void app.whenReady().then(async () => {
   initPlaylists()
 
   /**
+   * 第 2.1 步：确保有一个「默认列表」（拖入单条视频的落点）
+   *
+   * **只在库彻底空的时候建**（第一次启动）：老用户可能已经有列表了，
+   * 这时不主动塞一个新列表给他，而是把「最早的本地列表」认作默认的
+   * （`ensureDefaultVideoList` 内部按「设置 → 已有本地列表 → 新建」三级兜底）。
+   * 这一句同时也是「第一次打开就有一个能拖视频进去的落点」的实现。
+   */
+  ensureDefaultVideoList({ create: getVideoLists().length === 0 })
+
+  /**
    * 第 2.2 步：按设置把「开机自动启动」写进系统启动项
    *
    * **每次启动都重写**（不是只在第一次）—— 见 `applyAutoLaunch` 的说明：
@@ -2067,8 +2103,9 @@ void app.whenReady().then(async () => {
    */
   applyAutoLaunch()
 
-  // 第 2.5 步：装上加密资源的请求处理器（要在创建窗口之前）
+  // 第 2.5 步：装上加密资源 / 本地视频的请求处理器（要在创建窗口之前）
   installProtectedProtocol()
+  installMediaProtocol()
 
   /**
    * 配置变化时同步托盘菜单
@@ -2116,6 +2153,15 @@ void app.whenReady().then(async () => {
     if (keys.includes('common.autoLaunch')) {
       applyAutoLaunch()
     }
+    /**
+     * 切了工作区（`ov` ↔ `mv`）要**立刻**把新状态推给菜单
+     *
+     * 菜单窗口是常驻的（只在托盘右键时显示），文案只靠 `trayMenu:state` 驱动。
+     * 不推的话，用户在这次切换前就打开过菜单、之后又切了模式，
+     * 菜单里那一项会一直停在旧文案（「歌单管理」/「视频管理」说反了）。
+     * 没建过菜单窗口时 `pushTrayMenuState` 自己会直接返回，不用管。
+     */
+    if (keys.includes('ui.mode')) pushTrayMenuState()
     refreshTray()
   })
 
@@ -2143,7 +2189,7 @@ void app.whenReady().then(async () => {
    *  1. 有些 CDN 响应**不带** `Access-Control-Allow-Origin` → 直接拦；
    *  2. 有些 CDN 会把**第一个请求者的 Origin** 写进 ACAO 并按 URL 缓存下来
    *     （报错原话：`ACAO has a value 'http://localhost:5173' that is not equal to the supplied origin`，
-   *     那个 5173 就是开发服务器），于是别的来源（打包后的 `blmv://app`、或 `file://`）拿到一个对不上的值。
+   *     那个 5173 就是开发服务器），于是别的来源（打包后的 `blwe://app`、或 `file://`）拿到一个对不上的值。
    * 所以这里**不判断、一律覆盖成 `*`**，并且删掉 `Access-Control-Allow-Credentials`
    * —— `*` 和「允许带凭据」是浏览器眼里的非法组合。
    *
@@ -2159,7 +2205,7 @@ void app.whenReady().then(async () => {
        *
        * 踩过：CDN 回的是小写 `access-control-allow-origin`，我直接
        * `headers['Access-Control-Allow-Origin'] = ['*']` 等于**又加了一条**，
-       * 浏览器看到的是 `ACAO: blmv://app, *` —— 两个值直接判非法，
+       * 浏览器看到的是 `ACAO: blwe://app, *` —— 两个值直接判非法，
        * 本来能用的那些请求也被我搞挂了（报错从 1 条变成 20 条）。
        */
       for (const key of Object.keys(headers)) {

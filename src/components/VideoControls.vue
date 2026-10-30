@@ -1,5 +1,5 @@
 <template>
-  <div id="biliVideoControls">
+  <div id="VideoControls">
     <div class="now-playing">
       <!-- 封面：优先歌曲专辑图，退回视频缩略图 -->
       <div class="np-cover">
@@ -115,21 +115,29 @@
       <div class="time" id="totalTime">{{ formatTime(duration) }}</div>
     </div>
     <div id="controls">
-      <!-- 歌曲列表（播放队列）；打开时变成叉号 -->
+      <!-- 播放队列（MV 是曲目、OV 是视频条目）；打开时变成叉号 -->
       <i
         :class="[
           'iconfont',
           listType == 'list' ? 'icon-cuowu' : 'icon-bofangduilie',
         ]"
+        :title="mode === 'ov' ? '视频列表' : '歌曲列表'"
         @click="$emit('videoControl', 'list')"
         id="list"
       ></i>
-      <!-- 视频列表（播放列表） -->
+      <!--
+        候选视频列表（一首歌的一堆 B 站搜索结果）
+
+        **OV 模式下没有这个东西** —— 条目本身就是视频，没有「换一个视频」可选，
+        留着只会是个按下去什么都不发生的按钮。
+      -->
       <i
+        v-if="mode !== 'ov'"
         :class="[
           'iconfont',
           listType == 'vList' ? 'icon-cuowu' : 'icon-bofangliebiao',
         ]"
+        title="候选视频"
         @click="$emit('videoControl', 'vList')"
         id="vList"
       ></i>
@@ -141,7 +149,7 @@
       -->
       <i
         :class="['iconfont', 'icon-1_music83', busy ? 'ctrl-disabled' : '']"
-        :title="busy ? '正在加载中，请稍候……' : '上一首'"
+        :title="busy ? '正在加载中，请稍候……' : mode === 'ov' ? '上一个视频' : '上一首'"
         @click="busy ? null : $emit('videoControl', 'before')"
         id="before"
       ></i>
@@ -152,7 +160,7 @@
       ></i>
       <i
         :class="['iconfont', 'icon-1_music82', busy ? 'ctrl-disabled' : '']"
-        :title="busy ? '正在加载中，请稍候……' : '下一首'"
+        :title="busy ? '正在加载中，请稍候……' : mode === 'ov' ? '下一个视频' : '下一首'"
         @click="busy ? null : $emit('videoControl', 'next')"
         id="next"
       ></i>
@@ -230,7 +238,7 @@ import { normalizeImageUrl } from '../utils/image';
 import { sanitizeTitleHtml } from '../utils/title';
 
 export default defineComponent({
-  name: 'biliVideoControls',
+  name: 'VideoControls',
   emits: [
     'changeVolume',
     'changeTime',
@@ -287,6 +295,14 @@ export default defineComponent({
     duration: { type: Number, default: 0 },
     paused: { type: Boolean, default: false },
     listType: { type: String, default: '' },
+    /**
+     * 当前工作区：`ov`（B 站视频列表）/ `mv`（音乐歌单）
+     *
+     * 只影响**文案与按钮取舍**，不影响播放：
+     *  - 上一首 / 下一首 → 上一个视频 / 下一个视频；
+     *  - 候选视频列表按钮在 OV 下隐藏（条目本身就是视频，没有候选可选）。
+     */
+    mode: { type: String, default: 'mv' },
     /**
      * ★ **有网络请求在飞**（搜索 / 解析地址）时为 true
      *
@@ -487,7 +503,7 @@ export default defineComponent({
 </script>
 
 <style>
-#biliVideoControls {
+#VideoControls {
   /* 配色/圆角/模糊全部走主题令牌，和歌单面板、弹窗保持同一套风格 */
   color: var(--glass-text);
   position: fixed;
@@ -510,7 +526,7 @@ export default defineComponent({
   /* 白字 + 黑阴影（深色主题换成白阴影），压在亮/暗视频上都看得清 */
   text-shadow: var(--glass-shadow);
 }
-#biliVideoControls:hover {
+#VideoControls:hover {
   opacity: 1;
   box-shadow: var(--glass-shadow);
 }
@@ -684,7 +700,7 @@ export default defineComponent({
   box-shadow: var(--glass-shadow);
   display: none;
 }
-#biliVideoControls:hover .progressHandle {
+#VideoControls:hover .progressHandle {
   display: block;
 }
 /* #region 当前播放（封面 + 标题 + 副标题） */

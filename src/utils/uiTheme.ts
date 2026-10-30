@@ -103,7 +103,7 @@ export const applyUiTheme = (input: UiThemeInput): void => {
    * 闲置透明度：**存的是百分比（0-100），写进去的是 0-1 的小数**
    *
    * 和 `--glass-alpha` 一样要除 100（CSS 的 `opacity` 收小数）。
-   * 悬停时 CSS 直接写死 `opacity: 1`（见 biliVideoControls.vue），所以这里只管闲置态。
+   * 悬停时 CSS 直接写死 `opacity: 1`（见 VideoControls.vue），所以这里只管闲置态。
    */
   const idlePct = Number(input['common.idleOpacity']);
   const idle =
