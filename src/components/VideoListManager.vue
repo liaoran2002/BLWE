@@ -76,7 +76,7 @@
             </el-button>
           </div>
           <!-- 切回 MV 模式（和歌单管理里那个「视频管理 →」对称） -->
-          <el-button class="vlm-side-switch" size="small" @click="$emit('openPlaylists')">
+          <el-button class="vlm-side-switch" size="small" @click="void ui.openManager('mv')">
             ← 歌单管理
           </el-button>
         </div>
@@ -389,8 +389,10 @@ import { formatDuration } from '@common/utils/duration';
 import api from '../api/electron';
 import { useVideoListStore } from '../stores/videoLists';
 import { normalizeImageUrl } from '../utils/image';
+import { useUiStore } from '../stores/ui';
+import { useQueueStore } from '../stores/queue';
 
-interface Row {
+export interface Row {
   index: number;
   item: VideoListItem;
 }
@@ -401,7 +403,7 @@ interface Row {
  * `kind` 目前恒为 `'season'`（只收 `type = 21` 的合集）；类型里留着 `'series'`
  * 是因为「系列」也是 B 站的一类列表，将来若找到来源可以不做类型改动就接上。
  */
-interface SubList {
+export interface SubList {
   kind: 'season' | 'series';
   id: string;
   mid: string;
@@ -415,17 +417,6 @@ const pad = (n: number): string => (n < 10 ? `0${n}` : String(n));
 
 export default defineComponent({
   name: 'VideoListManager',
-  props: {
-    modelValue: { type: Boolean, default: false },
-    /**
-     * 父组件记住的「正在看哪个列表」
-     *
-     * 弹窗自身也存了 `selectedId`，但那个只在打开期间有效；
-     * 关掉再打开（或从歌单管理切回来）要停回同一个列表，得靠父组件这份。
-     */
-    browseId: { type: String, default: '' },
-  },
-  emits: ['update:modelValue', 'play', 'browse', 'openPlaylists', 'changed'],
   data() {
     return {
       selectedId: '',
@@ -467,13 +458,38 @@ export default defineComponent({
     store() {
       return useVideoListStore();
     },
+    /**
+     * 这些 store（播放状态按域拆成了多个）
+     *
+     * 弹窗开关、「正在看哪个列表」、播一条 / 换一列，本来就都在 player 里。
+     * 以前靠 v-model + props + 四个 emit 来回传，现在直接读写 store。
+     *
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    ui() {
+      return useUiStore();
+    },
+    queue() {
+      return useQueueStore();
+    },
     visible: {
       get(): boolean {
-        return this.modelValue;
+        return this.ui.videoListVisible;
       },
       set(v: boolean) {
-        this.$emit('update:modelValue', v);
+        this.ui.videoListVisible = v;
       },
+    },
+    /**
+     * 「正在看哪个列表」
+     *
+     * 弹窗自身也存了 `selectedId`，但那个只在打开期间有效；
+     * 关掉再打开（或从歌单管理切回来）要停回同一个列表，得靠 store 这份。
+     */
+    browseId(): string {
+      return this.ui.browseVideoListId;
     },
     totalItems(): number {
       return this.store.lists.reduce((sum, item) => sum + (item.itemCount ?? 0), 0);
@@ -503,7 +519,7 @@ export default defineComponent({
       if (v) void this.onOpen();
     },
     browseId(v: string) {
-      // 父组件换了「正在看哪个列表」（切模式 / 新建后）：跟着换，别停在旧列表上
+      // store 换了「正在看哪个列表」（切模式 / 新建后）：跟着换，别停在旧列表上
       if (v && v !== this.selectedId && this.visible) {
         this.selectedId = v;
       }
@@ -528,7 +544,7 @@ export default defineComponent({
       /**
        * 每次打开都重读一遍（纯数据库读，几毫秒）
        *
-       * `lastIndex` 会在播放过程中不断被 `App.vue` 写库，store 里那份是旧值 ——
+       * `lastIndex` 会在播放过程中不断被 player store 写库，store 里那份是旧值 ——
        * 不重读的话「正在播」那行会停在打开程序时的位置。
        */
       try {
@@ -538,9 +554,9 @@ export default defineComponent({
         return;
       }
       /**
-       * 停在哪个列表：父组件记的 > 正在播的 > 第一个
+       * 停在哪个列表：store 记的 > 正在播的 > 第一个
        *
-       * 父组件那份是「用户上次在看哪个」，关掉再开、从歌单管理切回来都要接上；
+       * store 那份是「用户上次在看哪个」，关掉再开、从歌单管理切回来都要接上；
        * 直接落到 activeId 的话，切模式把播放留在另一边时就会跳到别的列表。
        */
       const preferred = [this.browseId, this.store.activeId, this.store.lists[0]?.id || ''];
@@ -550,7 +566,7 @@ export default defineComponent({
     /** 左侧选中一个列表（只换浏览，不动播放） */
     selectList(id: string): void {
       this.selectedId = id;
-      this.$emit('browse', id);
+      void this.ui.onVideoListBrowse(id);
     },
     errMsg(err: unknown): string {
       return err instanceof Error ? err.message : String(err);
@@ -600,13 +616,13 @@ export default defineComponent({
         ElMessage.warning('这个列表还没有条目');
         return;
       }
-      this.$emit('browse', item.id);
-      this.$emit('play', item.id, Math.max(0, item.lastIndex || 0));
+      void this.ui.onVideoListBrowse(item.id);
+      void this.queue.onVideoListPlay(item.id, Math.max(0, item.lastIndex || 0));
       this.visible = false;
     },
     playAt(item: VideoListRecord, index: number): void {
-      this.$emit('browse', item.id);
-      this.$emit('play', item.id, index);
+      void this.ui.onVideoListBrowse(item.id);
+      void this.queue.onVideoListPlay(item.id, index);
       this.visible = false;
     },
     /**
@@ -646,7 +662,7 @@ export default defineComponent({
           ElMessage.warning('这个文件还有另一条记录（之前从新位置拖进来过），不影响播放');
         }
         await this.loadItems(record.id);
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
         ElMessage.error('重新定位失败：' + this.errMsg(err));
       }
@@ -691,7 +707,7 @@ export default defineComponent({
       try {
         const item = await this.store.addItem(record.id, input);
         await this.loadItems(record.id);
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
         ElMessage.success(`已添加《${item.title || item.bvid}》`);
       } catch (err) {
         ElMessage.error('添加失败：' + this.errMsg(err));
@@ -702,7 +718,7 @@ export default defineComponent({
       try {
         await this.store.setFavorite(record.id, item.bvid, !item.favorites);
         await this.loadItems(record.id);
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
         ElMessage.error('收藏失败：' + this.errMsg(err));
       }
@@ -724,7 +740,7 @@ export default defineComponent({
           ElMessage.warning('这一条已经不在列表里了');
         }
         await this.loadItems(record.id);
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
         ElMessage.error('移除失败：' + this.errMsg(err));
       }
@@ -749,7 +765,7 @@ export default defineComponent({
           ElMessage.error('重命名失败');
           return;
         }
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
         ElMessage.error('重命名失败：' + this.errMsg(err));
       }
@@ -825,7 +841,7 @@ export default defineComponent({
           const record = await this.store.createLocal(name || undefined);
           this.creating = false;
           this.selectList(record.id);
-          this.$emit('changed');
+          void this.ui.refreshBrowseAfterEdit();
           ElMessage.success(`已创建《${record.name}》，点「添加视频」往里加条目`);
         } catch (err) {
           ElMessage.error('创建失败：' + this.errMsg(err));
@@ -889,7 +905,7 @@ export default defineComponent({
         this.selectList(record.id);
         // 重复导入同一个列表时 selectedId 没变，watch 不会触发 —— 手动刷一次条目
         await this.loadItems(record.id);
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
         ElMessage.error('导入失败：' + this.errMsg(err));
       } finally {
@@ -911,7 +927,7 @@ export default defineComponent({
             (r.skipped ? `（跳过 ${r.skipped} 个）` : ''),
         );
         if (this.selectedId === item.id) await this.loadItems(item.id);
-        this.$emit('changed');
+        void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
         ElMessage.error('同步失败：' + this.errMsg(err));
       }
@@ -935,7 +951,7 @@ export default defineComponent({
         const next = this.store.lists[0]?.id ?? '';
         this.selectList(next);
       }
-      this.$emit('changed');
+      void this.ui.refreshBrowseAfterEdit();
     },
     // #endregion
   },

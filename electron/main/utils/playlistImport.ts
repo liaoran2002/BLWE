@@ -22,8 +22,8 @@
 import { randomUUID } from 'node:crypto'
 import type { PlaylistRecord } from '@common/types/playlist'
 import { playlistKey } from '@common/types/playlist'
-import { resolvePlaylist } from '../music'
-import { getPlaylists, savePlaylists, toPlaylistSongs } from './playlist'
+import { resolvePlaylist, resolveSong } from '../music'
+import { appendSongToDefaultPlaylist, getPlaylists, savePlaylists, toPlaylistSongs } from './playlist'
 
 export const importMusicPlaylist = async (
   url: string,
@@ -88,4 +88,35 @@ export const importMusicPlaylist = async (
   const created = saved.playlists.find((item) => item.id === id) ?? record
   console.log(`[playlist] 已导入《${created.name}》${songs.length} 首（拖入）`)
   return { record: created, existed: false }
+}
+
+/**
+ * 「拖入一首单曲」→ 追加进默认歌单 → 交给渲染层去播
+ *
+ * 和 `importMusicPlaylist` 的区别是**落点**：那边是「导入一个歌单」，
+ * 这边是「往默认歌单里塞一首」。之所以不新建歌单，是因为拖一首歌进来
+ * 的意图是「我想听这首」，不是「帮我建个歌单」—— 上次这么干的人
+ * 会在歌单列表里攒出十几个只有一首歌的歌单。
+ *
+ * 默认歌单由 `appendSongToDefaultPlaylist` 保证存在（没有就现建、且删不掉），
+ * 去重也在那边做（按 `songs.id` + `歌名-歌手` 两层，见那里的注释）。
+ *
+ * 返回的 `index` 就是要播的位置：主进程已经把默认歌单的 `lastIndex` 改成它，
+ * 渲染层拿 `record.id` 调 `onPlaylistSwitch` 就会从这一首起播。
+ */
+export const importSongToDefault = async (
+  url: string,
+): Promise<{ record: PlaylistRecord; index: number; added: boolean; songName: string }> => {
+  const input = (url ?? '').trim()
+  if (!input) throw new Error('歌曲链接不能为空')
+
+  const { song } = await resolveSong(input)
+  const [parsed] = toPlaylistSongs([song])
+  if (!parsed) throw new Error('这首歌的信息不完整（缺歌名），无法加入歌单')
+
+  const result = appendSongToDefaultPlaylist(parsed)
+  console.log(
+    `[playlist] ${result.added ? '已加入' : '已存在'}《${parsed.name}》→ 默认歌单（第 ${result.index + 1} 首）`,
+  )
+  return { ...result, songName: parsed.name }
 }

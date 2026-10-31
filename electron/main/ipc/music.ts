@@ -21,7 +21,7 @@
 import { mainHandle } from '@common/mainIpc'
 import { resolvePlaylist } from '../music'
 import { toPlaylistSongs } from '../utils/playlist'
-import { importMusicPlaylist } from '../utils/playlistImport'
+import { importMusicPlaylist, importSongToDefault } from '../utils/playlistImport'
 import { playlistKey } from '@common/types/playlist'
 
 export const registerMusicHandlers = (): void => {
@@ -64,4 +64,12 @@ export const registerMusicHandlers = (): void => {
    * 在表单里改名 / 调同步策略，导入时机由他自己点「保存」决定。
    */
   mainHandle('music:importPlaylist', ({ url }) => importMusicPlaylist(url))
+
+  /**
+   * 拖入一首单曲 = 追加进默认歌单 + 设为当前
+   *
+   * 和上面那条的差别只在落点：那边整个歌单进来，这边一首歌进「默认歌单」。
+   * 播放位置由主进程顺手写好（`lastIndex` = 这首歌），渲染层拿 id 切过去就播它。
+   */
+  mainHandle('music:importSong', ({ url }) => importSongToDefault(url))
 }

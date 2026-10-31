@@ -34,9 +34,7 @@ import type {
   VideoListItem,
   VideoListRecord,
   VideoListSyncResult,
-  PlaylistSong,
 } from '@common/types/playlist'
-import { directKeyOf } from '@common/types/playlist'
 import { fetchBiliList, parseVideoInput } from '../biliApi'
 import type { BiliListDetail, BiliListKind } from '../biliApi'
 import fs from 'node:fs'
@@ -215,28 +213,6 @@ export const getVideoListItems = (id: string): VideoListItem[] => {
   }
 }
 
-/**
- * 把列表条目映射成渲染层认识的 `PlaylistSong[]`
- *
- * 渲染层（`App.vue` 的 `songs`）一直吃 `PlaylistSong`，视频列表要复用同一套
- * 播放 / 切歌 / 续播逻辑，所以在这里做一次形状转换：
- *  - `name` = 视频标题（界面显示的就是它）
- *  - `singer` = UP 主（界面上「歌手」这一列在视频列表里改成「UP 主」）
- *  - `bvid` = 关键字段，`App.vue` 据此决定缓存键是 `bv:<bvid>` 而不是 `歌名-歌手`
- *  - `favorites` = 爱心（实心/空心），**不是** `videos` 上的收藏
- */
-export const toPlaylistSongs = (items: VideoListItem[]): PlaylistSong[] =>
-  items.map((item) => ({
-    name: item.title || item.bvid,
-    singer: item.author ?? '',
-    cover: item.cover,
-    duration: item.duration,
-    bvid: item.bvid,
-    favorites: item.favorites === true,
-    /** 本地文件丢了 → 主列表那一行也打标（进列表就能看见，不用等播失败） */
-    missing: item.missing === true,
-  }))
-
 /** 把视频元数据写进 videos（不含地址列；地址等第一次播放时补） */
 const upsertVideoMeta = (
   db: ReturnType<typeof getDb>,
@@ -251,19 +227,6 @@ const upsertVideoMeta = (
        author   = COALESCE(excluded.author, videos.author),
        duration = COALESCE(excluded.duration, videos.duration)`,
   ).run(item.bvid, item.title || null, item.cover ?? null, item.author ?? null, item.duration ?? null)
-}
-
-/**
- * `bv:<bvid>` 的关系行：**这就是「直连条目」的全部魔法**
- *
- * `ord = 0`（唯一候选）、`favorites = 0`（绝不能是 1 —— 音乐歌单那边取消收藏会把它删掉）、
- * `title_hl = NULL`（视图会回落成 `videos.title` 的干净标题）。
- */
-const ensureRelation = (db: ReturnType<typeof getDb>, bvid: string): void => {
-  db.prepare(
-    `INSERT OR IGNORE INTO song_videos (search_key, bvid, ord, favorites, title_hl)
-     VALUES (?, ?, 0, 0, NULL)`,
-  ).run(directKeyOf(bvid), bvid)
 }
 
 /** 置顶：别人全部 +1，位置 0 留给新来的（与音乐歌单「添加视频」同一套） */
@@ -344,19 +307,17 @@ const applyRemoteItems = (
   ]
   rows.forEach((row, index) => {
     insert.run(listId, row.bvid, index, row.favorites, row.origin, row.addedAt)
-    ensureRelation(db, row.bvid)
   })
   refreshCount(db, listId)
 
-  /** 被彻底移出列表的条目：清掉 `bv:` 关系（仍被别的列表引用时**不能**清） */
-  for (const row of old) {
-    if (remoteBvids.has(row.bvid) || keptBvids.has(row.bvid)) continue
-    db.prepare(
-      `DELETE FROM song_videos
-        WHERE search_key = ? AND bvid = ?
-          AND bvid NOT IN (SELECT bvid FROM videolist_items)`,
-    ).run(directKeyOf(row.bvid), row.bvid)
-  }
+  /*
+   * 这里原来还有两段：给每个条目补一行 `song_videos`（`search_key = 'bv:<bvid>'`），
+   * 以及把移出列表的条目的那行假关系删掉。
+   *
+   * 都随「视频借用音乐搜索链路」一起删了（见 `types/playlist.ts` 顶部那段说明）：
+   * 视频条目现在只活在 `videolist_items` + `videos` 两张表里，
+   * `song_videos` 重新只表示「歌的候选」，不再装假关系。
+   */
 
   return { added, removed }
 }
@@ -726,7 +687,6 @@ export const addLocalFilesToDefault = (paths: string[]): LocalFilesImportResult 
            VALUES (?, ?, ?, 0, 'local', ?)`,
         ).run(list.id, file.bvid, index, now)
       }
-      ensureRelation(db, file.bvid)
     })
     refreshCount(db, list.id)
   })
@@ -804,7 +764,6 @@ export const addLocalItem = async (listId: string, input: string): Promise<Video
       `INSERT OR IGNORE INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
        VALUES (?, ?, 0, 0, 'local', ?)`,
     ).run(listId, info.bvid, Date.now())
-    ensureRelation(db, info.bvid)
     refreshCount(db, listId)
   })
 
@@ -869,11 +828,6 @@ export const removeVideoListItem = (listId: string, bvid: string): boolean => {
       db.prepare(
         `UPDATE videolist_items SET ord = ord - 1 WHERE list_id = ? AND ord > ?`,
       ).run(listId, row.ord)
-      db.prepare(
-        `DELETE FROM song_videos
-          WHERE search_key = ? AND bvid = ?
-            AND bvid NOT IN (SELECT bvid FROM videolist_items)`,
-      ).run(directKeyOf(bvid), bvid)
       refreshCount(db, listId)
     })
     return true
@@ -898,24 +852,11 @@ export const removeVideoList = (id: string): boolean => {
   }
   try {
     const db = getDb()
-    const bvids = (
-      db.prepare(`SELECT bvid FROM videolist_items WHERE list_id = ?`).all(id) as Array<{
-        bvid: string
-      }>
-    ).map((row) => row.bvid)
-
     tx(() => {
       db.prepare(`DELETE FROM videolist_items WHERE list_id = ?`).run(id)
       db.prepare(`DELETE FROM videolists WHERE id = ?`).run(id)
-      for (const bvid of bvids) {
-        db.prepare(
-          `DELETE FROM song_videos
-            WHERE search_key = ? AND bvid = ?
-              AND bvid NOT IN (SELECT bvid FROM videolist_items)`,
-        ).run(directKeyOf(bvid), bvid)
-      }
     })
-    console.log(`[videolist] 已删除列表 ${id}（${bvids.length} 条）`)
+    console.log(`[videolist] 已删除列表 ${id}`)
     return true
   } catch (err) {
     console.error('[videolist] 删除列表失败:', err)

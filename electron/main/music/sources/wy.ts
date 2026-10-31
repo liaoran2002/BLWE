@@ -319,3 +319,51 @@ export const getListDetail = async (
     '网易云歌单解析',
   )
 }
+
+// #region 单曲
+
+/**
+ * 这个链接是不是**单曲**（而不是歌单 / 榜单 / 私人雷达）
+ *
+ * 网易云的单曲页形态比歌单多：
+ *  - `https://music.163.com/song?id=347230`
+ *  - `https://music.163.com/#/song?id=347230`（旧版 hash 路由，实际请求里 `#` 后面常被保留）
+ *  - `https://music.163.com/#/song/347230`
+ *  - `https://y.music.163.com/m/song?id=347230&uct2=…`（手机版分享）
+ *
+ * 统一特征就是路径里有一段 `/song`（后面紧跟 `/`、`?`、`#` 或数字）。
+ * 歌单是 `/playlist`、`/discover/toplist`，不会撞。
+ */
+export const isSongUrl = (input: string): boolean => /\/song(?:[/?#]|\d)/.test(String(input ?? ''))
+
+/**
+ * 单曲链接 / 裸 id -> 歌曲 id（纯数字）
+ *
+ * 短链（`163cn.tv/xxx`）不在这里处理：它认不出是歌是单，
+ * 由 `classifyDropInput` 归到歌单那条路，报错时提示也更明确。
+ */
+export const getSongId = (rawInput: string): string => {
+  const input = String(rawInput ?? '').trim()
+  const byQuery = /[?&]id=(\d+)/.exec(input)
+  if (byQuery) return byQuery[1]
+  const byPath = /\/song\/(\d+)/.exec(input)
+  if (byPath) return byPath[1]
+  if (/^\d+$/.test(input)) return input
+  throw new Error('无法从该链接中解析出网易云歌曲 ID，请直接粘贴歌曲页链接')
+}
+
+/**
+ * 按歌曲 id 拿单曲信息
+ *
+ * 走的是 `fetchSongDetail`（旧版明文 `api/song/detail`）—— 和歌单解析里
+ * 「tracks 为空时补全」用的是同一个接口，不需要 LX 那套 weapi 加密：
+ * 明文接口对单曲同样有效（实测 `ids=[347230]` 能拿到《海阔天空》）。
+ *
+ * 少一层加密就少一处可能在平台改版后失效的东西，所以这里不复用 weapi 通道。
+ */
+export const getSongDetail = async (id: string): Promise<ParsedSong | null> => {
+  const songs = await fetchSongDetail([id])
+  return songs[0] ?? null
+}
+
+// #endregion

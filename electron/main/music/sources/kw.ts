@@ -154,3 +154,20 @@ export const getListDetail = async (
     '酷我歌单解析',
   )
 }
+
+// #region 单曲
+
+/**
+ * 这个链接是不是**单曲**
+ *
+ * 酷我的单曲页是 `https://www.kuwo.cn/play_detail/244908`
+ * （歌单是 `/playlist_detail/…`，字面上不含 `play_detail`，不会撞）。
+ *
+ * **只判断、不解析**：本项目还没移植酷我的单曲详情接口。
+ * 之所以仍然导出它，是为了让下游能给出准确提示 ——
+ * 「酷我单曲暂不支持」比「无法从该链接中解析出歌单 ID」清楚得多。
+ */
+export const isSongUrl = (input: string): boolean =>
+  /\/play_detail\/\d+/.test(String(input ?? '')) || /[?&](?:musicId|rid)=\d+/.test(String(input ?? ''))
+
+// #endregion

@@ -443,41 +443,16 @@ export const listVideos = (cacheKey: string): VideoRow[] => {
   return rows.map(toVideoRow)
 }
 
-/**
- * 直连条目的「候选列表」—— **只有一条**，就是它自己
+/*
+ * ## 已删除：`listDirectCandidates()`
  *
- * ## 它为什么存在
+ * 它返回「某个 `bv:<bvid>` 假关系对应的一条候选」，供 `api:searchSong` 短路时使用。
+ * 视频条目不再有假关系、也不再经过搜索，这个函数随之失效（全仓 0 调用）。
  *
- * B 站视频列表（收藏夹 / 合集）的条目本来就是视频，不需要搜索、打分、过滤。
- * 但如果给它们另开一条播放链路，渲染层、预热、换源、续播、壁纸嵌入全都要分支。
- *
- * 所以做法是：导入时在 `song_videos` 里给它留一行 `search_key = 'bv:<bvid>'`，
- * `api:searchSong` 一看到这个前缀就**短路**，直接返回这里的结果。
- * 于是播放引擎看到的和「已经搜到结果、只有一个候选」完全一样 —— 一行分支都不用加。
- *
- * `ord = 0`、`favorites = 0` 是导入时写死的：
- * **不能**用 `favorites = 1` 表示「唯一候选」—— 用户点一下爱心取消收藏，
- * 那行就变成 0，任何「清理未收藏候选」的逻辑都会把它删掉，视频就消失了。
+ * 视频的播放路径现在是这样：`videolist_items JOIN videos` 拿到条目 →
+ * `api:resolveVideo(bvid, keyword 为空)` → 地址按 bvid 从 `videos` 取。
+ * 没有「候选」这一步，因为一个视频列表条目天然只有一个它自己。
  */
-export const listDirectCandidates = (cacheKey: string, bvid: string): CachedSearchItem[] => {
-  if (!cacheKey || !bvid) return []
-  try {
-    const rows = getDb()
-      .prepare(`SELECT ${META_COLUMNS} FROM videos_meta WHERE search_key = ? AND bvid = ?`)
-      .all(cacheKey, bvid) as VideoMetaDbRow[]
-    return rows.map((row) => ({
-      bvid: row.bvid,
-      title: row.title ?? '',
-      pic: row.pic ?? undefined,
-      author: row.author ?? undefined,
-      duration: row.duration,
-      favorites: row.favorites === 1,
-    }))
-  } catch (err) {
-    console.error('[cache] 读取直连候选失败:', err)
-    return []
-  }
-}
 
 /**
  * 整包读取（给 `api:searchSong` / `api:resolveVideo` 用）
@@ -958,7 +933,9 @@ export const prune = (): CacheStats => {
  * 一句 `DELETE FROM videos` 全清，视频列表会变成几百行「只有 bvid、没有标题」的空壳。
  * 所以分成三步：
  *
- *  1. 只删**音乐搜索**的候选关系（`search_key NOT LIKE 'bv:%'`）；
+ *  1. 删掉全部候选关系（`song_videos`）—— 包括历史遗留的 `bv:<bvid>` 假关系行
+ *     （那是「视频借用搜索链路」时代的产物，现在视频条目只活在
+ *     `videolist_items` + `videos` 里，不再有假关系）；
  *  2. 地址列一律清空 —— 这是体积大头，用户点这个按钮就是为了腾空间；
  *  3. 实体行只保留「`videolist_items` 还在引用」的那些。
  *
@@ -970,7 +947,7 @@ export const clearAll = async (): Promise<boolean> => {
     const before = getStats().count
     tx(() => {
       const db = getDb()
-      db.prepare(`DELETE FROM song_videos WHERE search_key NOT LIKE 'bv:%'`).run()
+      db.prepare(`DELETE FROM song_videos`).run()
       db.prepare(`DELETE FROM song_meta`).run()
       db.prepare(
         `UPDATE videos
@@ -1118,7 +1095,7 @@ export const upsertVideoMeta = (
   cacheKey: string,
   video: { bvid: string; title?: string; pic?: string | null; author?: string | null; duration?: number | null },
 ): void => {
-  if (!cacheKey || !video?.bvid) return
+  if (!video?.bvid) return
   try {
     tx(() => {
       const db = getDb()
@@ -1156,6 +1133,13 @@ export const upsertVideoMeta = (
            duration = COALESCE(excluded.duration, videos.duration)`,
       ).run(video.bvid, title, pic, author, duration)
 
+      /**
+       * 关系行只在**有缓存键**时写
+       *
+       * 视频列表的条目没有「属于哪首歌」这回事（它本身就是视频），
+       * 传空串进来时只更新 `videos` 那张实体表。
+       */
+      if (!cacheKey) return
       const rel = db
         .prepare(`SELECT ord FROM song_videos WHERE search_key = ? AND bvid = ?`)
         .get(cacheKey, video.bvid) as { ord: number } | undefined

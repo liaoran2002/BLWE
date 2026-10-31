@@ -6,6 +6,9 @@ import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import App from './App.vue'
 import './assets/iconfont/iconfont.css'
+// 主题令牌与全局骨架。顺序有意义：排在 element-plus 的 css 之后，覆盖才生效
+import './styles/theme.css'
+import './styles/global.css'
 import { useSettingStore } from './stores/setting'
 import { applyUiThemeFromSetting } from './utils/uiTheme'
 

@@ -118,12 +118,6 @@ const defaultSetting = {
    * 不如把「哪个是默认的」记死在这里，而不是靠名字去猜。
    */
   'player.defaultVideoListId': '',
-  /**
-   * 当前模式：`ov` = 视频列表（默认），`mv` = 音乐歌单
-   *
-   * 只决定「界面在哪个工作区」，不改变播放引擎（只有一套 `songs`）。
-   */
-  'ui.mode': 'ov' as 'ov' | 'mv',
   /** 声音输出设备变化时暂停，默认开（避免声音跑到刚插上的设备上） */
   'player.pauseOnDeviceChange': true,
   /**

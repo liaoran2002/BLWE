@@ -155,6 +155,8 @@ export interface RendererAPI {
   ) => Promise<import('./ipc').IpcChannelMap['music:getPlaylistDetail']['result']>
   /** 拖入歌单链接：导入（已有则同步）并设为当前 —— 会写库 */
   importMusicPlaylist: (url: string) => Promise<import('./ipc').IpcChannelMap['music:importPlaylist']['result']>
+  /** 拖入单曲链接：追加进默认歌单并把它设为当前 —— 会写库 */
+  importMusicSong: (url: string) => Promise<import('./ipc').IpcChannelMap['music:importSong']['result']>
   // #endregion
 
   // #region 歌单 / 缓存
@@ -166,6 +168,13 @@ export interface RendererAPI {
   ) => Promise<import('./playlist').PlaylistStoreData>
   /** 同步指定歌单，返回每个歌单的结果 */
   syncPlaylists: (ids: string[]) => Promise<import('./playlist').SyncResult[]>
+  /**
+   * 把平台歌单转成本地歌单（不可逆）
+   *
+   * 返回的记录 **id 已经变了**（`pl_<uuid>`），调用方要用它替换本地那份，
+   * 并把 `currentId` 一起重映射。
+   */
+  convertPlaylistToLocal: (id: string) => Promise<import('./playlist').PlaylistRecord>
   clearCache: () => Promise<boolean>
   /** 缓存统计（视频条数 / 近似占用字节） */
   getCacheStats: () => Promise<import('./cache_stats').CacheStats>

@@ -4,25 +4,31 @@
 
     和设置、歌单管理一样是 el-dialog：
     右上角没有叉号（show-close=false），点弹窗外面的空白处关闭；
-    「点击空白位置关闭」的提示由 App.vue 里遮罩的 ::after 统一提供。
+    「点击空白位置关闭」的提示由 `styles/global.css` 里遮罩的 ::after 统一提供。
   -->
   <el-dialog
     :model-value="listType != 'none'"
     :show-close="false"
-    :width="isSongList ? '56vw' : '50vw'"
+    :width="isBrowsePanel ? '56vw' : '50vw'"
     align-center
     @update:model-value="onVisibleChange"
   >
     <template #header>
       <div class="listTitle">
-        <!-- 左：刷新（两种列表共用一个按钮，动作不同）
-             歌曲列表 -> 重新同步歌单；视频列表 -> 重新搜索这首歌
+        <!-- 左：刷新（两个列表面板共用一个按钮，动作不同）
+             歌单 -> 重新同步歌单；OV 的视频列表 -> 重新拉列表；MV 的视频列表 -> 重新搜索
              点击时图标转 360°、0.5s，作为「点到了」的反馈 -->
         <div class="lt-side">
           <button
             class="lt-icon lt-refresh"
             :class="{ spin: spinning }"
-            :title="isSongList ? (mode === 'ov' ? '重新同步列表' : '重新同步歌单') : '重新搜索这首歌'"
+            :title="
+              isSongList
+                ? '重新同步歌单'
+                : mode === 'ov'
+                  ? '重新同步列表'
+                  : '重新搜索这首歌'
+            "
             @click="onRefresh"
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -37,11 +43,11 @@
           <span class="lt-count">{{ countText }}</span>
         </div>
         <!--
-          右：歌曲列表是「放大镜 -> 点开搜索框」，视频列表是加号
-          选中一首之后会自动清空并收回放大镜（见 onItemClick）
+          右：看一整列时是「放大镜 -> 点开搜索框」，看备选时是加号
+          选中一条之后会自动清空并收回放大镜（见 onItemClick）
         -->
         <div class="lt-side lt-end">
-          <template v-if="isSongList">
+          <template v-if="isBrowsePanel">
             <el-input
               v-if="searchOpen"
               ref="searchInput"
@@ -52,14 +58,14 @@
               clearable
               @keydown.esc.stop="closeSearch"
             />
-            <button v-else class="lt-icon" title="搜索歌曲" @click="openSearch">
+            <button v-else class="lt-icon" title="搜索" @click="openSearch">
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
                 <circle cx="7.2" cy="7.2" r="4.4" />
                 <path d="M10.6 10.6L13.6 13.6" />
               </svg>
             </button>
           </template>
-          <button v-else class="lt-icon" title="添加视频" @click="$emit('addVideo')">
+          <button v-else class="lt-icon" title="添加视频" @click="ui.addVideoVisible = true">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
               <path d="M8 3.2v9.6M3.2 8h9.6" />
             </svg>
@@ -129,16 +135,17 @@
           <!--
             收藏（空心爱心 / 实心爱心）
 
-            出现的位置有两处：
-              - **候选视频列表**（MV）：收藏 = 「这首歌就播这条」的记忆；
-              - **OV 的主列表**：收藏 = 这个列表里的收藏，会置顶（同一套 `ord` 事务）。
+            **只有「视频列表」才有**：收藏的语义是「这条视频我要用」——
+              - MV 的备选：收藏 = 「这首歌就播这条」的记忆；
+              - OV 的列表：收藏 = 这个列表里的收藏，会置顶（同一套 `ord` 事务）。
+            歌单里的歌不需要这个标记，收藏动作在歌单管理那边。
           -->
           <div
-            v-if="!isSongList || mode === 'ov'"
+            v-if="!isSongList"
             class="fav"
             :class="{ on: isFav(row.item) }"
             :title="isFav(row.item) ? '取消收藏' : '收藏'"
-            @click.stop="$emit('toggleFavorite', bvidOf(row.item))"
+            @click.stop="void queue.onToggleFavorite(bvidOf(row.item))"
           >
             <svg
               width="15"
@@ -168,6 +175,9 @@ import type { PlaylistSong } from '@common/types/playlist';
 import { formatDuration } from '@common/utils/duration';
 import { normalizeImageUrl } from '../utils/image';
 import { sanitizeTitleHtml, stripTags } from '../utils/title';
+import { useUiStore } from '../stores/ui';
+import { useQueueStore } from '../stores/queue';
+import { usePlaybackStore } from '../stores/playback';
 
 /**
  * 视频列表项（B 站搜索结果）
@@ -220,9 +230,25 @@ type ListItemFields = {
   cover?: string | null
   author?: string | null
   singer?: string
+  album?: string
 }
 
 const fieldsOf = (item: ListItem): ListItemFields => item as unknown as ListItemFields
+
+/**
+ * 一行里能拿来搜的文本：歌名 / 标题 / 歌手 / UP 主 / 专辑
+ *
+ * 两套字段都收进来（谁有算谁），过滤逻辑就不用再分「这是歌还是视频」——
+ * 以前的做法是 `item as PlaylistSong` 之后只认 `name/singer/album`，
+ * 换成视频条目（`title/author`）就一条都搜不到。
+ */
+const haystackOf = (item: ListItem): string => {
+  const f = fieldsOf(item)
+  return [f.title, f.name, f.singer, f.author, f.album]
+    .filter((v): v is string => typeof v === 'string')
+    .join(' ')
+    .toLowerCase()
+}
 
 /**
  * 时长文案（**秒 -> `mm:ss`**）
@@ -245,18 +271,7 @@ const durationText = (raw: number | null | undefined): string => formatDuration(
  */
 
 export default defineComponent({
-  name: 'showList',
-  emits: [
-    'showList',
-    'changeSong',
-    'changeVideo',
-    /** 左上角刷新：歌单列表=重新同步，视频列表=重新搜索 */
-    'refresh',
-    /** 右上角加号：打开「添加视频」 */
-    'addVideo',
-    /** 爱心：收藏 / 取消收藏某个视频 */
-    'toggleFavorite',
-  ],
+  name: 'SongVideoListDialog',
   data() {
     return {
       /** 刷新图标正在转圈（0.5s） */
@@ -284,55 +299,67 @@ export default defineComponent({
       failedCovers: {} as Record<string, boolean>,
     };
   },
-  props: {
-    title: {
-      type: String,
-      default: '',
-      required: true,
-    },
-    list: {
-      type: Array as () => ListItem[],
-      required: true,
-    },
-    listType: {
-      type: String,
-      default: 'none',
-      required: true,
-    },
-    currentIndex: {
-      type: Number,
-      default: 0,
-    },
-    /** 当前这首歌收藏的 bvid 列表（视频列表里显示实心爱心） */
-    favorites: {
-      type: Array as () => string[],
-      default: () => [],
-    },
-    /**
-     * 当前 `songs` 是不是来自 **B 站视频列表**
-     *
-     * 只影响文案（搜索框写「标题 / UP 主」、刷新叫「重新同步列表」）——
-     * 条目的渲染字段两个来源本来就用同一套（`name` / `singer` / `cover`），
-     * 所以不需要第二套模板。
-     */
-    fromVideoList: {
-      type: Boolean,
-      default: false,
-    },
-    /**
-     * 当前工作区：`ov` / `mv`
-     *
-     * 决定**主列表里要不要显示爱心**（OV 的收藏挂在 `videolist_items` 上，
-     * 不在 `favorites` 那个「这首歌选哪个 bvid」的数组里）。
-     */
-    mode: {
-      type: String,
-      default: 'mv',
-    },
-  },
   computed: {
+    /**
+     * 这些 store（播放状态按域拆成了多个）
+     *
+     * 这个弹窗**不再向父组件要数据、也不再 emit 意图** —— 面板该显示什么、
+     * 点一行该干什么，全在 store 里。父组件（App.vue）只剩 `<SongVideoListDialog />`
+     * 一行，连 prop 都不传。
+     *
+     * 下面那几个同名 computed 是刻意的：模板里还是写 `title` / `list` / `listType`，
+     * 但它们现在来自 store 而不是 props —— 模板因此一行都不用改。
+     *
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    ui() {
+      return useUiStore();
+    },
+    queue() {
+      return useQueueStore();
+    },
+    playback() {
+      return usePlaybackStore();
+    },
+    /** 面板标题（歌单名 / 「视频列表 · 歌曲名」） */
+    title(): string {
+      return this.ui.panelTitle;
+    },
+    /** 面板里的条目：歌单是 PlaylistSong，视频列表是 VideoListItem */
+    list(): ListItem[] {
+      return this.ui.panelList as ListItem[];
+    },
+    listType(): string {
+      return this.ui.listType;
+    },
+    /** 当前正在播的那一条在**面板**里的下标 */
+    currentIndex(): number {
+      return this.ui.panelIndex;
+    },
+    /** 当前这条已收藏的 bvid（MV 候选视频显示实心爱心） */
+    favorites(): string[] {
+      return this.queue.favoriteBvids;
+    },
+    /** 当前工作区：`ov` / `mv` */
+    mode(): string {
+      return this.queue.mode;
+    },
+    /** 面板装的是歌单（MV 的播放队列）。OV 里没有歌单这一层 */
     isSongList(): boolean {
-      return this.listType === 'list';
+      return this.listType === 'songList';
+    },
+    /**
+     * 面板装的是「当前这一列」，还是「当前这条的备选」
+     *
+     *  - 看一整列（MV 的歌单 / OV 的合集）：能按关键词过滤、点行 = 播这一列的第 N 条；
+     *  - 看备选（MV 的视频列表）：没有过滤（右上角是加号）、点行 = 换一个视频版本。
+     *
+     * `videoList` 在两个工作区里装的东西不同，这个判断就是那处差别**唯一**的落点。
+     */
+    isBrowsePanel(): boolean {
+      return this.isSongList || this.mode === 'ov';
     },
     /**
      * 实际渲染的行
@@ -342,28 +369,21 @@ export default defineComponent({
      */
     rows(): { item: ListItem; index: number }[] {
       const all = this.list.map((item, index) => ({ item, index }));
-      if (!this.isSongList) return all;
+      if (!this.isBrowsePanel) return all;
       const kw = this.keyword.trim().toLowerCase();
       if (!kw) return all;
-      return all.filter(({ item }) => {
-        const song = item as PlaylistSong;
-        return (
-          (song.name ?? '').toLowerCase().includes(kw) ||
-          (song.singer ?? '').toLowerCase().includes(kw) ||
-          (song.album ?? '').toLowerCase().includes(kw)
-        );
-      });
+      return all.filter(({ item }) => haystackOf(item).includes(kw));
     },
     /** 头部计数：过滤时显示「命中 / 总数」 */
     countText(): string {
-      if (this.isSongList && this.keyword.trim()) {
+      if (this.isBrowsePanel && this.keyword.trim()) {
         return `${this.rows.length} / ${this.list.length} 项`;
       }
       return `${this.list.length} 项`;
     },
     /** 一条都没有时的提示（空库指向入口，过滤无结果只说没匹配） */
     emptyText(): string {
-      if (this.isSongList && this.keyword.trim()) {
+      if (this.isBrowsePanel && this.keyword.trim()) {
         return this.mode === 'ov' ? '没有匹配的视频' : '没有匹配的歌曲';
       }
       if (this.mode === 'ov') {
@@ -468,7 +488,7 @@ export default defineComponent({
      * 左上角刷新
      *
      * 先复位再激活，保证连点也能重新播放转圈动画（CSS 动画靠类名重加才会重播）。
-     * 真正干什么由父组件按列表类型决定。
+     * 真正干什么由 store 按列表类型决定（`onListRefresh`）。
      */
     onRefresh(): void {
       this.spinning = false;
@@ -480,7 +500,7 @@ export default defineComponent({
           this._spinTimer = null;
         }, 500);
       });
-      this.$emit('refresh');
+      void this.queue.onListRefresh();
     },
     /** 展开搜索框并聚焦（放大镜点一下） */
     openSearch(): void {
@@ -496,17 +516,17 @@ export default defineComponent({
       this.searchOpen = false;
     },
     onItemClick(item: ListItem, index: number) {
-      if (this.isSongList) {
-        this.$emit('changeSong', index);
+      if (this.isBrowsePanel) {
+        void this.queue.onBrowsePlay(index);
         this.closeSearch();
         /**
          * 收回搜索后，滚到**刚点的这首**（不是 currentIndex）
          *
          * 踩过两次：
          *  1. 不滚的话，浏览器保住滚动锚点，点的那行被钉在列表顶部，看着像「它变成了第一首」；
-         *  2. 滚 `currentIndex` 也不行 —— 那是父组件的 prop，切歌是异步的，
+         *  2. 滚 `currentIndex` 也不行 —— 那是 store 里的值，切歌是异步的，
          *     这一刻它还是**上一首**的下标，于是滚到了上一首的位置（用户反馈：没滚到正在播的这首）。
-         * 自己点的下标是确定的，直接用它；再补一次延迟滚动，防父组件稍后重渲染把位置带偏。
+         * 自己点的下标是确定的，直接用它；再补一次延迟滚动，防列表稍后重渲染把位置带偏。
          */
         const scrollToPicked = (): void => this.scrollToIndex(index, false);
         void this.$nextTick(() => {
@@ -515,11 +535,16 @@ export default defineComponent({
         });
         return;
       }
-      this.$emit('changeVideo', (item as VideoListItem).bvid, this.title);
+      void this.playback.playCandidate((item as VideoListItem).bvid);
     },
-    /** el-dialog 关掉时（点空白处 / Esc）通知父组件把 listType 置回 none */
+    /**
+     * el-dialog 关掉时（点空白处 / Esc）把 listType 置回 none
+     *
+     * 以前是 emit('showList', 'none') 让 App.vue 去改 —— 现在这个开关只有
+     * 一个落点，直接写 store。
+     */
     onVisibleChange(visible: boolean): void {
-      if (!visible) this.$emit('showList', 'none');
+      if (!visible) this.ui.listType = 'none';
     },
     /** 把第 index 行滚进视野（默认居中、平滑） */
     scrollToIndex(index: number, smooth = true): void {
@@ -535,7 +560,7 @@ export default defineComponent({
 
 <style>
 /*
- * 外框（底色 / 圆角 / 模糊 / 白字 + 阴影）由 App.vue 里 `.el-dialog` 的全局样式提供，
+ * 外框（底色 / 圆角 / 模糊 / 白字 + 阴影）由 `styles/global.css` 里 `.el-dialog` 提供，
  * 这里只管列表内部。
  */
 .listTitle {

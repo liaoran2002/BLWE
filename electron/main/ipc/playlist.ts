@@ -9,6 +9,7 @@
  */
 import { mainHandle } from '@common/mainIpc'
 import {
+  convertPlaylistToLocal,
   getPlaylists,
   savePlaylists,
   syncPlaylists,
@@ -20,4 +21,6 @@ export const registerPlaylistHandlers = (): void => {
   mainHandle('playlists:save', (params) => savePlaylists(params))
 
   mainHandle('playlists:sync', ({ ids }) => syncPlaylists(ids))
+
+  mainHandle('playlists:convertToLocal', ({ id }) => convertPlaylistToLocal(id))
 }

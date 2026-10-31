@@ -400,10 +400,10 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   两者差 15 倍（9.6 ms vs 0.64 ms，300 行候选）。
 - **写拆两张**：展示字段 + `ord` / `favorites` / `title_hl` 写 `song_videos`，
   标题 / 封面 / 作者 / 时长 / 地址写 `videos`（`ON CONFLICT(bvid)` 更新）。
-- **`listDirectCandidates(cacheKey, bvid)`**：`bv:<bvid>` 直连条目的唯一候选读取，
-  给 `api:searchSong` 的短路分支用（不搜索、不打分、不过滤）。
 - **`clearAll` 不动 `videolists`**：那是「用户导入的列表」，不是缓存；
   清缓存只清 `song_videos` / `videos` / `song_meta`。
+  > 里面那句 `DELETE FROM song_videos` 会**顺带清掉历史遗留的 `bv:` 假关系行** ——
+  > 视频条目以前在 `song_videos` 里占一行 `bv:<bvid>`，这套设计已经删了，但老库里可能还有残行。
 - **孤儿 GC**：删关系行后，`videos` 里没有任何 `song_videos` 引用的实体由 GC 回收
   （但现在多了一层保险：被 `videolist_items` 引用的**绝不回收**）。
 
@@ -448,6 +448,35 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 | `findSongDuration(cacheKey)` | 查歌曲时长；内部改为调 `findSongByCacheKey` |
 | `getPlaylists()` / `savePlaylists()` / `syncPlaylists()` | 集合的读 / 写 / 同步 |
 | `initPlaylists()` / `flushPlaylists()` | 启动加载 / 退出兜底落盘 |
+| `ensureDefaultPlaylist()` | 保证默认歌单（`pl_default`）在，没有就建 |
+| `appendSongToDefaultPlaylist(song)` | 拖入单曲的落点：两层去重后追加，并把 `lastIndex` 挪到它 |
+| `convertPlaylistToLocal(id)` | **平台歌单 → 本地歌单**：换新 id、清链接与同步，一个事务里改两张表 |
+| `DEFAULT_PLAYLIST_ID` | 固定主键 `pl_default` —— 「是不是默认歌单」只看这一个字符串 |
+
+**两类歌单的分界**（详见 [ARCHITECTURE](ARCHITECTURE.md#10b-本地歌单与平台歌单)）：
+
+| | 平台歌单（`tx_8153225605`） | 本地歌单（`pl_default` / `pl_<uuid>`） |
+| :--- | :--- | :--- |
+| 链接 | 身份，用来重新解析 | 只做一次性导入，导完不留 |
+| 同步 | 有 | 没有这个概念 |
+| 曲目 | 只读（去平台上改） | 随便增删 |
+
+- `applyLocalInvariant()` 把本地歌单的 `source` / `sourceUrl` / `sync` / `lastSyncAt` 清空，
+  **`normalizeRecord`（写库前）和 `toRecord`（读库后）各调一次**，绕过界面也造不出脏数据；
+- `syncPlaylist` 对本地歌单直接返回「本地歌单不参与同步」，不靠「没有链接」那条兜底报错；
+- 平台歌单同步时名字**无条件以远端为准**（以前是「本地名为空才更新」，那样在平台上改名这边永远跟不上）。
+
+**默认歌单的三道闸**（行为和视频那边的「默认列表」一致，实现更简单）：
+
+| 层 | 做法 |
+| :--- | :--- |
+| 界面 | `PlaylistManager` 按 `isDefault` 禁用删除按钮 |
+| store | `removePlaylist` 命中默认歌单直接返回 `false` |
+| 主进程 | `savePlaylists` 发现集合里没有 `pl_default`，把它补回去（曲目以内存为准） |
+
+第三道不是多余的：这边的持久化是**整份覆盖**，绕过 store 直接改数组也能删掉。
+`isDefault` **不落库**，由 `withDefaultFlag()` 在 `getPlaylists` / `savePlaylists` 两个出口现贴 ——
+它是从 id 派生的状态，存下来只会多一处可能不一致的地方。
 
 **★ `toPlaylistSongs` 为什么不写在渲染层**（这是本轮改动的要害）：
 
@@ -524,10 +553,9 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 | `getVideoLists()` | 侧边栏用（按 `created_at` 排序，顺序必须稳定） |
 | `findVideoList(id)` | 按 id 找一条（同步时要用 `kind` / `source_id` / `mid` 重打接口） |
 | `getVideoListItems(id)` | 条目（**纯读库，不联网**，LEFT JOIN `videos` 取标题封面） |
-| `toPlaylistSongs(items)` | 条目 → 渲染层的 `PlaylistSong[]`（`name` = 标题、`singer` = UP 主、带 `bvid`） |
 | `addVideoList(kind, sourceId, mid)` | 拉取 + 落库（**一个事务**，见下） |
 | `syncVideoList(id)` | 重新同步 + `last_index` 按 bvid 重定位 |
-| `removeVideoList(id)` | 删列表 + 条目关系 + 不再被任何列表引用的 `bv:` 候选行 |
+| `removeVideoList(id)` | 删列表 + 条目关系（`videos` 实体留给 GC 判断，被别的列表引用的不动） |
 | `setVideoListIndex(id, index)` | 记录播到第几条 |
 | `ensureDefaultVideoList({create})` | 取「默认列表」：设置 → 最早的本地列表 → 新建（见下） |
 | `addItemToDefaultList(input)` | 拖入单条视频：加进默认列表并返回 `listId` 供播放 |
@@ -535,15 +563,16 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 **导入为什么必须一个事务**：中途失败不能留下「列表有 500 条、但只有前 200 条能播」
 这种半截状态 —— 那种状态用户完全看不出原因。
 
-**导入写三样东西，**都**很窄**：
+**导入只写两样东西，**都**很窄**：
 
 ```
 videos           500 行（只有 bvid / 标题 / 封面 / UP 主 / 时长，**没有地址**）
-videolist_items  500 行（list_id, ord, bvid）
-song_videos      500 行（'bv:<bvid>' → 唯一候选，ord=0、favorites=0）
+videolist_items  500 行（list_id, ord, bvid, favorites, origin）
 ```
 
-**`favorites` 必须是 0**：拿它当「唯一候选」的标记，用户点一下爱心就取消收藏了。
+> 以前还要往 `song_videos` 里写 500 行 `'bv:<bvid>'` 假关系（让播放走「搜索」那条路），
+> 现在视频条目**根本不进搜索链路**，那 500 行连同它带来的一堆 `NOT LIKE 'bv:%'`
+> 判断一起删了。
 
 **地址一律等第一次播放时由 `cache.updateVideoResult()` 补**：500 条 × dash 是几十 MB +
 500 次请求，必被风控。
@@ -552,8 +581,9 @@ song_videos      500 行（'bv:<bvid>' → 唯一候选，ord=0、favorites=0）
 同步前记住「现在播的那条的 **bvid**」→ 同步后在新列表里找它的下标；
 找不到（被移出列表）就保留原下标并夹进范围。
 
-**删除时为什么要判 `NOT IN (SELECT bvid FROM videolist_items)`**：
-同一个视频可以同时在两个收藏夹里，删 A 列表不能把 B 列表还在用的关系行一起删掉。
+**删除时 `videos` 实体不直接删**：同一个视频可以同时在两个收藏夹里，删 A 列表不能把
+B 还在用的实体一起删掉 —— 实体由 `clearAll` 里的孤儿 GC 判断（`NOT IN (SELECT bvid
+FROM videolist_items)`）。
 
 **默认列表（拖入单条视频的落点）**：身份记在设置项 `player.defaultVideoListId` 里，
 不靠名字匹配，所以**改名不影响**；`removeVideoList` 开头就拿它比一下，命中直接拒删
@@ -566,15 +596,20 @@ song_videos      500 行（'bv:<bvid>' → 唯一候选，ord=0、favorites=0）
 
 ### `utils/dropInput.ts` —— 拖入识别（新）
 
-**职责**：一段文本 → `DropInputTarget`（`music` / `list` / `video` / `none`）。
+**职责**：一段文本 → `DropInputTarget`（`music` / `song` / `list` / `video` / `none`）。
 **只识别，不联网、不写库** —— 拖入时先要知道「切成哪个工作区」，这一步必须快到松手就出结果。
 
 ```
-① detectSource(text)   → music（按 host 判平台：163 / qq / kuwo / kugou）
-② parseListInput(text) → list（收藏夹 / 合集 / 系列）
-③ BV_PATTERN / b23.tv  → video（`input` 原样带走，交给 parseVideoInput 去跟随短链）
-④ 其余                 → none
+① classifyMusicInput(text) → music / song（按 host 判平台，再看路径像不像单曲页）
+② parseListInput(text)     → list（收藏夹 / 合集 / 系列）
+③ BV_PATTERN / b23.tv      → video（`input` 原样带走，交给 parseVideoInput 去跟随短链）
+④ 其余                     → none
 ```
+
+**「歌单还是单曲」不在这里判**：三个平台的单曲页形态完全不同（网易云 `/song?id=`、
+QQ `songDetail/<mid>`、酷我 `/play_detail/<id>`），这套知识必须和解析待在同一个模块
+（`music/index.ts` 调各音源的 `isSongUrl`），否则会出现「识别说单曲、解析当歌单」的漂移。
+未接入的平台（酷狗）一律归 `music`，让导入那一步去报「尚未接入」。
 
 **为什么不在渲染层写正则**：这三套规则本来就都在主进程（`music/utils.detectSource`、
 `biliApi.parseListInput`、`parseVideoInput` 的短链跟随）。抄一份出去，迟早出现
@@ -608,9 +643,17 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 逐个摸盘既无意义又慢。B 站条目的 `durl_url` 是带签名、几分钟过期的直链，
 所以在 `getVideoListItems` 里也只给本地条目带 `localPath`。
 
-### `utils/playlistImport.ts` —— 拖入音乐歌单 → 导入/同步（新）
+### `utils/playlistImport.ts` —— 拖入音乐 → 导入/追加（新）
 
-**职责**：`importMusicPlaylist(url)` = 解析（`resolvePlaylist`）+ 落库（`getPlaylists` / `savePlaylists`）。
+**职责**：两个入口，落点不同：
+
+| 函数 | 干什么 |
+| :--- | :--- |
+| `importMusicPlaylist(url)` | 拖入**歌单**：解析 → 已有则同步、没有则新建 → 设为当前 |
+| `importSongToDefault(url)` | 拖入**单曲**：解析 → 追加进默认歌单（去重）→ 把 `lastIndex` 挪到它 |
+
+单曲不新建歌单，是因为拖一首歌进来的意图是「我想听这首」，不是「帮我建个歌单」——
+否则歌单列表里迟早攒出一堆只有一首歌的歌单。
 **为什么单开一个文件**：它同时依赖 `music/index.ts` 和 `utils/playlist.ts`，
 而后者已经在用音乐那边的同步逻辑 —— 塞进任何一边都会变成循环依赖。
 
@@ -876,9 +919,9 @@ channel → `{params, result}` 的契约集中在这里，
   存在这里而不是靠「名字叫默认列表」：改名之后它还是默认列表，而且**禁止删除**
   （`removeVideoList` 第一道闸就是拿它比）。
 
-- **`ui.mode`**（本轮新增）：`ov`（默认）/ `mv`，**只是界面工作区**。
-  不影响 `songs`、不影响播放引擎，只决定管理弹窗停在哪一页、主界面列表显示哪一份、
-  控制栏「候选视频」按钮显不显示。切换入口在管理弹窗左下角，不在设置里。
+- **`ui.mode`**：**已删除**。工作区不再是一个可写的设置项 —— 它是播放源的投影
+  （`queue.mode`：在播视频列表 → `ov`，在播歌单 → `mv`，什么都没有 → `ov`）。
+  以前它由「点开哪个管理弹窗」写入，导致点一下按钮界面就换边、而播放还在原地。
 
 - **`tagBonus` 与 `filterKeywords` 的区别**（注释里用表格写死了）：
 
@@ -991,74 +1034,121 @@ channel → `{params, result}` 的契约集中在这里，
 
 ## 4. 渲染层（src/）
 
-### `App.vue` —— ★ 界面中枢
+### `App.vue` —— ★ 装配图
 
-**职责**：模板 + **全部播放业务**。是最大的文件，也是所有状态的权威。
+**职责**：模板装配 + 生命周期挂载。**这里没有业务逻辑，也没有样式。**
 
-**按功能域分段**：
-
-| 域 | 关键内容 |
+| 段 | 内容 |
 | :--- | :--- |
-| 播放状态 | `videoUrl` + `dashSource` 二选一；`videoUpDate`（timeupdate）做 6 件事 |
-| 切歌流程 | `changeSong` → `changeVideo`，两个竞态令牌 |
-| 搜索与限流 | 空结果**不重试**（空 = 被限流）；`filtered: true` 是另一回事 |
-| 续播 | `tryResume` / `restoreSongVideo` |
-| 切歌预热 | `_warm` 系列九件套状态；**有请求在飞时让路**（不参与 `netBusy`）|
-| 停滞看门狗 | **8 秒**不动 → 换备用源 → 降清晰度（最多 3 档）→ 降 durl → 暂停+提示 |
-| 请求期间禁用 UI | `_netBusyCount`（计数器）+ `withNet()` 包装器；`_qualityCooldownUntil`（清晰度冷却 3 秒）|
-| **错误文案收口** | `errMsg(err)` —— 所有 `catch` 显示给用户的错误都走它；含一道**技术文案过滤**（状态码 / `SourceBuffer` 等内部词 → 换成「操作失败，请稍后再试」，原文只进控制台）|
-| 定时暂停 | `_sleepTimer` + `sleepState`，`play`/`pause` 事件里 `syncNow()` |
-| 片尾看门狗 | `ended` 不触发时按播完处理 |
-| 壁纸模式 | `.wm-hidden`（class 不用 v-if）+ 进壁纸关所有弹窗 |
-| 界面锁定 | `locked` + `_lockedByFullscreen` |
-| 快捷键 | Space / ↑↓ / ←→ / F / S / Esc |
-| 托盘事件 | 17 个监听全部存进 data 并在 `beforeUnmount` 摘除 |
-| 收藏 / 添加视频 | `onAddVideo` **复用 `setFavorite`** |
-| **拖入导入** | `onDocDragEnter/Over/Leave/Drop` + `handleDroppedText` → 按主进程给的 `type` 分三路（`dropImportMusic` / `dropImportList` / `dropImportVideo`）；整窗遮罩 `dropActive`，导入中 `dropBusy` |
-| 空库判据 | `isLibraryEmpty()` —— 按**条目**算（默认列表会让「列表数量 = 0」永远不成立） |
+| 模板 | 12 个组件按层摆好 + `<video>` 的 13 个事件直接绑到 store 的 action；**没有 props、没有 emit** |
+| `onMounted` | `attachVideo(el)` 把 `<video>` 交给 store → `bootstrap()` 起引擎、挂全部监听 |
+| `beforeUnmount` | `teardown()` 摘监听（17 个托盘事件等） |
 
-**关键设计（几处「先做/不能做」）**：
+> **以前这里是 5587 行的「界面中枢」**：117 个 data、17 个 computed、150 个方法全挤在
+> 这一个文件里，UI 状态和播放状态缠在一起 —— 任何一处改动都要先通读全文。
+> 现在拆进 `stores/` 下的 8 个独立 store（见下），播放器交互收进 `utils/playbackEngine.ts`。
+>
+> **新增功能别往这个文件里加**：先问它属于哪个域，落到 `stores/` 下对应的 store
+> 或 `utils/playbackEngine.ts` 里；只有「模板 / 挂载」才属于这里。样式落点是 `styles/`。
 
-- **`changeSong` 先就地切本地信息**（`currentIndex`/`songName`），
-  注释直说原来排在 `await searchSong()` 后面导致「切了歌，图片和名称还是上一首的」。
+### `styles/` 目录 —— 全局样式
 
-- **`videoListKeyword` 不能提前跟成新歌**：否则 `videoError` 会把上一首的报错
-  算到新歌头上。
+| 文件 | 职责 |
+| :--- | :--- |
+| `theme.css` | 主题令牌：`--glass-*`（浮在视频上的毛玻璃）/ `--panel-*`（有实底的面板）/ 强调色 / `--ui-idle-opacity`。值由 `utils/uiTheme.ts` 按设置写进来，浅底与深底的阴影靠 `html[data-tint='dark']` 切换 |
+| `global.css` | 不随设置变化的骨架与第三方覆盖：`#app` / `#biliVideo` 定位、`el-dialog` 面板化、遮罩上的「点击空白位置关闭」、`.wm-hidden`（壁纸模式隐藏标题栏与控制栏） |
 
-- **`_endStallHandled = true`**：空窗期防片尾看门狗抢跑，
-  否则点一次下一首**跳过两首**。
+**为什么必须放在 `main.ts` 里 import**：这些规则从来不属于某个组件 ——
+`el-dialog` 是 teleport 到 `body` 的，`#app` / `#biliVideo` / `.wm-hidden` 作用于全局节点
+或跨组件，组件的 scoped 样式够不到。以前它们是 App.vue 末尾一个非 scoped 的
+`<style>`（161 行），让「装配壳」兼任全局样式表。
 
-- **`_warmTries` 为什么存在**：心跳每秒调 `warmApi`，而搜不到视频时
-  `_warm[dir]` 是空的、拦不住它 —— 注释写「**每秒发一次真网络请求，永不停止**」，
-  症状是「控制台同一个关键词刷几十行、界面变卡」。
-  因为心跳是 1 秒一次，光靠计数做不到「间隔 3 秒」，所以必须同时看时间戳。
+**顺序**：在 `element-plus/dist/index.css` **之后**引入，否则对 el-dialog 的覆盖不生效。
 
-- **`sortSearchedVideos` 现在是恒等函数**：打分排序搬到主进程且在**写库之前**执行，
-  `videos.ord` 直接等于显示顺序。保留成恒等而不是删掉，
-  是因为调用点在续播/预热/重试好几处，「逐个删容易漏」。
+### `utils/playbackEngine.ts` —— ★ 把「队列里的一条」变成「`<video>` 上的流」
 
-- **★ `getSongName` 与 `getSongParts` 是两个不同的东西，别混用**：
+| 块 | 内容 |
+| :--- | :--- |
+| **分派** | `resolve()` 是唯一的岔路口：`isVideoItem()` → `resolveVideoItem()`（bvid 已在手里，**不搜索**）；否则 → `resolveSongItem()`（搜索 → 挑候选 → 解析） |
+| **对外** | `playAt(index)` / `playCandidate(bvid, opts)` / `reload()` / `recover()` / `next()` / `prev()` / `stop()` / `fallbackToDurl()` / `retargetDash(url)` |
+| **竞态** | **一条** `token`：切走就 `++`，回调回来对不上就丢弃（以前是 `_songToken` / `_videoToken` 两条，该谁失效靠人记） |
+| **挂载** | dash → `DashSession`（MSE 双轨）；durl → `video.src`；dash 连续失败两次 → 本会话放弃 dash |
+| **降级** | `fallbackToDurl()` 的决策（失败计数、是否放弃 dash、记进度）全在引擎里，界面只清显示状态 |
+| **宿主** | `PlaybackHost` 回调：`queue` / `index` / `videoEl` / `onSwitch` / `onStream` / `onEmpty` / `onError` / `onLocalMissing` / `withNet` / `stepIndex` / `isPaused` / `qualityOverride` / `rememberSeek` |
 
-  | 方法 | 返回 | 用作 |
-  | :--- | :--- | :--- |
-  | `getSongName(index)` | `歌名-歌手`（`toCacheKey`） | **缓存键 / 标识**：传给 `getSelectedBvid` / `resolveVideoUrl` / `setFavorite`，以及 `videoListKeyword` |
-  | `getSongParts(index)` | `{ song, singer }` | **搜索入参**：`searchSong(parts.song, parts.singer)` |
+**关键设计**：这个文件**不 import Vue、不 import Pinia、不读任何组件字段**。
+需要外界的信息全走 `PlaybackHost` 回调 —— 所以换个宿主（比如以后的托盘小窗）也能直接复用。
 
-  > 五个 `searchSong` 调用点**都传两个参数**（`changeSong` / `restoreSongVideo` /
-  > `warmApi` / `refreshVideoList` / 重试）。早先传的是一个 `歌名-歌手` 拼串，
-  > 主进程还得拆回来 —— 而歌名本身可能含 `-`，拆是**有歧义**的。
-  > （那个拆串函数 `splitCacheKey` 零调用，已经删掉了。）
+### `types/playItem.ts` —— 队列条目类型与取值器
+
+```ts
+type PlayItem = PlaylistSong | VideoListItem
+isVideoItem(item)   // 'title' in item
+```
+
+配上 `titleOf` / `subtitleOf` / `coverOf` / `durationOf` / `bvidOf` / `keyOf`。
+**判别字段是 `title`**：`VideoListItem.title` 必有、`PlaylistSong` 永远没有；
+而 `bvid` 在歌上也曾是可选字段，用它判别会重叠。
+
+> **以前不是这样**：`toSongs()` 把视频映射成歌的形状（`title→name`、`author→singer`），
+> 于是下游只能靠 `if (item.bvid)` 猜这是不是视频，类型系统完全帮不上忙。
+> 现在两者各保各的字段，判断是**显式**的类型守卫。
+
+**`keyOf(item)` 只是本进程内的标识键**（视频 = bvid、歌 = `歌名-歌手`），
+用于「这个错误 / 这次定位是不是当前这条的」比较。**不要写进数据库，也不要当搜索词** ——
+以前那个 `bv:` 前缀就是为了让搜索接口认得出来，那套已经删了。
+
+
+### `stores/` 目录 —— ★ 按业务域拆开的独立 store
+
+一个 `defineStore` 只管一个域；跨域访问写 `this.queueStore.playAt()`，
+那个指针是 getters 里的一个条目（`queueStore: () => useQueueStore()`），
+惰性求值 —— 所以模块之间可以互相 import 而不成环。
+
+| 文件 | 职责 | 规模 |
+| :--- | :--- | :--- |
+| **`playback.ts`** | 引擎装配、dash / durl 挂载、`<video>` 全部事件、缓冲圈、卡顿恢复链、清晰度切换、下一首预热 | 67 个 action |
+| **`queue.ts`** | 列表数据（`songs` / `videoList`）、当前下标、播放模式、歌单与视频列表装载、候选视频刷新、收藏 | 14 |
+| **`ui.ts`** | 弹窗开关、列表面板（浏览 / 候选）、错误文案、网络忙计数、清晰度冷却 | 18 |
+| **`window.ts`** | 最大化 / 全屏 / 壁纸模式 / 锁定 / 标题栏拖拽 / 快捷键 / 托盘菜单守卫 | 12 |
+| **`system.ts`** | SMTC、任务栏进度、托盘状态同步、播放位置落盘、定时同步 | 14 |
+| **`session.ts`** | 登录态、用户信息、扫码登录、退出确认 | 5 |
+| **`sleep.ts`** | 定时暂停 / 定时关闭（含每秒推的状态快照） | 4 |
+| **`drop.ts`** | 拖入导入：分类 → 四路分派（歌单 / 单曲 / B 站列表 / 单条视频）→ 本地文件探针 | 12 |
+| **`bootstrap.ts`** | **不是 store**：`boot.attachVideo()` / `bootstrap()` / `teardown()` / `init()`，只做编排、不留状态 | 9 |
+| `constants.ts` | 缓冲 / 预热 / 卡顿 / 冷却的常量（playback 与 ui 共用） | — |
+| `setting.ts` | 配置的响应式副本（主进程那份是权威） | — |
+| `playlists.ts` | 歌单集合 + 同步编排 + 收藏 | — |
+| `videoLists.ts` | B 站视频列表副本（列表 / 条目 / 同步 / 收藏） | — |
+
+**为什么 `playAt` / `next` / `prev` 在 `playback` 而不是 `queue`**：它们要跟引擎令牌、
+降级链、续播点打交道，搬进 queue 就变成 queue → playback → queue 的双向流程调用。
+queue 只回答「列表里有什么」。依赖方向因此是 `playback → queue → ui`。
+
+**三个类型坑**（细节见 [ARCHITECTURE](ARCHITECTURE.md#播放引擎与状态分层渲染层怎么拆的)）：
+
+1. `ThisType<>` 指向本 store 的 `XxxContext`（`State & Getters & Actions`），
+   不能写 `ReturnType<typeof useXxxStore>` —— 会和 `defineStore` 的泛型成环。
+   **代价：签名写两遍**（实现 + `interface XxxActions`），改签名要同步。
+2. getters 双形态：`XxxGetters` 声明成属性（`this.xxx` 要解包后的值），
+   `XxxGetterFns` 派生函数表给 `defineStore` 泛型，装配处 `getters: xxxGetters as never`。
+3. 跨 store 指针必须写成 getter，不能在模块顶层 `useXxxStore()` —— 循环 import 时
+   那一刻对方还没初始化完。
 
 ### `components/` 目录
 
 | 文件 | 职责 |
 | :--- | :--- |
-| `VideoControls.vue` | 播放控制栏（**纯展示 + 上报**）；`mode` 只影响文案（上一个视频 / 下一首）与「候选视频」按钮是否显示 |
+| `AppTitlebar.vue` | 标题栏：左上歌单入口、中间拖拽区、右侧定时 / 壁纸 / 头像 / 设置 / 窗口按钮。**直接读 store、直接调 action**（没有 props、没有 emit）；壁纸模式与锁定态用 class 隐藏（`v-if` 会卸载、丢内部状态） |
+| `BufferOverlay.vue` | 缓冲圈：`percent` + SVG 圆环周长/偏移 + 「已缓冲 x 秒」副标题，全部来自 store 的 getter |
+| `CornerButtons.vue` | 右下角全屏 + 左下角锁定（两个直接调用）；锁定时只留这两个按钮，图标字体里没有锁所以用内联 SVG |
+| `VideoControls.vue` | 播放控制栏；`mode` 只影响文案（上一个视频 / 下一首）与「歌曲列表」按钮是否渲染；两个列表按钮的图标与名字**固定**，不随模式变；壁纸 / 锁定时整条 `wm-hidden` 也在这里判 |
 | `SettingsDialog.vue` | 设置弹窗（**左栏目录 + 右栏一页到底**） |
-| `SleepTimerPanel.vue` | 定时暂停弹窗（时长草稿 + 三个复选框，**只有确认才上报**） |
-| `PlaylistManager.vue` | 歌单管理（左列表 + 右「内联表单 / 曲目列表」）；**只做展示与原样透传**，见下；左下角第二行是「视频管理 →」（= 切模式） |
+| `SleepTimerPanel.vue` | 定时暂停弹窗（时长草稿 + 三个复选框，**只有确认才写回 store**） |
+| `PlaylistManager.vue` | 歌单管理（左列表 + 右「内联表单 / 曲目列表」）；表单内容**原样**交给主进程、不做字段转换（见下）；**表单按歌单类型分流**（平台歌单只给同步方式 + 「转成本地歌单」，本地歌单给改名 + 链接导入器）；本地歌单带「本地」标签、不同步；默认歌单带「默认」标签、删除按钮禁用；左下角第二行是「视频管理 →」（= 切模式） |
 | `VideoListManager.vue` | **视频管理**：左列表 + 右条目预览；**「新建列表」一张表单收口四种来源**（空列表 / 粘贴链接 / 收藏夹 / 订阅合集，后两者是**封面网格**选片、选中高亮）+ 添加视频 / 收藏（置顶）/ 移除 / 重命名；**本地文件丢失的条目置灰 + 「文件丢失」标 + 「定位」重选路径**；左下角第二行是「← 歌单管理」 |
-| `showList.vue` | 歌曲列表 / 视频列表**双形态**弹层（按 `listType` 切换） |
+| `SongVideoListDialog.vue` | 列表面板，两种形态按 `listType` 切换：`songList` 歌单（MV）/ `videoList` 视频列表（MV = 这首歌的备选，OV = 当前合集）；点一行 / 刷新 / 爱心 / 加号都直接调 store |
+| `DropOverlay.vue` | 拖入遮罩（整窗虚线框 + 「松手即可导入并播放」），`dropActive` / `dropBusy` 来自 store |
 | `AddVideoDialog.vue` | 「添加视频」弹窗（粘贴链接 → 解析 → 收藏） |
 | `AboutDialog.vue` | 关于弹窗 |
 | `PlaylistPanel.vue` | 左上角歌单入口 |
@@ -1067,13 +1157,14 @@ channel → `{params, result}` 的契约集中在这里，
 
 - **`el-dialog` + `v-model`**，和歌单管理 / 设置同一套形态（不是锚点面板）。
 - **时长与三个复选框是本地 `draft`**，编辑只改草稿，点「确认 / 更新定时」才
-  `emit('apply', {hours, minutes, options})`。这是被逼出来的：原来编辑时立刻
+  `player.applySleepTimer({hours, minutes, options})`。这是被逼出来的：原来编辑时立刻
   向定时器上报 → 定时器 `emit()` → 那时还没启动、`active` 为 false →
   订阅回调里的「没在倒计时就关面板」直接生效，**点一下加号弹窗就自己关了**。
   （定时器上那个「实时同步选项」的方法**零调用，已删** —— 见第 12 节的说明。）
-- **`confirm()` / `onCancel()` 里要自己先置 `visible = false`**：
-  只 emit 给父组件、指望它改 `sleepPanelVisible` 的话**弹窗不会关**
+- **`confirm()` / `onCancel()` 里仍自己置 `visible = false`**：
+  早期只 emit 给父组件、指望它改 `sleepPanelVisible` 时**弹窗不会关**
   （`v-model` 是 getter/setter，父组件改值时 setter 又 emit 回来形成来回覆盖）。
+  现在组件直接写 store，setter 不再 emit，回环已经不存在；这句留着是为了「点了确认框就该消失」的确定性。
 - **时/分用 `el-input-number`（`:controls="false"`）**，可以直接打字 ——
   要 59 分钟不该按 59 下加号。`+` / `−` 保留做微调，并且**分满 60 进一位到小时**
   （59 点 `+` → 时 +1、分变 0；0 点 `−` → 时 −1、分变 59）。
@@ -1161,19 +1252,22 @@ presetId = detail.id                                // 已经是 tx_8153225605
 > 曲目列表本身也是**只读展示**（没有删除/编辑曲目的功能），
 > 所以「原样透传」不会丢用户的任何编辑。
 
-### `stores/` 目录
+### `setting.ts` / `playlists.ts` / `videoLists.ts` —— 数据层三个 store
+
+这三个是**纯数据副本**（都不碰界面）：
 
 | 文件 | 职责 |
 | :--- | :--- |
-| `setting.ts` | 配置的**响应式副本**（持久化在主进程） |
-| `playlists.ts` | 歌单副本 + 同步编排 |
+| `setting.ts` | 配置的**响应式副本**（持久化在主进程，见「配置的读写与广播」） |
+| `playlists.ts` | 歌单副本 + 同步编排；**默认歌单删不掉**（`removePlaylist` 返回 `false`）；`updatePlaylist` 按类型剔字段（平台只留 `sync`、本地不留链接与同步）；`convertToLocal` 换 id 并重映射 `currentId` |
 | `videoLists.ts` | **B 站视频列表副本**：列表 / 条目 / 同步 / 本地列表 / 收藏，以及 `activeId`（当前在播哪个列表，`''` = 音乐歌单） |
 
 **`videoLists.ts` 与 `playlists.ts` 是并列的**（不是一个 store 里加个 `kind` 字段）：
 两者的表、id、同步方式都不同，混在一起会让「当前是哪种来源」变成一堆
 `if (kind === 'video')`。播放层只认 `songs`，来源差异在 `loadPlaybackSource()` 里抹平。
 
-**`activeId` 自己不持久化**：落盘的是设置项 `player.activeVideoListId`，由 `App.vue` 读写 ——
+**`activeId` 自己不持久化**：落盘的是设置项 `player.activeVideoListId`，
+由 `player/actions/library.ts` 的 `setActiveVideoList()` 读写 ——
 store 保持「只做数据」，不碰设置。
 
 **`add(kind, sourceId, mid)` 返回 `existed`**：主键重复即「这次走的其实是同步」，
@@ -1279,8 +1373,9 @@ const addPlaylist = async (input: {
 
 **管理项文案是动态的**：`showPlaylist` 那一项的 `label` 读 `TrayMenuState.mode`，
 `mv` 显示「歌单管理」、`ov` 显示「视频管理」（默认 `ov`）。点下去发的是同一个
-`tray:showPlaylist`，落地页由渲染层 `openManager()` 按当前 `ui.mode` 决定 ——
-文案和落地页共用同一份状态，不会说一套做一套。
+`tray:showPlaylist`，落地页由渲染层 `openManager()` 按当前工作区决定 ——
+文案和落地页共用同一份 `queue.mode`，不会说一套做一套。这个值由渲染层随
+`trayUpdateState` 推上来（`TrayState.mode`），主进程不自己推算。
 
 ### `main.ts` / `api/electron.ts` / `types/app.ts`
 
@@ -1405,9 +1500,10 @@ SOURCES[source].getListDetail(input, page)
 
 ## 2. 搜索：从歌名到候选视频列表
 
-**入口**：`App.vue` 的 `changeSong(index)` → `getSongParts(index)` 取
-**歌名 + 歌手两个字段** → `electronApi.searchSong(song, singer)`
+**入口**：`player/engine.ts` 的 `playAt(index)` → `resolveSongItem()` →
+`getSongParts(index)` 取**歌名 + 歌手两个字段** → `electronApi.searchSong(song, singer)`
 → `ipc/biliApiHandlers.ts` 的 `api:searchSong`。
+（视频条目走 `resolveVideoItem()`，**不经过搜索**，见第 15 节。）
 
 **完整流程**（★ 注意「缓存键」与「搜索词」是两回事）：
 
@@ -1586,7 +1682,7 @@ B站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个
 | **上一首 / 下一首** | 切歌 = 重新搜索 + 解析地址（两个请求）；连点就是请求成倍叠加 |
 | **托盘菜单的上一首 / 下一首** | 同一件事，托盘也走 `prev()` / `next()` |
 | **系统媒体键的上一首 / 下一首** | 同上（`MediaSession` handler）|
-| **清晰度 / 音质下拉** | 切换会 `changeVideo()` 重新解析；**而且改完还有 3 秒冷却** |
+| **清晰度 / 音质下拉** | 切换会 `playCandidate()` 重新解析；**而且改完还有 3 秒冷却** |
 
 **不禁用**（它们是**本地功能**，请求期间照常可用）：播放 / 暂停、音量、
 进度、静音、两个列表开关、循环模式。
@@ -1856,8 +1952,9 @@ if (finalList.length === 0) {
 
 ## 4. 播放地址解析（dash / durl 两条路）
 
-**入口**：`App.vue` 的 `changeVideo` → `electronApi.resolveVideoUrl(...)`
+**入口**：`playCandidate(bvid, opts)` → `electronApi.resolveVideoUrl(bvid, keyword, …)`
 → `ipc/biliApiHandlers.ts` 的 `api:resolveVideo`。
+（`keyword` 只有音乐传，视频条目传空串 —— 见 `player/engine.ts` 的 `resolveVideoItem`。）
 
 ```
 ① ensureLoginState()                     ← 可能返回 null（未知）
@@ -1901,14 +1998,14 @@ if (finalList.length === 0) {
 （留解析与起播时间）。**拿不到 deadline 时返回 true**（无法判断就按「未知」处理）。
 dash 的 `videoUrl` 与 `audioUrl` **都要检查**。
 
-**★ 切换清晰度 / 音质**：`App.vue` 的 `switchQuality` → `changeVideo(bvid, keyword)`
-—— **不传 `skipCache`**（这里改过一次）。
+**★ 切换清晰度 / 音质**：`stores/playback.ts` 的 `switchQuality` →
+`playCandidate(bvid, { qn })` —— **不传 `skipCache`**（这里改过一次）。
 
 ```
 switchQuality(新档位)
   → 记下 selectedQn / selectedAudioId
   → 启动 3 秒冷却（那两个角标期间点不动，防连点）
-  → changeVideo()（**不传 skipCache**）
+  → playCandidate(bvid, { qn })（**不传 skipCache**）
         ↓
       api:resolveVideo 的判定链：
         地址有效 且 缓存里有目标档位 → extractDashStreams(缓存的 playurl, 新qn)
@@ -1964,11 +2061,11 @@ fetch + getReader + append
 
 ## 6. 切歌预热（为什么切歌几乎无感）
 
-**位置**：`App.vue` 的 `warmApi` / `maybeWarm` + `_warm` 系列状态。
+**位置**：`stores/playback.ts` 的 `warmApi` / `maybeWarm` + `_warm` 系列状态。
 
 **能「几乎无感」是四层叠加**：
 
-1. **本地信息先切**（`changeSong` 第一件事就是切 `currentIndex`/`songName`）
+1. **本地信息先切**（引擎在发请求前调 `onSwitch()`，store 先切 `currentIndex` / `currentKey`）
 2. **接口结果已在槽位**（预热提前把搜索 + 播放地址问好）
 3. **隐藏静音 `<video>` 已把开头 2.5 秒拉进 HTTP 缓存**
 4. **主进程解析缓存**（地址还没过期就直接用）
@@ -1985,7 +2082,7 @@ fetch + getReader + append
 3 次后 `_warmFailed` 彻底停掉，**只在未登录时才弹通知**
 （已登录还搜不到多半是 B站真没有，提示「请登录」是误导）。
 
-**`warmApi` 的挑选规则必须与 `changeSong` 逐字一致**（也必须问 `getSelectedBvid`），
+**`warmApi` 的挑选规则必须与 `resolveSongItem` 逐字一致**（也必须问 `getSelectedBvid`），
 否则预热好的地址切歌时会被换掉。
 
 ## 7. 收藏与「添加视频」
@@ -2032,7 +2129,7 @@ restoreSongVideo(songName, resumeTime)
      **没有记录就直接 return false**（说明这首歌从没播过）
   ② searchSong(songName)          ← 走缓存，秒回
   ③ 记住的 bvid 不在结果里 → 补成列表第一项
-  ④ changeVideo(bvid, songName)
+  ④ playCandidate(bvid)
 ```
 
 **「上次播的是哪个视频」= `song_meta.selected_bvid`**，
@@ -2203,9 +2300,8 @@ apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 attach 前
         ↓
 弹窗里编辑【本地草稿】：draftHours / draftMinutes / draftOptions
         ↓ 点「确认 / 更新定时」
-emit('apply', { hours, minutes, options })
+player.applySleepTimer({ hours, minutes, options })
         ↓
-App.vue 的 applySleepTimer(payload)
   ├─ settingStore.update(三个 settings 键)     ← 记住，下次打开直接显示
   └─ sleepTimer.start(h, m, options)          ← 启动倒计时
         ↓
@@ -2238,7 +2334,7 @@ handlers.quit()   → electronApi.winQuit()    ← 勾了「关闭程序」
 
 **★ 面板是「草稿模式」，定时器那边没有 `setOptions()`**：
 
-编辑时只改本地 `draftXxx`，**点「确认 / 更新定时」才 `emit('apply')` 上报一次**。
+编辑时只改本地 `draftXxx`，**点「确认 / 更新定时」才 `player.applySleepTimer(...)` 写一次**。
 定时器上曾经有个 `setOptions()`（实时同步选项）但**从未被调用**，已删 ——
 留着它的注释会让人以为选项是实时生效的。
 
@@ -2368,10 +2464,13 @@ electron-builder（asar）→ 打包 out/
 
 ```
 ┌─────────────────────────── 渲染进程（src/） ───────────────────────────┐
-│  App.vue（中枢：播放业务 + 全部状态）                                   │
-│    ├── components/  纯展示 + $emit 上报（不持有业务状态）                │
-│    ├── stores/      Pinia 副本（不持久化）                              │
-│    └── utils/       dashPlayer / uiTheme / image / title / plain        │
+│  App.vue（装配图：模板 + 挂载，无业务逻辑、无样式）                      │
+│    ├── stores/      playback / queue / ui / window / system / session    │
+│    │                sleep / drop（一域一 store）+ bootstrap 编排         │
+│    ├── components/  直接读写 store（没有 props / emit，不另存业务状态）  │
+│    ├── styles/      theme.css（令牌）+ global.css（骨架 / 弹窗覆盖）     │
+│    ├── types/       app（AppData）+ playItem（PlayItem 联合）            │
+│    └── utils/       playbackEngine / dashPlayer / uiTheme / title …      │
 └───────────────────────────────┬────────────────────────────────────────┘
                                 │ window.electronAPI（preload 类型化）
 ┌───────────────────────────────┴────────────────────────────────────────┐
@@ -2400,8 +2499,9 @@ electron-builder（asar）→ 打包 out/
 | `playlists.id` | `平台_平台歌单id`（`tx_8153225605`）；手动建的是 `pl_<uuid>` | `playlistKey()`（`ipc/music.ts`） | 歌单身份；重复导入命中同一行 |
 | `songs.id` | `平台_平台歌曲id`（`tx_1828354`）；手动歌是 `歌名-歌手` | `songId()`（`writePlaylistsToDb`） | `playlist_songs.song_id`；同一首歌多歌单只占一行 |
 
-**另一条数据纽带是 `search_key`**（`toCacheKey(song)` = `"歌名-歌手"`，
-直连条目是 `bv:<bvid>`）：它是 `song_videos` 复合主键的前半段、`song_meta` 的主键。
+**另一条数据纽带是 `search_key`**（`toCacheKey(song)` = `"歌名-歌手"`）：
+它是 `song_videos` 复合主键的前半段、`song_meta` 的主键。
+**只有音乐有这个概念** —— 视频条目按 `bvid` 直接解析地址，不进这两张表。
 
 > ⚠️ **它跟上面两个 id 是两回事**：`song_videos` / `song_meta` 要拿键去**搜 B站**，
 > 用 `tx_1828354` 那种 id 搜不出任何东西 —— 所以那两张表存的是**歌名**。
@@ -2417,7 +2517,8 @@ electron-builder（asar）→ 打包 out/
 ## 15. B 站视频列表（导入 → 播放 → 续播）
 
 音乐歌单是「歌名 → 搜索 → 候选」，视频列表是「条目本来就是视频」。
-这条链路的关键是**让播放引擎看不出差别** —— 全程只有一处分支（`bv:` 短路）。
+这条链路的关键是**播放层只写一遍**：队列统一成 `PlayItem`，引擎按
+`isVideoItem()` 一处分派 —— 视频不搜索、不评分、不进候选表，直接按 bvid 解析地址。
 
 ### 导入
 
@@ -2430,9 +2531,11 @@ electron-builder（asar）→ 打包 out/
         videolists 1 行
         videolist_items N 行
         videos N 行（只有元数据，**没有地址**）
-        song_videos N 行（'bv:<bvid>'，ord=0、favorites=0）
   → videoListsStore.load() → 侧边栏出现这个列表
 ```
+
+> 以前这里还要往 `song_videos` 写 N 行 `'bv:<bvid>'` 假关系（让播放借道「搜索」）。
+> 那套已经删了 —— 视频条目只活在 `videolist_items` + `videos` 里。
 
 **为什么不预取地址**：500 条 × dash ≈ 几十 MB + 500 次请求，必被风控；
 而且大部分条目用户根本不会播。
@@ -2441,28 +2544,28 @@ electron-builder（asar）→ 打包 out/
 
 ```
 列表里点第 N 条
-  → App.onVideoListPlay(id, N)
+  → library.onVideoListPlay(id, N)
        setActiveVideoList(id)                 // store + 设置 player.activeVideoListId
-       videoListsStore.songs(id)              // VideoListItem[] → PlaylistSong[]（带 bvid）
+       videoListsStore.items(id)              // VideoListItem[]（本来就带 bvid）
        this.songs = 它们；this.currentIndex = N
-  → playCurrent() → changeSong(N)
-       getSongName(N)  → 'bv:BV1xx…'          // 缓存键 = 直连键
-       getSongParts(N) → { song: 'bv:BV1xx…', singer: '' }
-  → api.searchSong('bv:BV1xx…', '')
-       bvidOfDirectKey() 命中 → listDirectCandidates() → 只返回这一条
-  → 之后完全是原来的链路：resolveVideo → dash/durl → MSE
+  → playCurrent() → playAt(N) → engine.playItem()
+       isVideoItem(item) === true → resolveVideoItem()
+  → api.resolveVideoUrl(bvid, '', ...)       // keyword 传空 = 「按 bvid 直接取地址」
+  → 挂源：dash（MSE）或 durl
 ```
 
-**`song_videos` 里那行 `bv:` 关系是必须的**：它让「一个条目 = 只有唯一候选的歌」
-这个抽象成立，于是一行分支就覆盖了切歌、预热、续播、换清晰度、壁纸嵌入。
+**视频这条路一次搜索都不发**。以前是 `getSongParts()` 返回 `{ song: 'bv:BV1xx…' }` →
+`api:searchSong` 认出前缀后原样吐回那一条，于是「播一条已知 bvid 的视频」要先跑一趟
+搜索接口，还白拿 `ord` / `favorites` / 高亮标题这些毫无意义的列。
+删掉之后，`song_videos` 只剩音乐的真候选。
 
 ### 两个工作区（OV / MV）与「在看 ≠ 在播」
 
 ```
-ui.mode = 'ov'（默认） | 'mv'      // 只是工作区，不是第二套播放逻辑
+queue.mode = 播放源的投影（不是可写状态）
+           = 在播视频列表 ? 'ov' : songs 有内容 ? 'mv' : 'ov'（空库默认 ov）
 入口：管理弹窗左下角（歌单管理 ⇄ 视频管理）= openManager(page)
-openManager = switchMode(page) + 打开该页管理器
-switchMode  = 写 ui.mode + loadBrowseList()      // 不停播、不动 songs
+openManager = 打开该页管理器          // 不碰工作区，不换播放源
 ```
 
 渲染层因此有**两份列表**：
@@ -2473,7 +2576,7 @@ switchMode  = 写 ui.mode + loadBrowseList()      // 不停播、不动 songs
 | `browseSongs` | **列表面板在看的那份**（`ovSongs` 或当前歌单曲目） | `loadBrowseList()` |
 | `browseVideoListId` | 视频管理页在看哪个列表 | 选中 / 导入 / 删除 |
 
-- `browseIndex` 用**键**（`bv:` 或 `歌名-歌手`）在 `browseSongs` 里找正在播的那一项，
+- `browseIndex` 用 `keyOf(item)`（视频 = `bvid`、歌 = `歌名-歌手`）在 `browseSongs` 里找正在播的那一项，
   找不到就 `-1`（不高亮）。直接拿 `currentIndex` 会在「在看 A、在播 B」时点亮错行。
 - 置顶（收藏 / 添加视频）会重排 `ord`：`refreshBrowseAfterEdit()` 重读后按 **bvid**
   把 `currentIndex` 修正回正在播的那条，并重建随机表与预热槽位。
@@ -2482,7 +2585,7 @@ switchMode  = 写 ui.mode + loadBrowseList()      // 不停播、不动 songs
 ### OV 下的播放控制
 
 - `next()` / `prev()` 结构不变，仍然环绕；只是文案变成「上一个视频 / 下一个视频」，
-  且控制栏的「候选视频」按钮隐藏。
+  且控制栏的「视频列表」按钮隐藏。
 - **预热降级**：只提前解析地址，不建隐藏 MSE 会话拉流（`maybeWarm()` 里 OV 直接 return）。
 - **失效刹车**：连续 `OV_MAX_AUTO_SKIP = 5` 条取不到地址就停止自动跳过并提示，
   计数在 `onVideoPlaying` 归零。理由是每条失效会触发两次解析，整片失效必踩 412。
@@ -2498,7 +2601,10 @@ switchMode  = 写 ui.mode + loadBrowseList()      // 不停播、不动 songs
   → tryResume()
        loadPlaybackSource()  // 视频列表 → videolists.last_index；音乐歌单 → playlists.last_index
        songs = 该来源的条目；index = lastIndex
-       restoreSongVideo(index, resumeTime)
+       restoreSongVideo(index, resumeTime)   // 只有歌走这里（视频没有「上次播哪个」这个概念）
+  → 续播失败 / 视频来源 → loadPlaylist()
+       playCurrent(resumeTime) → playAt(currentIndex)
+       ↑ 视频条目到这一步就够了：bvid 在条目里，直接解析地址即可
 ```
 
 `recordPlayPosition()` 是唯一的写入口：按来源分别写 `videolists.last_index` /
@@ -2511,7 +2617,8 @@ syncVideoList(id)
   → 记住当前在播那条的 bvid
   → fetchBiliList 重新拉
   → 事务内：删旧 videolist_items → 重建 → 按 bvid 重定位 last_index
-  → 清掉「被移出列表」的 bv: 关系行（仍被别的列表引用的不动）
+  → 被移出列表的 videos 实体不立刻删（可能被别的列表 / 歌曲候选引用）
+
 ```
 
 ### 踩过的坑（都写进代码注释了）
@@ -2522,8 +2629,8 @@ syncVideoList(id)
 | 复用 `rankVideos` | 列表一条都放不出来 | 标题不含「歌名」、时长窗口 ±90s 会判死长视频 |
 | `last_index` 按下标记 | 新收藏一条后，重启播的是上一条 | 收藏夹倒序，全体下标 +1，必须按 bvid 重定位 |
 | 只删 `song_videos` 就删 `videos` | 另一个列表的地址缓存被连坐删掉 | `videos` 是全局共享的，必须 `gcOrphanVideos()` 同时看两张引用表 |
-| `showList` 只认 `title/pic/author` | 视频列表行标题空、封面兜底、UP 主空 | 列表条目是 `PlaylistSong`（`name/cover/singer`），两者都有 `bvid`，`isVideoItem()` 分不开 → 统一走 `fieldsOf()` 回落 |
+| `SongVideoListDialog` 只认 `title/pic/author` | 视频列表行标题空、封面兜底、UP 主空 | 面板里装的形状比类型还多一种（MV 的视频面板是裸 `BiliVideo`、OV 的是列表条目）→ 统一走 `fieldsOf()` 按字段兜底 |
 | 切模式时清 `activeId` | 进度写到错的表、续播回到第一条 | `activeId` 是「在播哪个来源」，不是「在看哪个工作区」；浏览位置单独用 `browseVideoListId` |
-| 拿 `currentIndex` 当列表高亮 | 在看 A、在播 B 时点亮错的那一行 | 两边的下标含义不同，必须按键（`bv:` / `歌名-歌手`）在 `browseSongs` 里查 |
+| 拿 `currentIndex` 当列表高亮 | 在看 A、在播 B 时点亮错的那一行 | 两边的下标含义不同，必须按 `keyOf()`（`bvid` / `歌名-歌手`）在 `browseSongs` 里查 |
 | 收藏 / 添加视频后不重定位 `currentIndex` | 点「下一个视频」跳到意料之外的一条 | 置顶会把 `ord` 归零、其余 +1，下标全体漂移 → 按 bvid 修正 |
 | 失效条目无条件 `next()` | 整片失效时连环跳几十条，触发 412 | 每条失效要两次解析请求，必须加「连续 5 条就停」的刹车 |

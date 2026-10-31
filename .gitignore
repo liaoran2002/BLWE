@@ -20,6 +20,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# AI 助手的工作目录（会话状态、笔记都在项目外，这里只是兜底忽略）
+.workbuddy
+
 .idea
 .vscode
 *.suo

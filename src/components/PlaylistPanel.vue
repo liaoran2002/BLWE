@@ -6,7 +6,7 @@
     原来这里还有个快捷下拉菜单，已经去掉 —— 两套入口容易状态打架，而且用户点开只为了进管理。
     hover 表现和标题栏其它按钮一致：只换背景，不动透明度。
   -->
-  <div class="pl-trigger" :title="triggerTitle" @click="$emit('manage')">
+  <div class="pl-trigger" :title="triggerTitle" @click="manage">
     <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
       <path d="M2 4h12M2 8h12M2 12h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
     </svg>
@@ -18,15 +18,32 @@
 import { defineComponent } from 'vue';
 import { usePlaylistStore } from '../stores/playlists';
 import { useVideoListStore } from '../stores/videoLists';
+import { useQueueStore } from '../stores/queue';
+import { useUiStore } from '../stores/ui';
 
 export default defineComponent({
   name: 'PlaylistPanel',
-  emits: ['manage'],
-  props: {
-    /** 当前工作区：决定这里显示哪个源的名字、点开哪个管理器 */
-    mode: { type: String, default: 'ov' },
-  },
   computed: {
+    /**
+     * 当前工作区：决定这里显示哪个源的名字、点开哪个管理器
+     *
+     * 以前是 AppTitlebar 传下来的 prop、点一下 emit 上去 —— 现在直接读 store，
+     * 点一下也直接叫管理器。这个入口只有「当前模式」一个输入，没必要绕。
+     */
+    mode(): string {
+      return this.queue.mode;
+    },
+    /*
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    queue() {
+      return useQueueStore();
+    },
+    ui() {
+      return useUiStore();
+    },
     playlistsStore() {
       return usePlaylistStore();
     },
@@ -49,6 +66,12 @@ export default defineComponent({
         return playingVideoList || playingPlaylist || '还没有视频列表';
       }
       return playingPlaylist || playingVideoList || '还没有歌单';
+    },
+  },
+  methods: {
+    /** 点整个入口 = 打开对应那一页管理器 */
+    manage(): void {
+      void this.ui.openManager(this.mode === 'ov' ? 'ov' : 'mv');
     },
   },
 });

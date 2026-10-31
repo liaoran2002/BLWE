@@ -30,6 +30,7 @@ import type {
   SyncResult,
 } from '@common/types/playlist'
 import {
+  isLocalPlaylistId,
   parseCacheKey,
   platformIdOfSongId,
   songId,
@@ -64,6 +65,70 @@ let data: PlaylistStoreData = emptyData()
  * 排查时不用猜 `a9648dca-…` 属于哪个平台。
  */
 const newId = (): string => `pl_${randomUUID()}`
+
+/**
+ * 默认歌单的**固定主键**
+ *
+ * 视频列表那边靠「设置项记 id + 三级兜底」来认默认列表，因为默认列表
+ * 可以是用户已有的任意一个 local 列表。歌单这边不需要那种自由度：
+ * 默认歌单是我们自己建的、只有这一个，所以直接钉死主键 ——
+ * 判断「是不是默认」就是比一个字符串，不存在「设置项指向一个已经被删掉的 id」的漂移。
+ *
+ * 前缀仍是 `pl_`，和手动新建的歌单一个系列（`newId()` 生成 `pl_<uuid>`）。
+ */
+export const DEFAULT_PLAYLIST_ID = 'pl_default'
+
+const DEFAULT_PLAYLIST_NAME = '默认歌单'
+
+/** 空默认歌单（第一次运行 / 用户把别的歌单都删光时用） */
+const makeDefaultPlaylist = (): PlaylistRecord => {
+  const now = Date.now()
+  return {
+    id: DEFAULT_PLAYLIST_ID,
+    name: DEFAULT_PLAYLIST_NAME,
+    songs: [],
+    sync: { mode: 'off', intervalMs: 0 },
+    lastSyncAt: null,
+    createdAt: now,
+    updatedAt: now,
+    lastIndex: 0,
+  }
+}
+
+/**
+ * 出口处贴 `isDefault` 标记
+ *
+ * **不落库**：它是从 id 派生出来的，存下来只会多一处可能不一致的地方
+ * （比如某天有人改了主键，库里的 true 就变成谎话）。
+ * 所以 `getPlaylists` / `savePlaylists` 两个出口各贴一次。
+ */
+const withDefaultFlag = (list: PlaylistRecord[]): PlaylistRecord[] =>
+  list.map((item) => ({ ...item, isDefault: item.id === DEFAULT_PLAYLIST_ID }))
+
+/**
+ * 本地歌单的不变量：**没有链接、没有音源、不参与同步**
+ *
+ * 本地歌单（`pl_` 前缀）的语义是「一堆歌的容器」，链接在它那里只是一个
+ * 一次性导入器 —— 导完就该丢掉。如果库里留了 `url` / `sync_mode`，
+ * 它就会变成「既算本地、又跟着平台更新」的第三种东西：
+ * 下一次同步拿远端曲目**整体替换**，手动加进来的歌静默消失。
+ *
+ * 所以这条不变量要在**两个出入口**各强制一次：
+ *  - 写库前（`normalizeRecord`）：渲染层的全量覆盖带进来什么脏值都清掉；
+ *  - 读库后（`toRecord`）：老库 / 手改库里已经存在的脏值也不放出来。
+ *
+ * 只改副本，不动调用方传进来的对象 —— 调用方有的直接是内存里那份。
+ */
+const applyLocalInvariant = (record: PlaylistRecord): PlaylistRecord => {
+  if (!isLocalPlaylistId(record.id)) return record
+  return {
+    ...record,
+    source: undefined,
+    sourceUrl: undefined,
+    sync: { mode: 'off', intervalMs: 0 },
+    lastSyncAt: null,
+  }
+}
 
 // #region 数据库行 <-> 领域对象
 
@@ -170,7 +235,7 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
   if (!input || typeof input !== 'object') return null
   if (!Array.isArray(input.songs)) return null
   const now = Date.now()
-  return {
+  const record: PlaylistRecord = {
     id: typeof input.id === 'string' && input.id ? input.id : newId(),
     name: typeof input.name === 'string' && input.name ? input.name : '未命名歌单',
     source: typeof input.source === 'string' ? input.source : undefined,
@@ -192,6 +257,8 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
     lastIndex:
       typeof input.lastIndex === 'number' && input.lastIndex >= 0 ? input.lastIndex : 0,
   }
+  /** 本地歌单的链接 / 同步一律清掉（见 `applyLocalInvariant`） */
+  return applyLocalInvariant(record)
 }
 
 // #endregion
@@ -317,19 +384,22 @@ const readPlaylistsFromDb = (): PlaylistRecord[] => {
     list.push(song)
   }
 
-  return playlistRows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    /** 音源从歌单 id 前缀反推（`tx_8153225605` → `tx`） */
-    source: sourceOfSongId(row.id) ?? undefined,
-    sourceUrl: row.url ?? undefined,
-    songs: songsByPlaylist.get(row.id) ?? [],
-    sync: { mode: toSyncMode(row.sync_mode), intervalMs: row.sync_interval_ms ?? 0 },
-    lastSyncAt: row.last_sync_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    lastIndex: row.last_index ?? 0,
-  }))
+  return playlistRows.map((row) =>
+    /** 本地歌单的 url / sync 列可能是历史脏值，读出来也要清（见 `applyLocalInvariant`） */
+    applyLocalInvariant({
+      id: row.id,
+      name: row.name,
+      /** 音源从歌单 id 前缀反推（`tx_8153225605` → `tx`） */
+      source: sourceOfSongId(row.id) ?? undefined,
+      sourceUrl: row.url ?? undefined,
+      songs: songsByPlaylist.get(row.id) ?? [],
+      sync: { mode: toSyncMode(row.sync_mode), intervalMs: row.sync_interval_ms ?? 0 },
+      lastSyncAt: row.last_sync_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastIndex: row.last_index ?? 0,
+    }),
+  )
 }
 
 /**
@@ -527,10 +597,167 @@ export const initPlaylists = (): void => {
   const current =
     data.playlists.find((p) => p.id === data.currentId)?.name ?? (data.currentId || '无')
   console.log(`[playlist] 已加载 ${records.length} 个歌单，当前=${current}`)
+
+  /**
+   * 最后一步：保证默认歌单在
+   *
+   * 放在日志之后，是因为它可能**写库**（空库时新建一条）——
+   * 让「加载了几个」这句反映的是**库里真实有的**，而不是加上刚建的那个。
+   */
+  ensureDefaultPlaylist()
 }
 
-/** 取完整集合（深拷贝，避免调用方改到内存里那份） */
-export const getPlaylists = (): PlaylistStoreData => structuredClone(data)
+/** 取完整集合（深拷贝，避免调用方改到内存里那份；出口处贴上 `isDefault`） */
+export const getPlaylists = (): PlaylistStoreData => {
+  const copy = structuredClone(data)
+  copy.playlists = withDefaultFlag(copy.playlists)
+  return copy
+}
+
+/**
+ * 保证默认歌单存在（没有就现建）
+ *
+ * 和视频列表的 `ensureDefaultVideoList()` 目的相同，但实现简单得多：
+ * 主键是固定的，所以只看「内存里有没有这一条」——
+ * 不需要三级兜底（设置项 → 已有列表 → 新建），也不需要在出口处比对设置项。
+ *
+ * 调用点只有 `initPlaylists()`：程序的任何时刻 `data.playlists` 里都该有它，
+ * 后面 `savePlaylists` 还会再兜一道（防止渲染层把整份集合覆盖掉）。
+ */
+export const ensureDefaultPlaylist = (): PlaylistRecord => {
+  const existing = data.playlists.find((item) => item.id === DEFAULT_PLAYLIST_ID)
+  if (existing) return existing
+
+  const created = makeDefaultPlaylist()
+  /**
+   * 插到**最前面**：空库时它就是唯一一个；老库（已有歌单但没有默认歌单）时
+   * 它排在首位，用户一眼能看到「拖单曲会进这里」。
+   */
+  data.playlists = [created, ...data.playlists]
+  if (!data.currentId) data.currentId = created.id
+  writePlaylistsToDb(data)
+  console.log('[playlist] 已创建默认歌单')
+  return created
+}
+
+/**
+ * 追加一首歌到默认歌单（拖入单曲的落点）
+ *
+ * 默认歌单是**本地歌单**（`pl_default`）：没有链接、不参与同步，
+ * 所以往它里面加歌不需要考虑「下次同步会被冲掉」——
+ * 那正是本地歌单存在的意义。
+ *
+ * ## 去重是**两层**的，不能只比 id
+ *
+ * `songId()` 优先用 `音源_平台id`，没有平台 id 时退化成 `歌名-歌手`。
+ * 所以同一首歌可能有**两种 id**：
+ *
+ * | 怎么进来的 | `songs.id` |
+ * | :--- | :--- |
+ * | 从平台拖单曲 | `wy_347230` |
+ * | 歌单管理里手动填 `海阔天空-Beyond` | `海阔天空-Beyond` |
+ *
+ * 只比 id 的话，同一首歌会被插成两行。所以先按 id 精确命中，
+ * 再按缓存键（`歌名-歌手`）兜一层 —— 命中了就定位过去、不重复插。
+ *
+ * @returns 命中的下标，以及是不是新加进去的
+ */
+export const appendSongToDefaultPlaylist = (
+  song: PlaylistSong,
+): { record: PlaylistRecord; index: number; added: boolean } => {
+  const def = ensureDefaultPlaylist()
+  const id = songId(song)
+  const key = toCacheKey(song).toLowerCase()
+
+  const existingIndex = def.songs.findIndex(
+    (item) => songId(item) === id || toCacheKey(item).toLowerCase() === key,
+  )
+  if (existingIndex >= 0) {
+    /** 已经在了：只把播放位置挪到它，不重复插 */
+    def.lastIndex = existingIndex
+    def.updatedAt = Date.now()
+    savePlaylists({ playlists: data.playlists, currentId: def.id })
+    return { record: getPlaylists().playlists.find((p) => p.id === def.id) ?? def, index: existingIndex, added: false }
+  }
+
+  def.songs = [...def.songs, song]
+  /** 新歌接在最后，并把播放位置设成它 —— 拖进来就是想听这首 */
+  def.lastIndex = def.songs.length - 1
+  def.updatedAt = Date.now()
+  const saved = savePlaylists({ playlists: data.playlists, currentId: def.id })
+  return {
+    record: saved.playlists.find((p) => p.id === def.id) ?? def,
+    index: def.lastIndex,
+    added: true,
+  }
+}
+
+/**
+ * 把一个**平台歌单**转成本地歌单
+ *
+ * ## 为什么要换 id
+ *
+ * 「是不是本地歌单」由 id 前缀判定（`pl_`）。如果保留 `tx_8153225605`，
+ * 就会造出一个「id 说是 QQ 歌单、实际没有链接也不能同步」的东西 ——
+ * 两条互相矛盾的规则指向同一条记录，后面任何一处按 id 判断都会错。
+ *
+ * 所以换一个全新的 `pl_<uuid>`，旧 id 直接废弃。曲目、顺序、`lastIndex`
+ * 全部保留（`playlist_songs` 只是把引用指过去，和改主键在同一个事务里）。
+ *
+ * ## 为什么不用 `writePlaylistsToDb`
+ *
+ * 那个函数是**整份覆盖**（先 DELETE 再全插），会把所有歌单和曲目重写一遍。
+ * 转换只动一条记录，两条 UPDATE 就够。内存改完之后，后面任何一次
+ * `savePlaylists` 都会按新 id 整份写出去，两条路径不冲突。
+ *
+ * @returns 转换后的记录（新 id）
+ */
+export const convertPlaylistToLocal = (id: string): PlaylistRecord => {
+  const index = data.playlists.findIndex((item) => item.id === id)
+  if (index < 0) throw new Error('歌单不存在')
+  if (isLocalPlaylistId(id)) throw new Error('这已经是本地歌单了')
+
+  const target = data.playlists[index]
+
+  /**
+   * 同步中不许转
+   *
+   * `syncPlaylist` 是拿着 id 去 `data.playlists` 里找记录、就地改的。
+   * 那边正跑着几秒网络请求时这边把 id 换掉，等它回来就会把结果写到一个
+   * 已经不存在的 id 上 —— 或者更糟，写进刚转好的本地歌单、把手动加的歌冲掉。
+   */
+  if (syncingIds.has(id)) throw new Error('该歌单正在同步，请稍后再试')
+
+  const nextId = newId()
+  const db = getDb()
+  tx(() => {
+    /**
+     * `playlist_songs` **没有声明外键**（建表语句里只有 PRIMARY KEY），
+     * 所以关系行的 `playlist_id` 必须手动指过去 ——
+     * `PRAGMA foreign_keys = ON` 对它不起作用，不会级联更新。
+     */
+    db.prepare(
+      `UPDATE playlists
+          SET id = ?, url = NULL, sync_mode = 'off', sync_interval_ms = 0, last_sync_at = NULL
+        WHERE id = ?`,
+    ).run(nextId, id)
+    db.prepare(
+      `UPDATE playlist_songs SET playlist_id = ? WHERE playlist_id = ?`,
+    ).run(nextId, id)
+  })
+
+  target.id = nextId
+  target.source = undefined
+  target.sourceUrl = undefined
+  target.sync = { mode: 'off', intervalMs: 0 }
+  target.lastSyncAt = null
+  target.updatedAt = Date.now()
+  /** 正在播的就是它时，当前歌单指向也跟着换，否则高亮和进度都会丢 */
+  if (data.currentId === id) data.currentId = nextId
+
+  console.log(`[playlist] 《${target.name}》已转成本地歌单（${id} → ${nextId}）`)
+  return structuredClone(target)
+}
 
 /**
  * ★ 按**内存歌单**里的一首歌查时长（秒）
@@ -634,6 +861,23 @@ export const savePlaylists = (params: PlaylistSaveParams): PlaylistStoreData => 
       normalized.push(record)
     }
   }
+
+  /**
+   * 默认歌单**删不掉**
+   *
+   * 两个入口都可能把它弄丢：界面上删（那边已经按 `isDefault` 禁了按钮），
+   * 以及「整份集合覆盖」时它压根不在数组里（旧版本存档、手改过的库、将来的 bug）。
+   * 后者才是这道闸的意义 —— 被删掉之后下次拖单曲又得悄悄建一个，
+   * 用户看到的会是「我刚删了它，怎么又冒出来了」。所以干脆补回去。
+   *
+   * 曲目以**内存里那份**为准：既然这次保存没带上它，就不该借机清空它的歌。
+   */
+  const liveDefault = data.playlists.find((p) => p.id === DEFAULT_PLAYLIST_ID)
+  if (liveDefault && !normalized.some((p) => p.id === DEFAULT_PLAYLIST_ID)) {
+    console.warn('[playlist] 保存时默认歌单不在集合里，已补回（它不能被删除）')
+    normalized.unshift(liveDefault)
+  }
+
   let nextCurrentId =
     typeof params?.currentId === 'string' && params.currentId ? params.currentId : null
   if (normalized.length > 0 && !normalized.some((p) => p.id === nextCurrentId)) {
@@ -643,7 +887,16 @@ export const savePlaylists = (params: PlaylistSaveParams): PlaylistStoreData => 
 
   data = { version: PLAYLIST_DATA_VERSION, currentId: nextCurrentId, playlists: normalized }
   writePlaylistsToDb(data)
-  return structuredClone(data)
+  /**
+   * 返回给渲染层的那份也要贴 `isDefault`
+   *
+   * 渲染层拿到之后会**直接覆盖**它本地的歌单数组（`playlists` store 的 `persist`），
+   * 所以这里漏贴一次，界面上「默认」标签和删除按钮的禁用状态就会一起消失，
+   * 直到下一次 `getPlaylists`。
+   */
+  const saved = structuredClone(data)
+  saved.playlists = withDefaultFlag(saved.playlists)
+  return saved
 }
 
 /**
@@ -666,6 +919,21 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
   if (index < 0) return { id, name: '', ok: false, error: '歌单不存在' }
 
   const target = data.playlists[index]
+  /**
+   * 本地歌单**没有同步这个概念**
+   *
+   * 单独判一句而不是靠下面「没有 sourceUrl」兜住：那样报的是
+   * 「该歌单没有保存原始链接，无法自动同步（请重新添加）」——
+   * 对本地歌单是误导，它压根不需要链接，用户会以为要去补一个。
+   */
+  if (isLocalPlaylistId(id)) {
+    return {
+      id,
+      name: target.name,
+      ok: false,
+      error: '本地歌单不参与同步（链接只用于一次性导入）',
+    }
+  }
   if (!target.sourceUrl) {
     return {
       id,
@@ -719,8 +987,14 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
     const added = songs.filter((s) => !before.has(songId(s).trim().toLowerCase())).length
     const removed = target.songs.filter((s) => !after.has(songId(s).trim().toLowerCase())).length
 
-    // 名称与来源以远端为准，但保留用户自定义的名字（仅当原名为空时更新）
-    if (!target.name.trim()) target.name = detail.info.name || target.name
+    /**
+     * 名称与来源**一律以远端为准**
+     *
+     * 平台歌单的名字属于平台 —— 应用内不给改（编辑表单里名字是只读的），
+     * 所以同步时也不需要「保留用户自定义名」那种照顾。反过来还要主动跟上：
+     * 用户在平台上改了歌单名，这边同步一次就该跟着变，否则列表里会一直挂着旧名字。
+     */
+    if (detail.info.name) target.name = detail.info.name
     target.source = detail.source
 
     /**

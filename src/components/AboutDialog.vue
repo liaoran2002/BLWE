@@ -3,15 +3,14 @@
     「关于」弹窗
 
     和其它弹窗一样：没有右上角叉号，点空白处关闭，
-    提示「点击空白位置关闭」由 App.vue 里遮罩的 ::after 统一提供。
+    提示「点击空白位置关闭」由 `styles/global.css` 里遮罩的 ::after 统一提供。
   -->
   <el-dialog
-    :model-value="modelValue"
+    v-model="visible"
     title="关于"
     width="440px"
     :show-close="false"
     align-center
-    @update:model-value="(v: boolean) => $emit('update:modelValue', v)"
   >
     <div class="ab-body">
       <div class="ab-avatars">
@@ -44,6 +43,7 @@
 import { defineComponent } from 'vue';
 import { ElMessage } from 'element-plus';
 import api from '../api/electron';
+import { useUiStore } from '../stores/ui';
 
 /**
  * 仓库地址
@@ -55,10 +55,25 @@ const REPO_URL = 'https://github.com/liaoran2002/BiLiMusicVideo';
 
 export default defineComponent({
   name: 'AboutDialog',
-  props: {
-    modelValue: { type: Boolean, default: false },
+  computed: {
+    /*
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    ui() {
+      return useUiStore();
+    },
+    /** 弹窗开关就在 store 里，父组件不需要参与 */
+    visible: {
+      get(): boolean {
+        return this.ui.aboutVisible;
+      },
+      set(v: boolean) {
+        this.ui.aboutVisible = v;
+      },
+    },
   },
-  emits: ['update:modelValue'],
   data() {
     return {
       devAvatar: new URL('../assets/avatar.jpg', import.meta.url).href,

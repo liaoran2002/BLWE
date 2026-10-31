@@ -19,7 +19,7 @@
  * 越具体的规则越先跑。
  */
 import { parseListInput, BV_PATTERN } from '../biliApi'
-import { detectSource } from '../music'
+import { classifyMusicInput } from '../music'
 import type { DropInputTarget } from '@common/types/playlist'
 
 /** 短链域名：拖进来时本身看不出是什么，只能先当视频，由 `parseVideoInput` 去跟随跳转 */
@@ -30,13 +30,18 @@ export const classifyDropInput = (text: string): DropInputTarget => {
   if (!raw) return { type: 'none' }
 
   /**
-   * ① 音乐歌单
+   * ① 音乐（歌单 / 单曲）
    *
-   * `detectSource` 认不出「酷狗」以外的平台会返回 null，而酷狗返回 `kg`
-   * —— 这里**不拦**：拦截的理由（「哪个平台没接」）属于导入那一步，
-   * 那边报错比这里说「没认出来」准确得多。
+   * 「是歌还是单」由 `classifyMusicInput` 判 —— 各平台的单曲页形态不一样
+   * （网易云 `/song?id=`、QQ `songDetail/<mid>`、酷我 `/play_detail/<id>`），
+   * 这套知识必须和解析放在一起，否则又会出现「识别说单曲、解析当歌单」的漂移。
+   *
+   * 未接入的平台（酷狗）一律归到 `music`：链接是认得的，只是还没做，
+   * 让导入那一步去报「XX 的歌单解析尚未接入」，比这里说「没认出来」准确。
    */
-  if (detectSource(raw)) return { type: 'music', url: raw }
+  const musicKind = classifyMusicInput(raw)
+  if (musicKind === 'song') return { type: 'song', url: raw }
+  if (musicKind === 'playlist') return { type: 'music', url: raw }
 
   /**
    * ② B 站列表（收藏夹 / 合集 / 系列）

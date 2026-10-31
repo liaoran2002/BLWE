@@ -13,7 +13,7 @@
 import { mainHandle } from '@common/mainIpc'
 import { AUDIO_QUALITY_OPTIONS, findQualityOption, qualityLabelOf } from '@common/constants'
 import { rankVideos, baseSongName } from '@common/utils/videoRank'
-import { joinCacheKey, bvidOfDirectKey } from '@common/types/playlist'
+import { joinCacheKey } from '@common/types/playlist'
 import { durationToSeconds } from '@common/utils/duration'
 import * as biliApi from '../biliApi'
 import { isUrlUsable, readQualityOptions } from '../biliApi'
@@ -204,37 +204,17 @@ export const registerApiHandlers = (context: ApiContext): void => {
     const cacheKey = joinCacheKey(songName, singerName)
 
     /**
-     * ★ 直连条目（B 站视频列表）：不搜索、不打分、不过滤，候选就是它自己
+     * ## 这里原来有一条「直连条目」短路，已删除
      *
-     * 这是整套「视频列表」方案最关键的**一处**改动：
-     * 列表条目在 `song_videos` 里占一行、键是 `bv:<bvid>`，
-     * 这里一短路，播放引擎看到的就和「已经搜到结果、只有一个候选」完全一样 ——
-     * 选视频、取地址、续播、预热、壁纸嵌入全部照旧，下游一行分支都不用加。
+     * 视频列表的条目以前在 `song_videos` 里占一行 `search_key = 'bv:<bvid>'`，
+     * 这个接口看到 `bv:` 前缀就原样返回那一条 —— 于是播放一个视频也要先「搜索」，
+     * 而搜索结果就是它自己。现在视频条目根本不经过这里：渲染层按
+     * `isVideoItem()` 分派，视频直接调 `api:resolveVideo`（不带 keyword），
+     * 地址按 bvid 从 `videos` 表取。
      *
-     * ⚠️ 不要在这条分支上「顺手复用一下 rankVideos」：`videoRank` 里有
-     * 「标题必须含歌名」「时长窗口 ±90s」「歌手名命中 +100」这些规则，
-     * 对一条 45 分钟的游戏录播全是致命的（会把它判死）。
+     * ⚠️ **别把 `rankVideos` 用到视频上**：`videoRank` 里有「标题必须含歌名」
+     * 「时长窗口 ±90s」「歌手名命中 +100」，对一条 45 分钟的游戏录播全是致命的。
      */
-    const directBvid = bvidOfDirectKey(songName)
-    if (directBvid) {
-      const result = cacheEnabled()
-        ? cacheManager.listDirectCandidates(cacheKey, directBvid)
-        : []
-      if (result.length === 0) {
-        /**
-         * 关系行丢了（重新同步时被清过 / 库被手工动过）—— 现场补一条，
-         * 不然这条视频在列表里点一下就没反应。地址仍然等解析时再取。
-         */
-        cacheManager.upsertVideoMeta(cacheKey, { bvid: directBvid })
-        return {
-          data: {
-            code: 0,
-            result: cacheManager.listDirectCandidates(cacheKey, directBvid),
-          },
-        }
-      }
-      return { data: { code: 0, result } }
-    }
 
     /**
      * 缓存命中**直接返回**（`skipCache` 是视频列表的刷新按钮，会真的重搜）
@@ -671,9 +651,12 @@ export const registerApiHandlers = (context: ApiContext): void => {
    * 用 `upsertVideoMeta` 而不是自己写 SQL：它内部是「有值才覆盖」的语义，
    * 而且会保留其他列（favorites / 播放地址）。注意**不要传** title / pic /
    * author，传空串会把已有标题洗掉。
+   *
+   * `cacheKey` 可以为空：视频列表的条目没有缓存键（它就是它自己），
+   * 但时长是 `videos` 表的列，按 bvid 写就够了。
    */
   mainHandle('api:fillVideoDuration', ({ cacheKey, bvid, duration }) => {
-    if (!cacheKey || !bvid) return
+    if (!bvid) return
     const sec = Math.round(Number(duration))
     if (!Number.isFinite(sec) || sec <= 0) return
     /**
@@ -799,11 +782,17 @@ export const registerApiHandlers = (context: ApiContext): void => {
       /**
        * 这个 bvid 的**地址**（单独读一行，避免把整份列表的 dash 都拖出来）。
        *
-       * 拆表之后只按 bvid 取 —— 地址跟「哪首歌的候选」无关，
-       * 同一个视频从音乐歌单或视频列表进来，能播的都是同一份地址。
-       * 参数里那个 `keyword` 现在只用于「写回关系行」（见下面的 updateVideoResult）。
+       * 拆表之后地址是 per-bvid 的（`videos` 表），跟「它属于哪首歌的候选」
+       * 完全无关。所以两种调用方各走各的判据：
+       *
+       *  - **带了 `keyword`**（音乐歌单）：沿用老逻辑 —— 这个 bvid 不在该
+       *    候选列表里就当没有缓存，交给下面的 else 分支重新解析并补关系行。
+       *  - **没带 `keyword`**（视频列表条目）：直接按 bvid 取。它压根没有
+       *    「候选列表」这个概念，硬要求先出现在某份列表里只会让每次播放
+       *    都退化成联网重解析。
        */
-      const cachedAddress = targetVideo ? cacheManager.getVideoAddress(bvid) : null
+      const cachedAddress =
+        keyword && !targetVideo ? null : cacheManager.getVideoAddress(bvid)
 
       // 分支：使用缓存 / 重新解析
       if (targetVideo && cachedAddress && !skipCache) {
@@ -951,6 +940,11 @@ export const registerApiHandlers = (context: ApiContext): void => {
       /**
        * 写回缓存 —— 两件事的时机**故意不同**
        *
+       * ⚠️ **地址列不再要求 `keyword`**：视频列表的条目播放时压根没有缓存键
+       * （它就是它自己，没有「属于哪首歌」），但地址照样要落库 —— 不然每次
+       * 点同一个视频都重新联网解析一遍。`updateVideoResult` 的第一参数传空串
+       * 时只写 `videos` 表、跳过 `song_videos`（那边是「候选关系」，跟它无关）。
+       *
        * 1. **地址列**：只在**真的重新解析过**时写（`resolvedFresh`）。
        *    踩过：原来只要读到过这个 keyword 的缓存就无条件整包 `save` ——
        *    纯缓存命中、续播、预热下一首都会触发一次「同步 stringify + 写盘 + rename」
@@ -972,20 +966,20 @@ export const registerApiHandlers = (context: ApiContext): void => {
        * 正在续播的视频可能早已不在搜索结果里，补插时顺手把 view 响应里的
        * 标题/封面一起写上，免得列表里出现一个空壳。
        */
+      if (resolvedFresh && cacheEnabled()) {
+        cacheManager.updateVideoResult(
+          keyword ?? '',
+          bvid,
+          // 传整包 playurl 响应：cache 那边负责提取结构化列
+          playData,
+          // `loggedIn` 为 null = 这次没问到，cache 那边会保留旧值
+          loggedIn,
+          // IPC 参数是可选的，这里收敛成确定的布尔再传下去
+          noDash === true,
+          { title: title ?? '', pic, author: targetVideo?.author ?? null, duration },
+        )
+      }
       if (keyword && cacheEnabled()) {
-        if (resolvedFresh) {
-          cacheManager.updateVideoResult(
-            keyword,
-            bvid,
-            // 传整包 playurl 响应：cache 那边负责提取结构化列
-            playData,
-            // `loggedIn` 为 null = 这次没问到，cache 那边会保留旧值
-            loggedIn,
-            // IPC 参数是可选的，这里收敛成确定的布尔再传下去
-            noDash === true,
-            { title: title ?? '', pic, author: targetVideo?.author ?? null, duration },
-          )
-        }
         cacheManager.setSelectedBvid(keyword, bvid)
       }
 

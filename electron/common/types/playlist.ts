@@ -88,24 +88,22 @@ export interface PlaylistSong {
   missing?: boolean
 }
 
-/**
- * 直连条目的缓存键前缀
+/*
+ * ## 已删除：`DIRECT_KEY_PREFIX` / `directKeyOf` / `bvidOfDirectKey`
  *
- * 「视频列表 → 一个条目就是一个视频」在数据层表现为「一个只有唯一候选的条目」：
- * 它在 `song_videos` 里占一行，`search_key = 'bv:<bvid>'`，
- * `api:searchSong` 一看到这个前缀就短路，直接返回那一条。
+ * 这套东西（`search_key = 'bv:<bvid>'` + `api:searchSong` 认前缀短路）原本是
+ * 「让视频借用音乐搜索链路」的那层壳：视频条目在 `song_videos` 里占一行假关系，
+ * 搜索接口看到前缀就原样返回它自己，于是下游一行分支都不用加。
  *
- * 用 bvid 而不是视频标题当键的理由很硬：同一个标题会撞（「第 1 集」遍地都是）。
- * `:` 在歌名里出现概率极低，所以这个前缀**永远不可能和「歌名-歌手」撞**。
+ * 代价是**两套语义挤在一张表里**：`song_videos` 既装「真候选」，又装
+ * 「视频列表条目的假候选」，清理缓存时要专门写 `NOT LIKE 'bv:%'` 绕开它们，
+ * 而播放一个视频要绕「搜索 → 取 selected_bvid → 再解析」三跳，
+ * 其中两跳对视频没有任何信息增量。
+ *
+ * 现在视频走自己的路：队列里它就是 `VideoListItem`（带 bvid），
+ * 播放时直接按 bvid 解析地址（`api:resolveVideo` 的 keyword 为空），
+ * 地址本来就存在 `videos` 表、按 bvid 一行 —— 不需要任何前缀。
  */
-export const DIRECT_KEY_PREFIX = 'bv:'
-
-/** 生成直连条目的缓存键 */
-export const directKeyOf = (bvid: string): string => `${DIRECT_KEY_PREFIX}${bvid}`
-
-/** 从缓存键反推 bvid；不是直连键时返回 null */
-export const bvidOfDirectKey = (key: string): string | null =>
-  key.startsWith(DIRECT_KEY_PREFIX) ? key.slice(DIRECT_KEY_PREFIX.length) : null
 
 /**
  * 合法的音源前缀（`songs.id` / `playlists.id` 的前缀部分）
@@ -261,6 +259,72 @@ export const parseCacheKey = (text: string): PlaylistSong => {
 }
 
 /**
+ * 本地歌单的 id 前缀
+ *
+ * 歌单分两类，**类型由 id 决定，创建后不变**：
+ *
+ * | 类型 | id 形态 | 链接 | 同步 | 曲目 |
+ * | :--- | :--- | :--- | :--- | :--- |
+ * | 平台歌单 | `tx_8153225605` | 身份，用来重新解析 | 有 | 只读（去平台上改） |
+ * | 本地歌单 | `pl_default` / `pl_<uuid>` | 只做一次性导入 | **没有这个概念** | 随便增删 |
+ *
+ * 用前缀而不是加一个 `kind` 字段：`id` 在这个项目里本来就是身份
+ * （`songs.id` 带音源前缀是同一个理由）。加字段会让「id 说是 QQ 歌单、
+ * 字段说是本地」这种自相矛盾的状态有地方可存。
+ */
+export const LOCAL_PLAYLIST_PREFIX = 'pl_'
+
+/** 这个歌单是不是本地歌单（`pl_default` / `pl_xxx`） */
+export const isLocalPlaylistId = (id: string): boolean =>
+  String(id ?? '').startsWith(LOCAL_PLAYLIST_PREFIX)
+
+/**
+ * 把另一批歌**合并**进现有列表（导入用），跳过已经有的
+ *
+ * 判重是**两层**的，和「拖入单曲」同一套规则：
+ *
+ *  - 第一层按 `songId()`：有平台 id 时是 `wy_347230`，精确到「同一平台的同一首」；
+ *  - 第二层按 `toCacheKey()`（`歌名-歌手`）：兜住「手动填过的歌」——
+ *    那种歌没有平台 id，`songId()` 本身就退化成缓存键，
+ *    所以这一层同时负责「平台导入的歌」和「手动填的同名歌」对上。
+ *
+ * 代价是**同名同歌手的不同版本**（live / 翻唱）会被判成重复。
+ * 这是刻意的：宁可少一行，也不要在复合歌单里出现两条一模一样的歌名。
+ *
+ * @returns `songs` 合并后的新数组（原数组不动）、新增/跳过的数量
+ */
+export const mergePlaylistSongs = (
+  existing: PlaylistSong[],
+  incoming: PlaylistSong[],
+): { songs: PlaylistSong[]; added: number; duplicated: number } => {
+  const seen = new Set<string>()
+  const keyOf = (song: PlaylistSong): string => songId(song).trim().toLowerCase()
+  const cacheOf = (song: PlaylistSong): string => toCacheKey(song).trim().toLowerCase()
+
+  for (const song of existing) {
+    seen.add(keyOf(song))
+    seen.add(cacheOf(song))
+  }
+
+  const songs = [...existing]
+  let added = 0
+  let duplicated = 0
+  for (const song of incoming) {
+    const key = keyOf(song)
+    const cache = cacheOf(song)
+    if (seen.has(key) || seen.has(cache)) {
+      duplicated += 1
+      continue
+    }
+    seen.add(key)
+    seen.add(cache)
+    songs.push(song)
+    added += 1
+  }
+  return { songs, added, duplicated }
+}
+
+/**
  * 一个歌单
  */
 export interface PlaylistRecord {
@@ -268,9 +332,16 @@ export interface PlaylistRecord {
   name: string
   /** 来源音源（wy / tx / kw），手动创建时可能为空 */
   source?: string
-  /** 原始分享链接，用于自动同步时重新解析 */
+  /**
+   * 原始分享链接，用于自动同步时重新解析
+   *
+   * **本地歌单恒为空**（`isLocalPlaylistId(id)`）：本地歌单里贴链接只是
+   * 「把那个歌单的歌导进来一次」，导完不留链接 —— 否则它会变成
+   * 「既算本地、又跟着平台更新」的第三种东西，同步一次就把手动加的歌冲掉。
+   */
   sourceUrl?: string
   songs: PlaylistSong[]
+  /** 同步策略。本地歌单恒为 `off`（没有同步这个概念） */
   sync: PlaylistSync
   /** 上次同步成功时间（毫秒时间戳） */
   lastSyncAt: number | null
@@ -286,6 +357,17 @@ export interface PlaylistRecord {
    * 这首歌被删掉时保留原下标（夹进范围），效果是「下一首顶上来」。
    */
   lastIndex: number
+  /**
+   * 是不是**默认歌单**（拖入单曲的落点）
+   *
+   * 和视频列表那边不同，这里**不用设置项记 id**：默认歌单的主键是固定的
+   * `pl_default`（见 `main/utils/playlist.ts`），所以「是不是默认」看一眼 id 就知道，
+   * 不存在「设置项指向一个已经被删掉的 id」这种漂移。
+   *
+   * 由主进程在出口处贴（`getPlaylists` / `savePlaylists` 都贴），
+   * 不落库 —— 它是派生状态，不是数据。渲染层只拿它决定「这条不显示删除按钮」。
+   */
+  isDefault?: boolean
 }
 
 
@@ -474,7 +556,16 @@ export interface ParsedListInput {
  * 本来就都在主进程，渲染层只负责按 `type` 调对应的一个接口。
  */
 export type DropInputTarget =
+  /** 音乐**歌单**：导入成一个歌单（已有则同步） */
   | { type: 'music'; url: string }
+  /**
+   * 音乐**单曲**：追加进默认歌单
+   *
+   * 单独一个分支而不是复用 `music`，是因为下游要做的事完全不同：
+   * 歌单是「换个歌单听」，单曲是「往默认歌单里塞一首然后播它」。
+   * 混在一起会让 `dropImportMusic` 里长出一个 `if (是单曲)`。
+   */
+  | { type: 'song'; url: string }
   | { type: 'list'; kind: 'fav' | 'season' | 'series'; id: string; mid?: string }
   /**
    * 单条视频：`input` 原样带回去交给 `parseVideoInput`

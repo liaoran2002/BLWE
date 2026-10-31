@@ -11,50 +11,31 @@
  * 所以这里也不把它们塞进同一个 store —— 那会让「当前是哪种来源」变成
  * 一堆 `if (kind === 'video')`。
  *
- * ## 播放层只认一个东西：`songs`
+ * ## 播放队列吃的是联合类型
  *
- * 不管来源是哪边，`App.vue` 最终都拿到 `PlaylistSong[]`：
- * 视频列表的条目在 `toSongs()` 里被映射成 `{ name: 标题, singer: UP主, bvid }`，
- * 而 `bvid` 是**关键字段** —— `App.vue` 的 `getSongParts()` 看到它就返回
- * `bv:<bvid>` 当缓存键，主进程那边的 `api:searchSong` 一看到前缀就短路。
+ * `queue` store 的 `songs` 是 `PlayItem[]`（见 `types/playItem.ts`）：
+ * 视频条目**原样进去**，字段一个都不改（`title` / `author` / `bvid`）。
+ * 播放前用 `isVideoItem()` 分开 —— 视频直接拿 `bv:<bvid>` 去解析地址，
+ * 歌才去搜索候选。
  *
- * 也就是说：**播放引擎完全不知道自己在播的是歌单还是收藏夹**。
+ * 以前这里有个 `toSongs()`，把条目改名成 `{ name: 标题, singer: UP主 }` 塞进
+ * 歌的形状里，下游只能靠「有没有 bvid」猜这是不是视频。那个映射已经删了。
  *
  * ## `activeId` 是「当前在播哪个视频列表」
  *
  * `''` 表示当前在播音乐歌单（此时由 `playlists` store 的 `currentId` 说话）。
  * 它需要跨重启保留 —— 落在设置项 `player.activeVideoListId` 里，
- * 由 `App.vue` 读写（store 本身不碰设置，保持这一层只做数据）。
+ * 由 `queue` store 读写（store 本身不碰设置，保持这一层只做数据）。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import api from '@/api/electron'
 import type {
-  PlaylistSong,
   VideoListItem,
   VideoListKind,
   VideoListRecord,
   VideoListSyncResult,
 } from '@common/types/playlist'
-
-/**
- * 列表条目 → 播放层认识的歌
- *
- * `name` 取标题（空标题回退 bvid，至少能点开），`singer` 取 UP 主 ——
- * 界面在视频列表下会把「歌手」这一列改成「UP 主」（P1），字段复用同一个。
- */
-const toSongs = (items: VideoListItem[]): PlaylistSong[] =>
-  items.map((item) => ({
-    name: item.title || item.bvid,
-    singer: item.author ?? '',
-    cover: item.cover,
-    duration: item.duration,
-    bvid: item.bvid,
-    /** 爱心：这个列表里的收藏状态（同一个 bvid 换个列表就不一样） */
-    favorites: item.favorites === true,
-    /** 本地文件丢了 → 主列表那一行要打「文件丢失」标 */
-    missing: item.missing === true,
-  }))
 
 export const useVideoListStore = defineStore('videoLists', () => {
   const lists = ref<VideoListRecord[]>([])
@@ -84,7 +65,7 @@ export const useVideoListStore = defineStore('videoLists', () => {
     loaded.value = true
   }
 
-  /** 切换「当前在播的视频列表」（持久化由 App.vue 负责） */
+  /** 切换「当前在播的视频列表」（持久化由 queue store 的 action 负责） */
   const setActive = (id: string): void => {
     activeId.value = id
   }
@@ -192,11 +173,13 @@ export const useVideoListStore = defineStore('videoLists', () => {
     }
   }
 
-  /** 列表条目（已在库里，不联网） */
+  /**
+   * 列表条目（已在库里，不联网）
+   *
+   * 返回的就是播放队列能直接吃的东西 —— 不需要再转一次形状。
+   * 播放层拿 `isVideoItem()` 认它，而不是靠 `bvid` 猜。
+   */
   const items = (id: string): Promise<VideoListItem[]> => api.getVideoListItems(id)
-
-  /** 列表条目 → 播放层的 `PlaylistSong[]` */
-  const songs = async (id: string): Promise<PlaylistSong[]> => toSongs(await items(id))
 
   /** 记录播到第几条（等价于歌单的 `lastIndex`） */
   const setIndex = (id: string, index: number): Promise<void> =>
@@ -223,7 +206,6 @@ export const useVideoListStore = defineStore('videoLists', () => {
     setFavorite,
     sync,
     items,
-    songs,
     setIndex,
   }
 })

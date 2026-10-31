@@ -1,0 +1,79 @@
+/*
+ * 主题令牌（颜色 / 毛玻璃都靠这几个变量）
+ *
+ * 分两组，别混用：
+ *  - `--glass-*`：**浮在视频上**的毛玻璃（控制栏、左上角歌单按钮、标题栏、全屏按钮）；
+ *  - `--panel-*`：**有实底**的面板（歌单下拉、设置 / 歌单管理 / 视频列表 / 关于弹窗、歌曲列表）。
+ *
+ * 颜色来自设置里的两个取色器，由 `src/utils/uiTheme.ts` 写成 `r, g, b` 三个通道：
+ *  - `--glass-rgb`：玻璃/面板的底色（浅色主题默认 255,255,255）；
+ *  - `--text-rgb`：浮层上的文字颜色（默认也是白色）。
+ * 透明度由 `--glass-alpha`（设置里的「透明度」）组合进 rgba。
+ * 底色偏暗时 `uiTheme` 会给 html 加 `data-tint="dark"`，阴影自动换成白色。
+ *
+ * ⚠️ 这里只放「设置能改写」的变量。骨架（`#app` / `#biliVideo`）和 Element Plus
+ * 的覆盖在 `global.css`，两者都由 `main.ts` 引入。
+ */
+:root {
+  --glass-rgb: 255, 255, 255;
+  --text-rgb: 255, 255, 255;
+  --glass-alpha: 0.3;
+  --glass-alpha-strong: 0.42;
+  --glass-blur: 10px;
+  /* 文字阴影的模糊半径（设置里的「阴影强度」，8px = 默认那套） */
+  --glass-shadow-size: 8px;
+  /**
+   * 强调色
+   *
+   * 当前播放标记、同步转圈、B 站搜索关键词高亮这些「功能色」用它，
+   * 别在组件里散落一堆 #6f8cff / #d03050 —— 换主题时至少有个统一入口。
+   */
+  --accent: #6f8cff;
+  --accent-strong: #5b6fe0;
+  --accent-danger: #d03050;
+
+  /* —— 浮在视频上的毛玻璃 —— */
+  --glass-bg: rgba(var(--glass-rgb), var(--glass-alpha));
+  --glass-bg-strong: rgba(var(--glass-rgb), var(--glass-alpha-strong));
+  --glass-border: rgba(var(--text-rgb), 0.5);
+  --glass-radius: 12px;
+  --glass-text: rgb(var(--text-rgb));
+  --glass-text-dim: rgba(var(--text-rgb), 0.75);
+  /* 浅底 -> 黑阴影；近影是远影的一半，字号小的地方也不会糊成一团 */
+  --glass-shadow:
+    0 1px calc(var(--glass-shadow-size) * 0.5) rgba(0, 0, 0, 0.9),
+    0 0 var(--glass-shadow-size) rgba(0, 0, 0, 0.5);
+
+  /* —— 面板：同一套底色与 alpha，文字也跟设置走 —— */
+  --panel-bg: rgba(var(--glass-rgb), var(--glass-alpha));
+  --panel-border: rgba(var(--text-rgb), 0.28);
+  --panel-text: rgb(var(--text-rgb));
+  --panel-text-dim: rgba(var(--text-rgb), 0.78);
+  --panel-hover: rgba(var(--text-rgb), 0.16);
+  --panel-active: rgba(111, 140, 255, 0.35);
+  --panel-shadow: 0 10px 32px rgba(0, 0, 0, 0.25);
+  --panel-divider: rgba(var(--text-rgb), 0.18);
+  /**
+   * 更淡的次级分隔线（关键词加权下面那条、分值档之间）
+   *
+   * 比 `--panel-divider` 淡一半：这两处是**同一块里的细分**，
+   * 不该和「设置项之间」的线一样重，否则一屏全是横线。
+   */
+  --panel-divider-fine: rgba(var(--text-rgb), 0.09);
+
+  /**
+   * 浮层未悬停时的不透明度：**固定行为**，鼠标移上去变 1。
+   *
+   * 注意它跟设置里的「透明度」是两回事：
+   * 这个管的是「整个控件淡出到什么程度」，设置管的是「玻璃底有多透明」。
+   */
+  --ui-idle-opacity: 0.1;
+}
+
+/* 深底 -> 白阴影（底色深浅由 uiTheme 按亮度写进来） */
+html[data-tint='dark'] {
+  --glass-shadow:
+    0 0 var(--glass-shadow-size) rgba(255, 255, 255, 0.5),
+    0 1px calc(var(--glass-shadow-size) * 0.4) rgba(0, 0, 0, 0.5);
+  --panel-shadow: 0 10px 32px rgba(0, 0, 0, 0.7);
+}

@@ -28,6 +28,7 @@ import type {
 import type { RendererAPI, ScreenWorkArea } from '@common/types/api'
 import type { GetPlaylistDetailParams } from '@common/types/musicSdk'
 import type {
+  PlaylistRecord,
   PlaylistSaveParams,
   PlaylistStoreData,
   SyncResult,
@@ -135,6 +136,9 @@ const api = {
   /** 拖入歌单链接：导入（已有则同步）并设为当前 —— 会写库 */
   importMusicPlaylist: (url: string): Promise<IpcChannelMap['music:importPlaylist']['result']> =>
     rendererInvoke('music:importPlaylist', { url }),
+  /** 拖入单曲链接：追加进默认歌单并把它设为当前 —— 会写库 */
+  importMusicSong: (url: string): Promise<IpcChannelMap['music:importSong']['result']> =>
+    rendererInvoke('music:importSong', { url }),
   // #endregion
 
   // #region 歌单 / 缓存
@@ -144,6 +148,9 @@ const api = {
     rendererInvoke('playlists:save', params),
   syncPlaylists: (ids: string[]): Promise<SyncResult[]> =>
     rendererInvoke('playlists:sync', { ids }),
+  /** 把平台歌单转成本地歌单（不可逆，返回的记录 id 已经变了） */
+  convertPlaylistToLocal: (id: string): Promise<PlaylistRecord> =>
+    rendererInvoke('playlists:convertToLocal', { id }),
   clearCache: (): Promise<boolean> => rendererInvoke('cache:clearAll'),
   getCacheStats: (): Promise<CacheStats> => rendererInvoke('cache:getStats'),
   pruneCache: (): Promise<CacheStats> => rendererInvoke('cache:prune'),

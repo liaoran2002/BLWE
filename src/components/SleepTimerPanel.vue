@@ -26,7 +26,6 @@
     width="430px"
     :show-close="false"
     align-center
-    @update:model-value="onVisibleChange"
   >
     <template #header>
       <div class="slp-head">
@@ -113,7 +112,7 @@
         <!--
           ⚠️ `0 时 0 分` 时**未定时**要禁用确认（踩过）
 
-          原来按钮永远可点，于是「时长停在 00:00 → 点确认」会走到父组件的
+          原来按钮永远可点，于是「时长停在 00:00 → 点确认」会走到 player 的
           `applySleepTimer`：弹一句 warning 并 return（不写设置、不启动定时），
           但面板的 `confirm()` 紧接着**自己把弹窗关了** —— 用户看到的是
           「警告一闪 + 面板关了 + 什么也没设定」。
@@ -138,38 +137,16 @@
 /**
  * 定时暂停弹窗
  *
- * 时长与三个复选框是**本地草稿**：编辑只改 draft，点确认才 `emit('apply', ...)`。
- * 这样编辑过程完全不影响 `App.vue` 的定时器，也就不会出现「点加号弹窗自己关掉」。
+ * 时长与三个复选框是**本地草稿**：编辑只改 draft，点确认才写回 store。
+ * 这样编辑过程完全不影响 player store 里正在跑的定时器，
+ * 也就不会出现「点加号弹窗自己关掉」那种回环。
  */
 import { defineComponent } from 'vue';
 import type { SleepTimerOptions } from '../utils/sleepTimer';
+import { useSleepStore } from '../stores/sleep';
 
 export default defineComponent({
   name: 'SleepTimerPanel',
-  props: {
-    modelValue: { type: Boolean, default: false },
-    /** 是否正在倒计时（决定头部显示和按钮组） */
-    active: { type: Boolean, default: false },
-    /**
-     * 倒计时已归零、正在等「视频播到 0-3 秒」
-     *
-     * 头部改成「计时已结束，等待视频播放完毕…」。
-     */
-    pending: { type: Boolean, default: false },
-    /** 剩余时间的可读文本（`1:23:45` / `23:45`） */
-    remainText: { type: String, default: '' },
-    /** 到点后做什么的可读文本 */
-    actionText: { type: String, default: '' },
-    /** settings 里记住的时长（打开面板时用它初始化草稿） */
-    hours: { type: Number, default: 0 },
-    minutes: { type: Number, default: 0 },
-    /** settings 里记住的三个选项（打开面板时用它初始化草稿） */
-    options: {
-      type: Object as () => SleepTimerOptions,
-      required: true,
-    },
-  },
-  emits: ['update:modelValue', 'apply', 'cancel'],
   data() {
     return {
       /** 草稿：时 */
@@ -185,14 +162,58 @@ export default defineComponent({
     };
   },
   computed: {
+    /**
+     * 这些 store（播放状态按域拆成了多个）
+     *
+     * 面板要显示的状态（是否在倒计时 / 剩余多久 / 上次设的时长）全在 store 里，
+     * 开关也在 —— 以前用 props 传进来、emit 出去，现在直接读写。
+     *
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    sleep() {
+      return useSleepStore();
+    },
     /** `el-dialog` 的 v-model */
     visible: {
       get(): boolean {
-        return this.modelValue;
+        return this.sleep.sleepPanelVisible;
       },
       set(v: boolean): void {
-        this.$emit('update:modelValue', v);
+        this.sleep.sleepPanelVisible = v;
       },
+    },
+    /** 是否正在倒计时（决定头部显示和按钮组） */
+    active(): boolean {
+      return this.sleep.sleepState.active;
+    },
+    /**
+     * 倒计时已归零、正在等「视频播到 0-3 秒」
+     *
+     * 头部改成「计时已结束，等待视频播放完毕…」。
+     */
+    pending(): boolean {
+      return this.sleep.sleepState.pending;
+    },
+    /** 剩余时间的可读文本（`1:23:45` / `23:45`） */
+    remainText(): string {
+      return this.sleep.sleepRemainText;
+    },
+    /** 到点后做什么的可读文本 */
+    actionText(): string {
+      return this.sleep.sleepActionText;
+    },
+    /** settings 里记住的时长（打开面板时用它初始化草稿） */
+    hours(): number {
+      return this.sleep.sleepHours;
+    },
+    minutes(): number {
+      return this.sleep.sleepMinutes;
+    },
+    /** settings 里记住的三个选项（打开面板时用它初始化草稿） */
+    options(): SleepTimerOptions {
+      return this.sleep.sleepOptions;
     },
   },
   watch: {
@@ -202,7 +223,7 @@ export default defineComponent({
      * 必须每次打开都重置：用户可能上次改到一半点了取消，
      * 或者定时执行完值变了 —— 再打开应该看到「已保存的那份」。
      */
-    modelValue: {
+    visible: {
       immediate: true,
       handler(open: boolean): void {
         if (!open) return;
@@ -211,13 +232,10 @@ export default defineComponent({
     },
   },
   methods: {
-    /** 点「取消定时」：先关自己，再让父组件取消定时（理由同 `confirm`） */
+    /** 点「取消定时」：先关自己，再取消定时 */
     onCancel(): void {
-      this.$emit('cancel');
+      this.sleep.cancelSleepTimer();
       this.visible = false;
-    },
-    onVisibleChange(v: boolean): void {
-      this.$emit('update:modelValue', v);
     },
     resetDraft(): void {
       this.draftHours = Math.min(23, Math.max(0, Math.floor(this.hours || 0)));
@@ -279,9 +297,9 @@ export default defineComponent({
         this.draftMinutes = next;
       }
     },
-    /** 点确认 / 更新定时：**这一步才上报**，并自己先关掉弹窗 */
+    /** 点确认 / 更新定时：交给 store，并自己先关掉弹窗 */
     confirm(): void {
-      this.$emit('apply', {
+      this.sleep.applySleepTimer({
         hours: this.draftHours,
         minutes: this.draftMinutes,
         options: { ...this.draftOptions },
@@ -289,13 +307,14 @@ export default defineComponent({
       /**
        * ⚠️ **必须在这里主动关掉自己**
        *
-       * 踩过：只 emit('apply') 然后指望父组件把 `sleepPanelVisible` 置 false ——
+       * 踩过：只上报启动定时、然后指望别处把 `sleepPanelVisible` 置 false ——
        * 实测**弹窗不会关**（定时确实启动了，但框还在）。
-       * 原因是 `el-dialog` 的 `v-model="visible"` 绑的是一个 getter/setter，
-       * 父组件改 `sleepPanelVisible` 时，`visible` 的 setter 又会 emit
-       * `update:modelValue` 回来，形成来回覆盖。
+       * 原因当时是 `el-dialog` 的 `v-model="visible"` 绑了一个 getter/setter，
+       * 外面改 `sleepPanelVisible` 时 setter 又 emit `update:modelValue` 回来，
+       * 形成来回覆盖。
        *
-       * 直接在这里置 false 是确定的：先关自己，再让父组件做它的事。
+       * 现在 setter 直接写 store、没有 emit 了，那个来回已经不存在；这里照旧
+       * 显式关一次，语义更清楚：用户点了确认，框就该消失。
        */
       this.visible = false;
     },

@@ -1,11 +1,10 @@
 <template>
   <el-dialog
-    :model-value="modelValue"
+    v-model="visible"
     title="设置"
     width="600px"
     :show-close="false"
     align-center
-    @update:model-value="(v: boolean) => $emit('update:modelValue', v)"
   >
     <div class="st-body">
       <!--
@@ -593,6 +592,8 @@ import type { AppSetting } from '@common/types/app_setting';
 import api from '../api/electron';
 import { useSettingStore } from '../stores/setting';
 import { parseHexColor } from '../utils/uiTheme';
+import { usePlaybackStore } from '../stores/playback';
+import { useUiStore } from '../stores/ui';
 
 /** 字节 -> 可读体积 */
 const formatBytes = (bytes: number): string => {
@@ -632,10 +633,6 @@ const snapSlider = (v: number | number[], min: number, max: number, step: number
 
 export default defineComponent({
   name: 'SettingsDialog',
-  props: {
-    modelValue: { type: Boolean, default: false },
-  },
-  emits: ['update:modelValue'],
   data() {
     return {
       /** 缓存占用统计 */
@@ -711,6 +708,30 @@ export default defineComponent({
     };
   },
   computed: {
+    /**
+     * 这些 store（播放状态按域拆成了多个）
+     *
+     * 设置弹窗只有一个开关，没有业务输入 —— 直接读写 store，
+     * 父组件那边连 v-model 都不用写。
+     *
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    playback() {
+      return usePlaybackStore();
+    },
+    ui() {
+      return useUiStore();
+    },
+    visible: {
+      get(): boolean {
+        return this.ui.settingsVisible;
+      },
+      set(v: boolean) {
+        this.ui.settingsVisible = v;
+      },
+    },
     store() {
       return useSettingStore();
     },
@@ -797,7 +818,7 @@ export default defineComponent({
     },
   },
   mounted() {
-    if (this.modelValue) void this.refreshCacheStats();
+    if (this.visible) void this.refreshCacheStats();
   },
   beforeUnmount() {
     /** 组件真被销毁时（App 卸载）也兜一次，别留着 rAF */

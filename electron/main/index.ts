@@ -158,6 +158,14 @@ let wallpaperEnabled = false
 let wallpaperAttached = false
 /** 是否正在退出应用（区分「点关闭按钮」与「真的要退出」） */
 let isQuitting = false
+/**
+ * 托盘菜单那一项的工作区（「歌单管理」还是「视频管理」）
+ *
+ * 由渲染层推上来（`trayUpdateState`）——工作区是**播放源的投影**，
+ * 只有渲染层算得准（它同时知道 `activeId` 和当前这条是不是视频）。
+ * 初始值 `ov` 跟界面默认一致：空库 / 刚装时两边都没内容，按视频列表那侧显示。
+ */
+let trayMode: 'ov' | 'mv' = 'ov'
 /** 托盘悬浮提示里显示的「当前在播什么」（由渲染层同步） */
 let trayTitle = ''
 /** 托盘菜单进度条要用的播放位置 / 时长（秒） */
@@ -1503,7 +1511,7 @@ function getTrayMenuState(): TrayMenuState {
     volume: trayVolume,
     muted: trayMuted,
     // 工作区：菜单里那一项按它显示「歌单管理」还是「视频管理」
-    mode: getSetting()['ui.mode'] === 'mv' ? 'mv' : 'ov',
+    mode: trayMode,
     sleepActive: traySleepActive,
     sleepRemainSec: traySleepRemainSec,
   }
@@ -1788,7 +1796,7 @@ function runTrayMenuAction(action: TrayMenuAction, value?: number): void {
        * 所以先把窗口恢复出来，再让渲染层打开弹窗。
        *
        * 打开哪一页由渲染层决定（它更清楚当前工作区）：`openManager()` 会按
-       * `ui.mode` 打开「歌单管理」或「视频管理」，和弹窗左下角那个切换按钮同一条路径。
+       * 当前工作区打开「歌单管理」或「视频管理」，和弹窗左下角那个切换按钮同一条路径。
        */
       void restoreWindow().then(() => sendToMain('tray:showPlaylist'))
       break
@@ -2153,15 +2161,6 @@ void app.whenReady().then(async () => {
     if (keys.includes('common.autoLaunch')) {
       applyAutoLaunch()
     }
-    /**
-     * 切了工作区（`ov` ↔ `mv`）要**立刻**把新状态推给菜单
-     *
-     * 菜单窗口是常驻的（只在托盘右键时显示），文案只靠 `trayMenu:state` 驱动。
-     * 不推的话，用户在这次切换前就打开过菜单、之后又切了模式，
-     * 菜单里那一项会一直停在旧文案（「歌单管理」/「视频管理」说反了）。
-     * 没建过菜单窗口时 `pushTrayMenuState` 自己会直接返回，不用管。
-     */
-    if (keys.includes('ui.mode')) pushTrayMenuState()
     refreshTray()
   })
 
@@ -2263,6 +2262,8 @@ void app.whenReady().then(async () => {
       if (state.isLoggedIn !== undefined && state.isLoggedIn !== isLoggedIn) {
         isLoggedIn = state.isLoggedIn
       }
+      // 工作区同理：菜单文案跟着「正在播哪一边」走
+      if (state.mode !== undefined) trayMode = state.mode
       refreshTray()
       // 菜单开着就把新状态推过去（进度条才会动）
       if (trayMenuShown) pushTrayMenuState()

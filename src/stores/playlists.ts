@@ -28,7 +28,7 @@ import type {
   PlaylistStoreData,
   SyncResult,
 } from '@common/types/playlist'
-import { getSyncInterval, isAutoSyncable, isSyncDue } from '@common/types/playlist'
+import { getSyncInterval, isAutoSyncable, isLocalPlaylistId, isSyncDue } from '@common/types/playlist'
 import { toPlain } from '@/utils/plain'
 
 /**
@@ -68,7 +68,7 @@ export const usePlaylistStore = defineStore('playlists', () => {
   /**
    * 从主进程加载集合
    *
-   * 只有 `src/App.vue` 的 init 会调用它（而且是 await 的），
+   * 只有 `boot.init()`（以及拖拽入库）会调用它（都是 await 的），
    * 所以不需要「幂等 ensureLoaded + 复用同一个 promise」那层包装 —— 已删。
    */
   const load = async (): Promise<void> => {
@@ -145,24 +145,86 @@ export const usePlaylistStore = defineStore('playlists', () => {
     return record
   }
 
-  /** 更新歌单字段 */
+  /**
+   * 更新歌单字段
+   *
+   * ## 两类歌单能改的东西不一样，这里各拦一道
+   *
+   * - **平台歌单**（`tx_8153225605`）：名字、链接、曲目都属于平台。
+   *   应用内只允许改**同步方式** —— 想改名、加减歌请去平台上操作，
+   *   否则下次同步会被远端覆盖回来，用户看到的是「改了又变回去」。
+   * - **本地歌单**（`pl_` 前缀）：`source` / `sourceUrl` / `sync` / `lastSyncAt`
+   *   恒为空 / off。链接在本地歌单那里只是「一次性导入器」，
+   *   导完就不该留下来（留下就会跟着同步，把手动加的歌冲掉）。
+   *
+   * 表单已经按类型分开渲染了，这里是第二道闸：将来多一个调用方
+   * （批量操作、快捷键、脚本）也不会把状态写歪。主进程归一化时还有第三道。
+   */
   const updatePlaylist = async (
     id: string,
     patch: Partial<Omit<PlaylistRecord, 'id'>>,
   ): Promise<void> => {
+    const safe: Partial<Omit<PlaylistRecord, 'id'>> = { ...patch }
+    if (isLocalPlaylistId(id)) {
+      delete safe.source
+      delete safe.sourceUrl
+      delete safe.sync
+      delete safe.lastSyncAt
+    } else {
+      /** 平台歌单：只放过 sync，其余一律以平台为准 */
+      delete safe.name
+      delete safe.source
+      delete safe.sourceUrl
+      delete safe.songs
+      delete safe.lastSyncAt
+    }
     playlists.value = playlists.value.map((p) =>
-      p.id === id ? { ...p, ...patch, updatedAt: Date.now() } : p,
+      p.id === id ? { ...p, ...safe, updatedAt: Date.now() } : p,
     )
     await persist()
   }
 
-  /** 删除歌单 */
-  const removePlaylist = async (id: string): Promise<void> => {
+  /**
+   * 把平台歌单转成本地歌单（**不可逆**）
+   *
+   * 主进程会换一个新 id（`pl_<uuid>`），所以这里要做三件事：
+   *  1. 用返回的记录**替换**数组里那条 —— 旧 id 那条不能留，否则列表里会
+   *     同时出现「平台的它」和「本地的它」；
+   *  2. `currentId` 若指向旧 id，改成新 id；
+   *  3. 把记录返回给调用方（界面要重映射选中项、刷新播放链路）。
+   *
+   * 不在这里调 `load()`：主进程已经把权威结果返回了，重新拉一遍既多一次
+   * 往返，中途还可能被别的 `persist` 盖掉。
+   */
+  const convertToLocal = async (id: string): Promise<PlaylistRecord> => {
+    const record = await api.convertPlaylistToLocal(id)
+    playlists.value = playlists.value.map((p) => (p.id === id ? record : p))
+    if (currentId.value === id) currentId.value = record.id
+    return record
+  }
+
+  /**
+   * 删除歌单
+   *
+   * **默认歌单删不掉**（返回 `false`）：它是拖入单曲的落点，删掉之后下次
+   * 拖单曲还得悄悄再建一个，用户看到的是「我刚删了它，怎么又冒出来了」。
+   * 界面上那个按钮已经按 `isDefault` 禁用了，这里是第二道闸（快捷键 / 将来的批量操作）。
+   *
+   * 主进程那边还有第三道（`savePlaylists` 发现默认歌单不在集合里会补回），
+   * 因为这里的持久化是**整份覆盖** —— 绕过 store 直接改数组也能删掉。
+   *
+   * @returns 真的删掉了才返回 true
+   */
+  const removePlaylist = async (id: string): Promise<boolean> => {
+    const target = playlists.value.find((p) => p.id === id)
+    if (target?.isDefault) return false
+
     playlists.value = playlists.value.filter((p) => p.id !== id)
     if (currentId.value === id) {
       currentId.value = playlists.value[0]?.id ?? null
     }
     await persist()
+    return true
   }
 
   /** 切换当前歌单 */
@@ -258,6 +320,7 @@ export const usePlaylistStore = defineStore('playlists', () => {
     persist,
     addPlaylist,
     updatePlaylist,
+    convertToLocal,
     removePlaylist,
     setCurrent,
     setLastIndex,

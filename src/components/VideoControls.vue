@@ -1,5 +1,6 @@
 <template>
-  <div id="VideoControls">
+  <!-- 壁纸模式 / 锁定时整条隐藏（class 而不是 v-if：v-if 拆掉再挂会丢拖动状态） -->
+  <div id="VideoControls" :class="{ 'wm-hidden': window.wallpaperEnabled || window.locked }">
     <div class="now-playing">
       <!-- 封面：优先歌曲专辑图，退回视频缩略图 -->
       <div class="np-cover">
@@ -36,7 +37,7 @@
           <div class="np-subtitle" :title="subtitle">{{ subtitle }}</div>
           <!--
             清晰度 / 音质角标：贴在这一行最右边，点开可以切换
-            可选档位由父组件从 playurl 响应里取（不同视频、不同账号能选的档位不一样）
+            可选档位由 store 从 playurl 响应里取（不同视频、不同账号能选的档位不一样）
 
             ⚠️ 切换清晰度**会重新解析播放地址**（发请求）—— 请求进行中禁用（`qualityBusy`），
             而且改完还有 3 秒冷却（防连点）。禁用时 `title` 说明原因。
@@ -46,7 +47,7 @@
             trigger="click"
             placement="top"
             :disabled="qualityBusy"
-            @command="(id: number) => $emit('selectQuality', 'video', id)"
+            @command="(id: number) => playback.switchQuality('video', id)"
           >
             <div class="np-quality" :title="qualityBusy ? '正在加载中，请稍候……' : qualityTitle">
               {{ quality }}<span v-if="videoChoices.length > 1" class="np-caret">▾</span>
@@ -69,7 +70,7 @@
             trigger="click"
             placement="top"
             :disabled="qualityBusy"
-            @command="(id: number) => $emit('selectQuality', 'audio', id)"
+            @command="(id: number) => playback.switchQuality('audio', id)"
           >
             <div class="np-quality" :title="qualityBusy ? '正在加载中，请稍候……' : audioTitle">
               {{ audioQuality }}<span v-if="audioChoices.length > 1" class="np-caret">▾</span>
@@ -115,31 +116,37 @@
       <div class="time" id="totalTime">{{ formatTime(duration) }}</div>
     </div>
     <div id="controls">
-      <!-- 播放队列（MV 是曲目、OV 是视频条目）；打开时变成叉号 -->
-      <i
-        :class="[
-          'iconfont',
-          listType == 'list' ? 'icon-cuowu' : 'icon-bofangduilie',
-        ]"
-        :title="mode === 'ov' ? '视频列表' : '歌曲列表'"
-        @click="$emit('videoControl', 'list')"
-        id="list"
-      ></i>
       <!--
-        候选视频列表（一首歌的一堆 B 站搜索结果）
+        歌曲列表（MV 的播放队列）
 
-        **OV 模式下没有这个东西** —— 条目本身就是视频，没有「换一个视频」可选，
-        留着只会是个按下去什么都不发生的按钮。
+        **OV 下不渲染** —— 那边没有「歌」这一层，整个合集就是视频列表本身；
+        留一个「歌曲列表」按钮只会让人以为还能按歌看。
       -->
       <i
         v-if="mode !== 'ov'"
+        :class="['iconfont', listType == 'songList' ? 'icon-cuowu' : 'icon-bofangduilie']"
+        title="歌曲列表"
+        @click="playback.videoControl('songList')"
+        id="songList"
+      ></i>
+      <!--
+        视频列表
+
+        MV：当前这首歌的 B 站搜索结果（一条一个视频版本，可以换）
+        OV：当前这一列的全部条目（合集 / 收藏夹）
+
+        两个工作区里它都表示「一堆视频」，所以图标和文案**不随模式变**。
+        以前 OV 是把这个图标借给「歌曲列表」那个按钮、再把文案改成「视频列表」，
+        于是一个按钮身上挂三种 `mode === 'ov' ? …`，改一处漏一处。
+      -->
+      <i
         :class="[
           'iconfont',
-          listType == 'vList' ? 'icon-cuowu' : 'icon-bofangliebiao',
+          listType == 'videoList' ? 'icon-cuowu' : 'icon-bofangliebiao',
         ]"
-        title="候选视频"
-        @click="$emit('videoControl', 'vList')"
-        id="vList"
+        title="视频列表"
+        @click="playback.videoControl('videoList')"
+        id="videoList"
       ></i>
       <!--
         上一首 / 下一首：**会发请求**（重新搜索 + 解析地址），
@@ -149,19 +156,19 @@
       -->
       <i
         :class="['iconfont', 'icon-1_music83', busy ? 'ctrl-disabled' : '']"
-        :title="busy ? '正在加载中，请稍候……' : mode === 'ov' ? '上一个视频' : '上一首'"
-        @click="busy ? null : $emit('videoControl', 'before')"
+        :title="busy ? '正在加载中，请稍候……' : modeUi.prevTitle"
+        @click="busy ? null : playback.videoControl('before')"
         id="before"
       ></i>
       <i
         :class="['iconfont', paused ? 'icon-play' : 'icon-pause']"
-        @click="$emit('videoControl', 'playControls')"
+        @click="playback.videoControl('playControls')"
         id="playControls"
       ></i>
       <i
         :class="['iconfont', 'icon-1_music82', busy ? 'ctrl-disabled' : '']"
-        :title="busy ? '正在加载中，请稍候……' : mode === 'ov' ? '下一个视频' : '下一首'"
-        @click="busy ? null : $emit('videoControl', 'next')"
+        :title="busy ? '正在加载中，请稍候……' : modeUi.nextTitle"
+        @click="busy ? null : playback.videoControl('next')"
         id="next"
       ></i>
       <!--
@@ -224,7 +231,7 @@
               : 'icon-suijibofang'
             : 'icon-liebiaoxunhuan',
         ]"
-        @click="$emit('videoControl', 'playMode')"
+        @click="playback.videoControl('playMode')"
         id="playMode"
       ></i>
     </div>
@@ -236,18 +243,13 @@ import { defineComponent } from 'vue';
 import type { QualityOptionPayload, QualityOptionsPayload } from '@common/types/ipc';
 import { normalizeImageUrl } from '../utils/image';
 import { sanitizeTitleHtml } from '../utils/title';
+import { useWindowStore } from '../stores/window';
+import { usePlaybackStore } from '../stores/playback';
+import { useQueueStore } from '../stores/queue';
+import { useUiStore } from '../stores/ui';
 
 export default defineComponent({
   name: 'VideoControls',
-  emits: [
-    'changeVolume',
-    'changeTime',
-    'videoControl',
-    'showList',
-    'toggleMute',
-    /** 用户在角标菜单里选了清晰度（'video'）或音质（'audio'） */
-    'selectQuality',
-  ],
   data() {
     return {
       isVideoDragging: false,
@@ -265,69 +267,6 @@ export default defineComponent({
       coverFailed: false,
     };
   },
-  props: {
-    videoName: { type: String, default: '' },
-    /** 当前封面（歌曲专辑图或视频缩略图） */
-    cover: { type: String, default: '' },
-    /** 副标题：歌曲名 - 歌手 · 专辑 */
-    subtitle: { type: String, default: '' },
-    /** 正在播的视频清晰度标签（例如 1080P / 4K），为空则不显示 */
-    quality: { type: String, default: '' },
-    /** 清晰度 + 分辨率，用于悬浮提示，例如 1080P（1920×1080） */
-    qualityDetail: { type: String, default: '' },
-    /** 正在播的音频流音质（例如 192K），为空则不显示 */
-    audioQuality: { type: String, default: '' },
-    /** 音质悬浮提示，例如 192K 高音质 */
-    audioQualityDetail: { type: String, default: '' },
-    /** 这个视频当前可选的清晰度 / 音质 */
-    qualityOptions: {
-      type: Object as () => QualityOptionsPayload | null,
-      default: null,
-    },
-    /** 当前实际在播的清晰度代码（qn）；durl 时为空 */
-    videoQn: { type: Number as unknown as () => number | null, default: null },
-    /** 当前实际在播的音频流 id；durl 时为空 */
-    audioId: { type: Number as unknown as () => number | null, default: null },
-    currentMode: { type: Number, default: 0 },
-    currentVolume: { type: Number, default: 0 },
-    isMuted: { type: Boolean, default: false },
-    currentTime: { type: Number, default: 0 },
-    duration: { type: Number, default: 0 },
-    paused: { type: Boolean, default: false },
-    listType: { type: String, default: '' },
-    /**
-     * 当前工作区：`ov`（B 站视频列表）/ `mv`（音乐歌单）
-     *
-     * 只影响**文案与按钮取舍**，不影响播放：
-     *  - 上一首 / 下一首 → 上一个视频 / 下一个视频；
-     *  - 候选视频列表按钮在 OV 下隐藏（条目本身就是视频，没有候选可选）。
-     */
-    mode: { type: String, default: 'mv' },
-    /**
-     * ★ **有网络请求在飞**（搜索 / 解析地址）时为 true
-     *
-     * 用于**禁用所有会再发请求的控件**，防止用户狂点造成请求风暴
-     * （B站会返回 412 风控）。
-     *
-     * ⚠️ 只禁「会发请求的」——播放 / 暂停 / 音量 / 进度这些**本地功能**不禁，
-     * 它们在请求期间照常可用（用户不该因为后台在搜歌就不能暂停）。
-     *
-     * 会发请求的有：切歌（上一首 / 下一首）、清晰度 / 音质切换、播放模式
-     * （换模式可能重新解析地址）。
-     * 不该禁的有：播放/暂停、静音、音量、进度条、两个列表开关（纯本地展开收起）。
-     */
-    busy: { type: Boolean, default: false },
-    /**
-     * ★ **清晰度 / 音质下拉是否该禁用**
-     *
-     * 比 `busy` 多一个来源：**刚改过清晰度/音质的 3 秒冷却**
-     * （见 App.vue 的 `startQualityCooldown`）。
-     *
-     * 为什么不干脆用 `busy`：切歌按钮没必要因为「刚改过清晰度」被禁 3 秒 ——
-     * 冷却只针对「再改一次清晰度」这个动作。
-     */
-    qualityBusy: { type: Boolean, default: false },
-  },
   methods: {
     formatTime(s: number): string {
       s = Math.floor(s || 0);
@@ -340,15 +279,15 @@ export default defineComponent({
     /**
      * 静音按钮
      *
-     * 这里只负责「上报用户按了静音」，具体是静音还是恢复、
-     * 恢复到多少音量，都交给父组件决定 —— 因为音量状态的权威在 App 那边。
+     * 这里只负责转达「用户按了静音」，具体是静音还是恢复、恢复到多少音量，
+     * 都由 store 决定 —— 音量状态的权威在 player 里。
      *
      * 之前这里用 draggingVolume 当「静音前的音量」暂存：
      * 但 draggingVolume 只在拖动音量条时才被赋值，点击静音时它还是初始值 0，
      * 于是「解除静音」恢复的音量是 0，音量永远回不来，静音状态也卡死。
      */
     toggleMute() {
-      this.$emit('toggleMute');
+      this.playback.toggleMute();
     },
     onProgressDown(e: PointerEvent) {
       this.isVideoDragging = true;
@@ -381,7 +320,7 @@ export default defineComponent({
       );
       // 已经 0 / 100：照样 preventDefault（别让滚轮漏到页面去），但不白发一次事件
       if (next === this.currentVolume) return;
-      this.$emit('changeVolume', next);
+      this.playback.changeVolume(next);
     },
     onPointerMove(e: PointerEvent) {
       if (this.isVideoDragging) this.calcProgress(e);
@@ -421,7 +360,7 @@ export default defineComponent({
       const rect = el.getBoundingClientRect();
       const pos = Math.min(Math.max(0, (e.clientX - rect.left) / rect.width), 1);
       this.draggingTime = pos * this.duration;
-      this.$emit('changeTime', this.draggingTime);
+      this.playback.changeTime(this.draggingTime);
     },
     calcVolume(e: PointerEvent) {
       const el =
@@ -432,10 +371,138 @@ export default defineComponent({
       const y = rect.bottom - e.clientY;
       const pct = Math.min(Math.max(0, y / rect.height), 1);
       this.draggingVolume = Math.round(pct * 100);
-      this.$emit('changeVolume', this.draggingVolume);
+      this.playback.changeVolume(this.draggingVolume);
     },
   },
   computed: {
+    /**
+     * 这些 store（播放状态按域拆成了多个）
+     *
+     * 控制栏显示的一切（标题 / 封面 / 清晰度 / 进度 / 音量）都是播放状态，
+     * 以前由 App.vue 逐个 props 传进来、操作再 emit 回去 —— 那层搬运没有信息量。
+     * 现在直接读写 store：下面这些同名 computed 就是原来那些 props 的同义替换，
+     * 模板一行都不用改。
+     *
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    window() {
+      return useWindowStore();
+    },
+    playback() {
+      return usePlaybackStore();
+    },
+    queue() {
+      return useQueueStore();
+    },
+    ui() {
+      return useUiStore();
+    },
+    /** 标题：视频标题优先，没有就用「歌名 - 歌手」 */
+    videoName(): string {
+      return this.queue.videoName || this.queue.songDisplayName;
+    },
+    /** 当前封面（歌曲专辑图或视频缩略图） */
+    cover(): string {
+      return this.playback.currentCover() || '';
+    },
+    /** 副标题：歌手 · 专辑 / UP 主 · 列表名 */
+    subtitle(): string {
+      return this.queue.controlsSubtitle;
+    },
+    /** 正在播的视频清晰度标签（例如 1080P），为空则不显示 */
+    quality(): string {
+      return this.playback.videoQuality;
+    },
+    /** 清晰度 + 分辨率，用于悬浮提示 */
+    qualityDetail(): string {
+      return this.playback.videoQualityDetail;
+    },
+    /** 正在播的音频流音质（例如 192K） */
+    audioQuality(): string {
+      return this.playback.audioQuality;
+    },
+    audioQualityDetail(): string {
+      return this.playback.audioQualityDetail;
+    },
+    /** 这个视频当前可选的清晰度 / 音质 */
+    qualityOptions(): QualityOptionsPayload | null {
+      return this.playback.qualityOptions;
+    },
+    /** 当前实际在播的清晰度代码（qn）；durl 时为空 */
+    videoQn(): number | null {
+      return this.playback.currentVideoQn;
+    },
+    /** 当前实际在播的音频流 id；durl 时为空 */
+    audioId(): number | null {
+      return this.playback.currentAudioId;
+    },
+    /** 播放模式（顺序 / 随机 / 单曲） */
+    currentMode(): number {
+      return this.queue.currentMode;
+    },
+    currentVolume(): number {
+      return this.playback.currentVolume;
+    },
+    isMuted(): boolean {
+      return this.playback.isMuted;
+    },
+    currentTime(): number {
+      return this.playback.currentTime;
+    },
+    duration(): number {
+      return this.playback.duration;
+    },
+    paused(): boolean {
+      return this.playback.paused;
+    },
+    listType(): string {
+      return this.ui.listType;
+    },
+    /**
+     * 当前工作区：`ov` / `mv`
+     *
+     * 只影响**文案与图标取舍**，不影响播放。所有派生项都收在 `modeUi` 里：
+     * **模板不要再直接判 `mode === 'ov'`**，要加一项就加在那里。
+     */
+    mode(): string {
+      return this.queue.mode;
+    },
+    /**
+     * 有网络请求在飞（搜索 / 解析地址）时为 true
+     *
+     * 用于禁用**会再发请求的控件**，防请求风暴（B站 412 风控）。
+     * ⚠️ 只禁「会发请求的」——播放 / 暂停 / 音量 / 进度这些本地功能不禁。
+     */
+    busy(): boolean {
+      return this.ui.netBusy;
+    },
+    /**
+     * 清晰度 / 音质下拉是否该禁用
+     *
+     * 比 `busy` 多一个来源：刚改过清晰度/音质的 3 秒冷却。
+     * 不用 `busy` 是因为切歌按钮没必要因为「刚改过清晰度」被禁 3 秒。
+     */
+    qualityBusy(): boolean {
+      return this.ui.qualityBusy;
+    },
+    /**
+     * 按工作区切换的文案
+     *
+     * 只剩「上一个视频 / 上一首」这一类**纯文案**了：两个列表按钮各自的图标和
+     * 名字现在都是固定的（见模板顶部），不再需要在这里按模式分叉。
+     *
+     * 这里保留一个对象而不是两个 computed，是为了让模板只写 `modeUi.prevTitle`，
+     * 不至于哪天又有人往 `<i :title="mode === 'ov' ? …">` 那样散回去。
+     */
+    modeUi(): { prevTitle: string; nextTitle: string } {
+      const ov = this.mode === 'ov';
+      return {
+        prevTitle: ov ? '上一个视频' : '上一首',
+        nextTitle: ov ? '下一个视频' : '下一首',
+      };
+    },
     /**
      * 跑马灯标题（净化过的 HTML）
      *

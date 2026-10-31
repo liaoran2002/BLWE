@@ -8,8 +8,10 @@
  */
 import type { RemoveListener } from '@common/types/ipc'
 import type { DashStreamsPayload, QualityOptionsPayload } from '@common/types/ipc'
+import type { VideoListItem } from '@common/types/playlist'
+import type { PlayItem } from './playItem';
 import type { DashSession } from '../utils/dashPlayer'
-import type { PlaylistSong } from '@common/types/playlist'
+import type { PlaybackEngine } from '../utils/playbackEngine'
 
 /** 循环模式下标（与 electron/common 的 PLAY_LOOP_MODES 顺序一致） */
 export interface LoopModeIndex {
@@ -18,13 +20,22 @@ export interface LoopModeIndex {
   random: 2
 }
 
-/** 列表弹层类型：none 关闭 / list 歌单 / vList 视频列表 */
-export type ListType = 'none' | 'list' | 'vList'
+/**
+ * 列表弹层类型
+ *
+ *  - `songList`  歌单：**MV 的播放队列**，一行一首歌。OV 里没有这个东西。
+ *  - `videoList` 视频列表：一行一个视频。两个工作区里都有，但来源不同：
+ *                OV 是当前这一列的全部条目（合集 / 收藏夹），
+ *                MV 是当前这首歌的备选（搜索结果里的一条一个版本）。
+ *
+ * 原来是 `list` / `vList` —— 名字既不像英文也不像中文，读代码时得先猜。
+ */
+export type ListType = 'none' | 'songList' | 'videoList'
 
 /** VideoControls 派发的控制动作 */
 export type VideoControlAction =
-  | 'list'
-  | 'vList'
+  | 'songList'
+  | 'videoList'
   | 'before'
   | 'playControls'
   | 'next'
@@ -33,7 +44,7 @@ export type VideoControlAction =
 /**
  * B 站搜索结果里的视频项
  *
- * 与 showList 的 VideoListItem 保持结构兼容（bvid/title/pic/author/duration）。
+ * 与 SongVideoListDialog 的 VideoListItem 保持结构兼容（bvid/title/pic/author/duration）。
  */
 export interface BiliVideo {
   bvid: string
@@ -68,10 +79,17 @@ export interface BiliVideo {
 
 export interface AppData {
   // ---- 歌单与播放 ----
-  /** 当前歌单的曲目（结构化：含封面 / 专辑 / 歌手） */
-  songs: PlaylistSong[]
+  /**
+   * 当前播放队列
+   *
+   * 装的是**歌或视频**（`PlayItem`）—— 两种条目各自保留自己的字段，
+   * 不再把视频改名成歌的形状。分派靠 `isVideoItem()`，见 `types/playItem.ts`。
+   */
+  songs: PlayItem[]
+  /** 播放引擎（`markRaw`，不进响应式）—— 解析 / 挂源 / 降级都在它里面 */
+  engine: PlaybackEngine | null
   videoList: BiliVideo[]
-  /** `videoList` 属于哪一首歌（缓存键），用于判断列表是否已经跟上当前歌曲 */
+  /** `videoList` 属于哪一条（标识键），用于判断列表是否已经跟上当前条目 */
   videoListKeyword: string
   /** 正在播的那个视频的封面（主进程回传，优先于列表里的缩略图） */
   videoPic: string
@@ -94,12 +112,6 @@ export interface AppData {
   videoUrl: string
   /** dash 双轨信息（非空时用 MSE 播放；只有 durl 时为空） */
   dashSource: DashStreamsPayload | null
-  /** 当前 dash 会话（MSE），不进模板所以不需要响应式 */
-  _dashSession: DashSession | null
-  /** dash 连续失败次数 */
-  _dashFailures: number
-  /** 本会话是否已判定 dash 不可用（连续失败后置位，避免每首歌都白试一次） */
-  _dashDisabled: boolean
   /** 正在播的视频 bvid（`currentVideoIndex` 可能是 -1，所以单独记一个） */
   currentBvid: string
   randomList: number[]
@@ -108,7 +120,13 @@ export interface AppData {
   MODE: LoopModeIndex
   currentMode: number
   videoName: string
-  songName: string
+  /**
+   * 当前这条的**标识键**（`keyOf`：歌是 `歌名-歌手`，视频是 bvid）
+   *
+   * 只用于进程内比较（「这个错误/定位是不是当前这条的」）——
+   * **不是搜索词、也不能贴到界面上**。显示名一律走 `titleOf()`。
+   */
+  currentKey: string
   listName: string
   currentVolume: number
   currentTime: number
@@ -130,7 +148,7 @@ export interface AppData {
    */
   browseVideoListId: string
   /** 视频管理页当前浏览列表的条目（从库里读，切换 / 编辑后重载） */
-  ovSongs: PlaylistSong[]
+  ovSongs: VideoListItem[]
   /** 已经提示过「还没有任何列表」（避免每次兜底加载都再弹一次） */
   _emptyNotified: boolean
   /** OV 下连续「取不到播放地址」的条数（达到上限就停止自动跳过） */
@@ -161,8 +179,6 @@ export interface AppData {
   _pendingMoveY: number
   _moveFramePending: boolean
 
-  // ---- 请求竞态令牌 ----
-  _songToken: number
   // ---- 登录态 ----
   isLoggedIn: boolean
   userFace: string
@@ -222,8 +238,6 @@ export interface AppData {
   _sleepTimer: import('../utils/sleepTimer').SleepTimer | null
   /** `SleepTimer` 的订阅取消函数 */
   _sleepUnsub: (() => void) | null
-  /** 视频请求竞态令牌（切视频时防乱序覆盖） */
-  _videoToken: number
   /** 同一个视频的连续失败次数，达到上限就跳过该曲，避免无限重试 */
   _videoErrorCount: number
   /** 正在播的这条是不是本地视频文件（由 `resolveVideo` 回的 `isLocal` 决定） */

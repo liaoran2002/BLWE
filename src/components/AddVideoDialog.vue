@@ -3,16 +3,15 @@
     「添加视频」弹窗
 
     和歌单管理一样是 el-dialog：没有右上角叉号，点空白处关闭，
-    「点击空白位置关闭」的提示由 App.vue 里遮罩的 ::after 统一提供。
+    「点击空白位置关闭」的提示由 `styles/global.css` 里遮罩的 ::after 统一提供。
 
     流程：粘贴链接 / BV 号 -> 解析 -> 看到封面 + 标题 + UP 主 -> 确认 -> 加到这首歌的收藏里
   -->
   <el-dialog
-    :model-value="modelValue"
+    v-model="visible"
     width="560px"
     :show-close="false"
     align-center
-    @update:model-value="(v: boolean) => $emit('update:modelValue', v)"
   >
     <template #header>
       <div class="av-head">添加视频</div>
@@ -79,13 +78,10 @@ import { ElMessage } from 'element-plus';
 import type { ParsedVideoInfo } from '@common/types/ipc';
 import api from '../api/electron';
 import { normalizeImageUrl } from '../utils/image';
+import { useUiStore } from '../stores/ui';
 
 export default defineComponent({
   name: 'AddVideoDialog',
-  props: {
-    modelValue: { type: Boolean, default: false },
-  },
-  emits: ['update:modelValue', 'confirm'],
   data() {
     return {
       input: '',
@@ -99,12 +95,33 @@ export default defineComponent({
     };
   },
   computed: {
+    /**
+     * 这些 store（播放状态按域拆成了多个）
+     *
+     * 开关在 `ui.addVideoVisible`，确认后要做的事（把视频加进收藏）
+     * 也是 player 的 action —— 这个弹窗不需要父组件参与。
+     *
+     * 播放相关的状态按业务域拆成了多个 store（原来全在一个 player store 里）：
+     * 下面每个 computed 取一个（Pinia 返回同一个单例，调用没有开销），
+     * 模板里就用 `playback.xxx` / `queue.xxx` / `ui.xxx` 直接读。
+     */
+    ui() {
+      return useUiStore();
+    },
+    visible: {
+      get(): boolean {
+        return this.ui.addVideoVisible;
+      },
+      set(v: boolean) {
+        this.ui.addVideoVisible = v;
+      },
+    },
     coverUrl(): string | null {
       return normalizeImageUrl(this.info?.pic ?? null);
     },
   },
   watch: {
-    modelValue(v: boolean) {
+    visible(v: boolean) {
       // 每次打开都是一张干净的空白表单；关闭时丢掉上次的结果
       if (v) {
         this.input = '';
@@ -154,11 +171,11 @@ export default defineComponent({
     },
     confirm(): void {
       if (!this.info) return;
-      this.$emit('confirm', this.info);
+      void this.ui.onAddVideo(this.info);
       this.close();
     },
     close(): void {
-      this.$emit('update:modelValue', false);
+      this.visible = false;
     },
   },
 });

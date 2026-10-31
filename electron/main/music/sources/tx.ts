@@ -259,3 +259,84 @@ export const getListDetail = async (
     'QQ音乐歌单解析',
   ).then((detail) => ({ ...detail, page }))
 }
+
+// #region 单曲
+
+/** `music.pf_song_detail_svr` 的响应形状（只用得到的字段） */
+interface TxSongDetailResponse {
+  code: number
+  req?: {
+    code: number
+    data?: {
+      /** 结构和列表接口里的歌曲项一致，所以能直接复用 `toSong` */
+      track_info?: TxRawSong
+    }
+  }
+}
+
+/**
+ * 这个链接是不是**单曲**
+ *
+ * QQ 的单曲页：`https://y.qq.com/n/ryqq/songDetail/003aAYrm3GE0Ac`
+ * 播放页分享：`https://i.y.qq.com/v8/playsong.html?songmid=003aAYrm3GE0Ac`
+ *
+ * 歌单是 `/n/ryqq/playlist/…` / `playsquare/…`，路径里没有 `songDetail`，不会撞。
+ */
+export const isSongUrl = (input: string): boolean =>
+  /songDetail\/[A-Za-z0-9]+/.test(String(input ?? '')) || /[?&]songmid=/.test(String(input ?? ''))
+
+/** 单曲链接 / 裸 songmid -> songmid */
+export const getSongId = (rawInput: string): string => {
+  const input = String(rawInput ?? '').trim()
+  const byPath = /songDetail\/([A-Za-z0-9]+)/.exec(input)
+  if (byPath) return byPath[1]
+  const byQuery = /[?&]songmid=([A-Za-z0-9]+)/.exec(input)
+  if (byQuery) return byQuery[1]
+  /** 裸 mid：QQ 的 songmid 是大小写字母 + 数字，长度固定 14 */
+  if (/^[A-Za-z0-9]{10,20}$/.test(input)) return input
+  throw new Error('无法从该链接中解析出 QQ 音乐歌曲 mid，请直接粘贴歌曲页链接')
+}
+
+/**
+ * 按 songmid 拿单曲信息
+ *
+ * 移植自 LX 的 `musicSdk/tx/musicInfo.js`（接口是 `music.pf_song_detail_svr`
+ * 的 `get_song_detail_yqq`）。LX 那版还会顺手算出各码率的文件大小，
+ * 本项目不需要（播放走 B 站 MV，不从这里拿音频地址），所以只取歌曲本体。
+ *
+ * `track_info` 的结构和列表接口里的歌曲项一致 —— 直接复用 `toSong()`，
+ * 保证「从歌单来的」和「从单曲链接来的」两条路产出的字段完全一样
+ * （尤其是 `platformId`：它是 `songs.id` 的主键成分，两边不一致就会变成两首歌）。
+ */
+export const getSongDetail = async (songmid: string): Promise<ParsedSong | null> => {
+  const body = await musicFetchJson<TxSongDetailResponse>(
+    'https://u.y.qq.com/cgi-bin/musicu.fcg',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: 'https://y.qq.com',
+        Referer: `https://y.qq.com/n/ryqq/songDetail/${songmid}`,
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({
+        comm: { ct: '19', cv: '1859', uin: '0' },
+        req: {
+          module: 'music.pf_song_detail_svr',
+          method: 'get_song_detail_yqq',
+          param: { song_type: 0, song_mid: songmid },
+        },
+      }),
+    },
+  )
+
+  if (body.code !== 0 || body.req?.code !== 0) {
+    throw new Error('QQ 音乐歌曲详情接口返回异常（歌曲可能已下架或需要会员）')
+  }
+  const item = body.req?.data?.track_info
+  if (!item) return null
+  return toSong(item)
+}
+
+// #endregion

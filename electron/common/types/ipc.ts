@@ -285,6 +285,26 @@ export interface IpcChannelMap {
     params: { url: string }
     result: { record: import('./playlist').PlaylistRecord; existed: boolean }
   }
+  /**
+   * 导入**单曲**：追加进默认歌单（已在里面就只定位过去）
+   *
+   * 落点永远是默认歌单 —— 拖进来一首歌的意图是「我想听这首」，
+   * 不该因此建一个新歌单出来。默认歌单由主进程保证存在（没有就现建，且删不掉）。
+   *
+   * `added` 区分「新加进去的」和「本来就在里面的」，只影响提示语；
+   * `index` 是它最终落在第几首（主进程顺手把默认歌单的 `lastIndex` 改成它，
+   * 渲染层拿这个 id 去 `onPlaylistSwitch` 就能从这一首起播）。
+   */
+  'music:importSong': {
+    params: { url: string }
+    result: {
+      record: import('./playlist').PlaylistRecord
+      index: number
+      added: boolean
+      /** 这首歌的歌名 —— 提示语要能说出「加的是哪首」，不能只说「已加入默认歌单」 */
+      songName: string
+    }
+  }
   /** 全部视频列表（侧边栏 / 管理弹窗） */
   'videolists:list': {
     params: void
@@ -467,6 +487,16 @@ export interface IpcChannelMap {
     params: { ids: string[] }
     result: import('./playlist').SyncResult[]
   }
+  /**
+   * 把平台歌单转成本地歌单（不可逆）
+   *
+   * 会换一个新 id（`pl_<uuid>`），旧 id 在同一事务里废弃 ——
+   * 主进程会顺带把 `currentId` 指到新 id，渲染层拿返回值更新本地副本。
+   */
+  'playlists:convertToLocal': {
+    params: { id: string }
+    result: import('./playlist').PlaylistRecord
+  }
   // #endregion
 
   // #region cache
@@ -609,6 +639,14 @@ export interface TrayState {
    * 万一哪次没同步到，托盘菜单就会把「退出登录」显示成「登录」。
    */
   isLoggedIn?: boolean
+  /**
+   * 渲染层算出来的工作区（在播视频列表 = `ov`，在播歌单 = `mv`）
+   *
+   * 和登录态同一类「防漂移」字段：工作区是**播放源的投影**，只有渲染层算得准
+   * （它同时知道 `activeId` 和当前这条是不是视频）。主进程不再自己读设置项，
+   * 只拿这个值换菜单文案。
+   */
+  mode?: 'ov' | 'mv'
 }
 
 /**
@@ -659,9 +697,9 @@ export interface TrayMenuState {
   volume: number
   muted: boolean
   /**
-   * 当前工作区（设置项 `ui.mode`）
+   * 当前工作区（渲染层推上来的，= 正在播哪一边）
    *
-   * 菜单里那一项「歌单管理 / 视频管理」据此换文案 —— 点开的就是当前模式的
+   * 菜单里那一项「歌单管理 / 视频管理」据此换文案 —— 点开的就是当前工作区的
    * 那个管理弹窗，文案必须和它一致，否则用户会以为点错了。
    */
   mode: 'ov' | 'mv'

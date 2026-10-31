@@ -1,0 +1,114 @@
+/*
+ * 全局样式：根容器、video 元素定位、Element Plus 弹窗覆盖
+ *
+ * 这些规则**从来不属于 App.vue 这个组件**：`el-dialog` 是 teleport 到 body 的，
+ * `#app` / `#biliVideo` / `.wm-hidden` 作用于全局节点或跨组件。
+ * 之前它们以非 scoped 的 `<style>` 挂在 App.vue 末尾（161 行），
+ * 让「App 只是装配壳」这个定位名不副实 —— 一个 130 行的组件旁边挂着 160 行全局 CSS，
+ * 改主题色要先翻到文件最后。
+ *
+ * 现在按职责分开：
+ *  - `theme.css`：可被设置改写的令牌（颜色、透明度、模糊）；
+ *  - 本文件：不随设置变化的骨架与第三方组件覆盖。
+ *
+ * ⚠️ 必须在 `element-plus/dist/index.css` **之后**引入，否则覆盖不生效。
+ */
+
+#app {
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* 视频铺满窗口：宽高交给元素本身，dash/durl 两条路都靠 attach() 设 src，这里只管定位 */
+#biliVideo {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  z-index: 0;
+}
+
+/*
+ * 所有 el-dialog 统一成同一套面板风格
+ * （设置 / 歌单管理 / 视频列表管理 / 歌曲·视频列表 / 添加视频 / 关于）。
+ * 弹窗是 teleport 到 body 的，scoped 样式够不到，所以写在全局里。
+ *
+ * 文字是白色的（浅色主题偏白的面板底 + 黑阴影，深色主题偏黑的底 + 白阴影），
+ * 这样不管背后视频是亮是暗都看得清 —— 跟控制栏同一套做法。
+ */
+.el-dialog {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--panel-shadow);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  color: var(--panel-text);
+  text-shadow: var(--glass-shadow);
+}
+.el-dialog .el-dialog__title,
+.el-dialog .el-dialog__header,
+.el-dialog .el-dialog__body {
+  color: var(--panel-text);
+}
+
+/*
+ * 这几个弹窗都不用右上角的叉号（`show-close=false`），
+ * 关闭方式统一成「点弹窗外面的空白处」——
+ * Element Plus 默认行为，它要求 mousedown/mouseup 都落在遮罩上，
+ * 所以拖滑块松手在弹窗外不会误关。
+ *
+ * 提示写在**遮罩**上、弹窗下面：用遮罩的 ::after，一处生效所有弹窗都有。
+ * `pointer-events: none` 保证它不挡点击（点它等于点遮罩，照样关）。
+ */
+.el-overlay-dialog::after {
+  content: '点击空白位置关闭';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 4vh;
+  text-align: center;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--glass-text);
+  text-shadow: var(--glass-shadow);
+  pointer-events: none;
+}
+
+/*
+ * Element Plus 自己的控件有实底（输入框、按钮、下拉），文字不能再叠阴影：
+ * 白底黑字加一圈黑阴影会发虚，像没对焦。
+ */
+.el-dialog .el-button,
+.el-dialog .el-input,
+.el-dialog .el-select,
+.el-dialog .el-textarea,
+.el-dialog .el-radio-group,
+.el-dialog .el-checkbox,
+.el-dialog .el-switch,
+.el-dialog .el-tag {
+  text-shadow: none;
+}
+
+.el-overlay {
+  background-color: rgba(0, 0, 0, 0.45);
+}
+
+/*
+ * 壁纸模式：标题栏与控制栏整体隐藏
+ *
+ * 壁纸模式下窗口就是桌面背景，鼠标输入也不再转发（attach 里 forwardMouseInput: false），
+ * 界面上的按钮点不到，留着只会挡画面 —— 全部操作走托盘菜单。
+ * 用 !important 压掉组件自己的 `position: fixed` / opacity 之类。
+ *
+ * 它管的是**多个组件**（标题栏、控制栏），所以不能放进任何一个组件的 scoped 里。
+ */
+.wm-hidden {
+  display: none !important;
+}
