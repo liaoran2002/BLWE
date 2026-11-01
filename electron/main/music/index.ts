@@ -14,7 +14,6 @@ import type {
   ParsedSong,
   PlaylistDetail,
 } from '@common/types/musicSdk'
-import { MUSIC_SOURCE_NAMES } from '@common/types/musicSdk'
 import { detectSource } from './utils'
 import * as tx from './sources/tx'
 import * as wy from './sources/wy'
@@ -37,7 +36,7 @@ export { detectSource }
 /**
  * 判断音源是否已接入
  *
- * 酷狗(kg) 在类型里是合法音源，但本版本尚未移植其解析实现，
+ * kg(kg) 在类型里是合法音源，但本版本尚未移植其解析实现，
  * 这里显式挡掉，避免传入后抛「undefined is not a function」这种莫名错误。
  */
 const isSupported = (source: MusicSource): source is SupportedSource =>
@@ -46,7 +45,7 @@ const isSupported = (source: MusicSource): source is SupportedSource =>
 /**
  * 解析歌单
  *
- * @param params.input  歌单分享链接或歌单 ID（网易云支持 `链接###token`）
+ * @param params.input  歌单分享链接或歌单 ID（wy 支持 `链接###token`）
  * @param params.source 不传则按链接 host 自动识别
  * @param params.page   页码，默认 1
  */
@@ -68,16 +67,16 @@ export const resolvePlaylist = async (
         )
       }
       throw new Error(
-        '无法识别这个链接属于哪个音乐平台。目前支持 网易云音乐 / QQ音乐 / 酷我音乐 的歌单分享链接',
+        `无法识别这个链接属于哪个音乐平台。目前支持 ${SUPPORTED_SOURCES.join(' / ')} 的歌单分享链接`,
       )
     }
     source = detected
   }
 
   if (!isSupported(source)) {
-    const name = MUSIC_SOURCE_NAMES[source] ?? source
+    // 界面上只用短码（wy / tx / kw），不出现平台全名
     throw new Error(
-      `${name} 的歌单解析尚未接入（当前已支持：${SUPPORTED_SOURCES.map((s) => MUSIC_SOURCE_NAMES[s]).join(' / ')}）`,
+      `${source} 的歌单解析尚未接入（当前已支持：${SUPPORTED_SOURCES.join(' / ')}）`,
     )
   }
 
@@ -90,7 +89,7 @@ export const resolvePlaylist = async (
 /**
  * 能解析单曲的音源
  *
- * 和 `SOURCES` 分开是因为**能力不一样**：酷我（以及未接入的酷狗）只有
+ * 和 `SOURCES` 分开是因为**能力不一样**：kw（以及未接入的 kg）只有
  * 「这链接是不是单曲」的判断，没有单曲详情接口 —— 混在一张表里会让
  * `SOURCES[source].getSongDetail` 在类型上变成「可能不存在」。
  */
@@ -114,7 +113,7 @@ export const classifyMusicInput = (raw: string): 'playlist' | 'song' | null => {
   const source = detectSource(raw)
   if (!source) return null
   /**
-   * 未接入的音源（酷狗）一律当歌单：真去导入时那边会报「XX 的歌单解析尚未接入」，
+   * 未接入的音源（kg）一律当歌单：真去导入时那边会报「XX 的歌单解析尚未接入」，
    * 比这里说「没认出这是什么」准确 —— 链接明明是认得的，只是还没做。
    */
   if (!isSupported(source)) return 'playlist'
@@ -125,7 +124,7 @@ export const classifyMusicInput = (raw: string): 'playlist' | 'song' | null => {
  * 解析**单曲**（拖入单曲链接用）
  *
  * 拿到的只是一首歌的元信息（歌名 / 歌手 / 时长 / 封面）。
- * 播放不走这里 —— 和歌单里的每一首歌一样，真正播的是 B 站上搜到的那支 MV。
+ * 播放不走这里 —— 和歌单里的每一首歌一样，真正播的是某站上搜到的那支 MV。
  */
 export const resolveSong = async (
   input: string,
@@ -136,13 +135,12 @@ export const resolveSong = async (
   const source = detectSource(raw)
   if (!source) {
     throw new Error(
-      '无法识别这个链接属于哪个音乐平台。目前支持 网易云音乐 / QQ音乐 / 酷我音乐 的单曲链接',
+      `无法识别这个链接属于哪个音乐平台。目前支持 ${Object.keys(SOURCES).join(' / ')} 的单曲链接`,
     )
   }
   if (!isSongSupported(source)) {
-    const name = MUSIC_SOURCE_NAMES[source] ?? source
     throw new Error(
-      `${name}的单曲链接还没接入。可以拖歌单链接，或在歌单管理里手动添加这首歌`,
+      `${source} 的单曲链接还没接入。可以拖歌单链接，或在歌单管理里手动添加这首歌`,
     )
   }
 

@@ -9,7 +9,7 @@
  *  Electron 里覆盖内置的 file 协议要自己重写整套文件服务（MIME、目录穿越、范围请求…），
  *  而 `protocol.handle` + `registerSchemesAsPrivileged` 是官方支持的路子；
  *  注册成 standard + secure 之后，页面的 origin 是 `blwe://app`，
- *  fetch / MSE / CORS 的行为和 https 页面一致（B 站 CDN 是 `Access-Control-Allow-Origin: *`，
+ *  fetch / MSE / CORS 的行为和 https 页面一致（某站 CDN 是 `Access-Control-Allow-Origin: *`，
  *  所以跨域取流不受影响 —— 打包后实测过能正常出画）。
  *
  * 踩坑提醒：

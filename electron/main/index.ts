@@ -324,7 +324,7 @@ function createMainWindow(): void {
     height: initialHeight,
     minWidth: 800,
     minHeight: 450,
-    title: 'B站音乐视频',
+    title: '某站音乐视频',
     frame: false,
     center: true,
     /**
@@ -1079,7 +1079,7 @@ function createLoginWindow(): void {
   })
 
   /**
-   * 登录窗口加载的是真实 B 站页面，必须自己带护栏
+   * 登录窗口加载的是真实某站页面，必须自己带护栏
    *
    * 主窗口那套 `setWindowOpenHandler` + `will-navigate` 是给自家页面用的，
    * 远程页面一旦 window.open / 被重定向，就会开出应用不跟踪的新窗口
@@ -1134,7 +1134,7 @@ function createLoginWindow(): void {
    *  2. **接口裁定** —— cookie 存在不代表登录有效（可能被风控或已过期），
    *     清掉 nav 缓存后问一次 `isLogin`，以接口为准。
    *
-   * 之所以不能只靠 `did-navigate`：B 站登录可能走 SPA 内部跳转，
+   * 之所以不能只靠 `did-navigate`：某站登录可能走 SPA 内部跳转，
    * 用户也可能登录完直接手动关窗 —— 这两条路都触发不了导航事件，
    * 于是「登录成功」没人告诉主进程，必须重启一次才生效。
    *
@@ -1189,7 +1189,7 @@ function createLoginWindow(): void {
 
   loginWindow.webContents.on('dom-ready', () => {
     if (!loginWindow || loginWindow.isDestroyed()) return
-    // dom-ready 每次主框架导航都会触发（登录成功后 B 站自己就会跳一次），
+    // dom-ready 每次主框架导航都会触发（登录成功后某站自己就会跳一次），
     // 不判重就会叠出好几个关闭按钮和倒计时（文字重影）
     void loginWindow.webContents
       .executeJavaScript(
@@ -1270,7 +1270,7 @@ function createLoginWindow(): void {
  */
 function refreshTray(): void {
   if (!tray || tray.isDestroyed()) return
-  // 视频标题里可能带 B 站搜索的 <em> 高亮标签，托盘提示要的是纯文本
+  // 视频标题里可能带某站搜索的 <em> 高亮标签，托盘提示要的是纯文本
   const title = (trayTitle || '未在播放').replace(/<[^>]*>/g, '').trim() || '未在播放'
   /**
    * 悬浮提示要说**现在的**左键行为
@@ -1872,7 +1872,7 @@ async function restoreWindow(): Promise<void> {
 function createTray(): void {
   const icon = loadIcon('bili.ico')
   tray = new Tray(icon)
-  tray.setToolTip('B站音乐视频')
+  tray.setToolTip('某站音乐视频')
   /**
    * 左键：直接显示窗口
    *
@@ -1967,7 +1967,7 @@ async function grabCookiesSilently(): Promise<void> {
     })
     cookieWindow.webContents.on('did-fail-load', () => wrappedSettle())
     cookieWindow.webContents.on('render-process-gone', () => wrappedSettle())
-    // 隐藏窗口加载的是真实 B 站页面：不许它开新窗口（弹出来会凭空出现在用户桌面上）
+    // 隐藏窗口加载的是真实某站页面：不许它开新窗口（弹出来会凭空出现在用户桌面上）
     cookieWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     cookieWindow.webContents.on('will-navigate', (event, url) => {
       if (!url.startsWith('https://www.bilibili.com/')) event.preventDefault()
@@ -1976,7 +1976,7 @@ async function grabCookiesSilently(): Promise<void> {
   })
 }
 
-/** 清除 B 站登录态 cookie */
+/** 清除某站登录态 cookie */
 async function executeLogout(): Promise<void> {
   isLoggedIn = false
   biliApi.clearNavData()
@@ -2181,7 +2181,7 @@ void app.whenReady().then(async () => {
   )
 
   /**
-   * 给 B 站媒体直链的响应**统一改** CORS 头
+   * 给某站媒体直链的响应**统一改** CORS 头
    *
    * 渲染层是用 `fetch()` 把 dash 音视频流拉下来喂给 MSE 的（见 `src/utils/dashPlayer.ts`），
    * 所以受同源策略约束。实测两种翻车：

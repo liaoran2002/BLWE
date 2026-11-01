@@ -1,5 +1,5 @@
 /**
- * QQ音乐歌单解析
+ * tx 歌单解析
  *
  * 移植自 lx-music-desktop 的 src/renderer/utils/musicSdk/tx/songList.js
  *
@@ -142,7 +142,7 @@ const getListDetailNew = async (id: string): Promise<PlaylistDetail> => {
   )
 
   if (body.code !== 0 || body.req_1?.code !== 0 || !body.req_1.data) {
-    throw new Error('QQ音乐歌单接口返回异常')
+    throw new Error('tx 歌单接口返回异常')
   }
 
   const data = body.req_1.data
@@ -185,7 +185,7 @@ const getListDetailOld = async (id: string): Promise<PlaylistDetail> => {
 
   const cdlist = body.cdlist?.[0]
   if (body.code !== 0 || !cdlist) {
-    throw new Error('QQ音乐歌单接口返回异常（旧接口）')
+    throw new Error('tx 歌单接口返回异常（旧接口）')
   }
 
   const songs = mapSongs(cdlist.songlist)
@@ -226,11 +226,11 @@ const getListId = async (rawInput: string): Promise<string> => {
     const afterRedirect = /\/playlist\/(\d+)/.exec(id)
     if (afterRedirect) return afterRedirect[1]
 
-    throw new Error('无法从该链接中解析出 QQ音乐歌单 ID，请直接粘贴歌单 ID')
+    throw new Error('无法从该链接中解析出 tx 歌单 ID，请直接粘贴歌单 ID')
   }
 
   if (!/^\d+$/.test(id)) {
-    throw new Error('QQ音乐歌单 ID 应为纯数字')
+    throw new Error('tx 歌单 ID 应为纯数字')
   }
   return id
 }
@@ -256,7 +256,7 @@ export const getListDetail = async (
       }
     },
     2,
-    'QQ音乐歌单解析',
+    'tx 歌单解析',
   ).then((detail) => ({ ...detail, page }))
 }
 
@@ -294,7 +294,7 @@ export const getSongId = (rawInput: string): string => {
   if (byQuery) return byQuery[1]
   /** 裸 mid：QQ 的 songmid 是大小写字母 + 数字，长度固定 14 */
   if (/^[A-Za-z0-9]{10,20}$/.test(input)) return input
-  throw new Error('无法从该链接中解析出 QQ 音乐歌曲 mid，请直接粘贴歌曲页链接')
+  throw new Error('无法从该链接中解析出 tx 歌曲 mid，请直接粘贴歌曲页链接')
 }
 
 /**
@@ -302,7 +302,7 @@ export const getSongId = (rawInput: string): string => {
  *
  * 移植自 LX 的 `musicSdk/tx/musicInfo.js`（接口是 `music.pf_song_detail_svr`
  * 的 `get_song_detail_yqq`）。LX 那版还会顺手算出各码率的文件大小，
- * 本项目不需要（播放走 B 站 MV，不从这里拿音频地址），所以只取歌曲本体。
+ * 本项目不需要（播放走某站 MV，不从这里拿音频地址），所以只取歌曲本体。
  *
  * `track_info` 的结构和列表接口里的歌曲项一致 —— 直接复用 `toSong()`，
  * 保证「从歌单来的」和「从单曲链接来的」两条路产出的字段完全一样
@@ -332,7 +332,7 @@ export const getSongDetail = async (songmid: string): Promise<ParsedSong | null>
   )
 
   if (body.code !== 0 || body.req?.code !== 0) {
-    throw new Error('QQ 音乐歌曲详情接口返回异常（歌曲可能已下架或需要会员）')
+    throw new Error('tx 歌曲详情接口返回异常（歌曲可能已下架或需要会员）')
   }
   const item = body.req?.data?.track_info
   if (!item) return null

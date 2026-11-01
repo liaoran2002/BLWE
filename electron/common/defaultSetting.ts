@@ -38,7 +38,7 @@ const defaultSetting = {
    * 用户多半是重复设同一个时长（比如每天睡前 1 小时）。
    */
   'common.sleepTimerHours': 0,
-  'common.sleepTimerMinutes': 0,
+  'common.sleepTimerMinutes': 30,
   /**
    * 定时暂停：三个复选框的上次选择
    *
@@ -64,9 +64,9 @@ const defaultSetting = {
    */
   'common.glassTransparency': 30,
   /**
-   * 控制栏闲置透明度（0-100），默认 10
+   * 控制栏闲置透明度（0-100），默认 30
    *
-   * 10% = 改造前写死的 `--ui-idle-opacity: 0.1`，所以老用户观感不变。
+   * 30% = 改造前写死的 `--ui-idle-opacity: 0.3`，所以老用户观感不变。
    * 鼠标悬停时会变成完全不透明，这个值只管「闲着的时候淡到多透明」。
    */
   'common.idleOpacity': DEFAULT_IDLE_OPACITY,
@@ -74,7 +74,7 @@ const defaultSetting = {
    * 模糊强度：`backdrop-filter: blur(Npx)` 的 N（0-20）
    * 界面上显示成百分比（50% = 10px），存的是这个 px 值
    */
-  'common.glassBlur': 10,
+  'common.glassBlur': 30,
   /**
    * 阴影强度：文字阴影的模糊半径（0-20 px，界面显示成百分比：8px = 40%）
    * 8 就是原来的「0 1px 4px + 0 0 8px」
@@ -95,8 +95,19 @@ const defaultSetting = {
   'common.customAspectRatios': [],
   // #endregion
 
+  // #region ui
+  /**
+   * 界面字号缩放（百分比，-50 ~ 50，步进 10）
+   *
+   * 0 = 原样。落地成 CSS 变量 `--fs = 1 + 值/100`，每处 `font-size` 写成
+   * `calc(13px * var(--fs))` —— 放大的只是字，间距和布局不动。
+   *
+   */
+  'ui.fontScale': 30,
+  // #endregion
+
   // #region player
-  'player.volume': 70,
+  'player.volume': 75,
   'player.isMute': false,
   'player.loopMode': 'listLoop',
   /**
@@ -108,7 +119,7 @@ const defaultSetting = {
   'player.resumeOnStart': true,
   /** 上次播放到的秒数 */
   'player.resumeTime': 0,
-  /** 当前在播的 B 站视频列表 id；空 = 在播音乐歌单 */
+  /** 当前在播的某站视频列表 id；空 = 在播音乐歌单 */
   'player.activeVideoListId': '',
   /**
    * 默认列表的 id（拖入单条视频的落点）

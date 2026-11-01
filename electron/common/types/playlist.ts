@@ -3,7 +3,7 @@
  *
  * 从「单个歌单」升级为「歌单集合」，并补上：
  *  - 自动同步策略（启动时 / 定时）
- *  - 每首歌已选定的 B 站视频（bvId），用于续播时优先还原上次看的那个视频
+ *  - 每首歌已选定的某站视频（bvId），用于续播时优先还原上次看的那个视频
  *  - 每个歌单自己的播放位置，切歌单不丢进度
  */
 
@@ -42,7 +42,7 @@ export interface PlaylistSong {
   name: string
   singer: string
   album?: string
-  /** 音乐平台给的专辑封面；可能为空（如酷我列表接口不返回封面） */
+  /** 音乐平台给的专辑封面；可能为空（如 kw 列表接口不返回封面） */
   cover?: string | null
   /**
    * 时长（**秒**）
@@ -53,7 +53,7 @@ export interface PlaylistSong {
    */
   duration?: number | null
   /**
-   * 平台侧歌曲 id（QQ 数字 id / 网易云 id / 酷我 rid）
+   * 平台侧歌曲 id（QQ 数字 id / wy id / kw rid）
    *
    * 歌单导入时从音源带过来，**取歌词时用它精确定位** ——
    * 不用拿「歌名 + 歌手」重新搜（那是模糊搜索，可能搜到别的版本，
@@ -63,7 +63,7 @@ export interface PlaylistSong {
   /** 来源音源（`wy` / `tx` / `kw`），与 `platformId` 配对 */
   source?: string
   /**
-   * ★ B 站视频列表条目的 bvid
+   * ★某站视频列表条目的 bvid
    *
    * 只有「视频列表」来源的条目才有这个字段。渲染层据此判断：
    *  - `getSongParts()` 直接返回 `bv:<bvid>`（主进程据此短路，不联网搜索）；
@@ -135,13 +135,13 @@ export const sourceOfSongId = (id: string): string | null => {
  * ## 形态：`音源_平台id`
  *
  * 形如 `tx_002dNLgZ2dk7sy` / `wy_1234567`。带音源前缀是**必须的** ——
- * 各平台的 id 空间独立，QQ 的 `123` 和酷我的 `123` 是两首完全不同的歌，
+ * 各平台的 id 空间独立，QQ 的 `123` 和 kw 的 `123` 是两首完全不同的歌，
  * 不带前缀会静默撞在一起。
  *
  * ## ⚠️ 它**只用于 `songs` 表**
  *
  * `videos.search_key` / `song_meta.search_key` 存的是**歌名**
- * （见 `toCacheKey`）—— 那些表要拿键去**搜 B站**，用 id 搜不出任何东西。
+ * （见 `toCacheKey`）—— 那些表要拿键去**搜 某站**，用 id 搜不出任何东西。
  *
  * 这个 id 的唯一用途是让「同一首歌」在两个歌单里只占 songs 表**一行**。
  *
@@ -204,7 +204,7 @@ export const platformIdOfSongId = (id: string): string | null => {
  *
  * ## ⚠️ 它**不是搜索词**（这两个概念最容易混）
  *
- * 真正发给 B 站的是 `歌名 歌曲 歌手`（见 `buildPrimaryKeyword`，**不带引号**），
+ * 真正发给某站的是 `歌名 歌曲 歌手`（见 `buildPrimaryKeyword`，**不带引号**），
  * 而这个只是数据库里用来标识"哪首歌的搜索结果"的**主键**：
  * `videos.search_key` / `song_meta.search_key` 的值。
  *
@@ -423,7 +423,7 @@ export interface PlaylistSaveParams {
   currentId: string | null
 }
 
-// #region 视频列表（B 站收藏夹 / 合集 / 系列）
+// #region 视频列表（某站收藏夹 / 合集 / 系列）
 
 /**
  * 视频列表的来源类型
@@ -436,8 +436,8 @@ export type VideoListKind = 'fav' | 'season' | 'series' | 'local'
 /**
  * 条目来源
  *
- *  - `sync`：从 B 站列表拉下来的，下次同步以远端为准；
- *  - `local`：用户手动「添加视频」加进来的，B 站上没有它 ——
+ *  - `sync`：从某站列表拉下来的，下次同步以远端为准；
+ *  - `local`：用户手动「添加视频」加进来的，某站上没有它 ——
  *    同步时**必须保留**，否则一次同步就把它删了（而且再也找不回来）。
  */
 export type VideoListOrigin = 'sync' | 'local'
@@ -449,6 +449,9 @@ export type VideoListOrigin = 'sync' | 'local'
  *  - `PlaylistRecord.songs` 是「歌」，还要再经过搜索才能变成视频；
  *  - 这里的成员**直接就是视频**（bvid），成员存在 `videolist_items`。
  */
+/** 视频列表的同步策略，取值与音乐歌单的 `PlaylistSyncMode` 对齐 */
+export type VideoListSyncMode = 'off' | 'startup' | 'interval'
+
 export interface VideoListRecord {
   /** 'bv_fav_123456' / 'bv_season_789' / 'bv_series_456' */
   id: string
@@ -462,8 +465,15 @@ export interface VideoListRecord {
   cover: string | null
   /** 远端报告的总条数（可能大于实际拉到的条数） */
   itemCount: number | null
-  /** 重新同步策略：默认 off（手动刷新），避免每次启动都打一串接口 */
-  syncMode: 'off' | 'manual'
+  /**
+   * 重新同步策略（和音乐歌单同一套语义）
+   *
+   * `off` 手动同步 / `startup` 每次启动时同步 / `interval` 定时自动同步。
+   * 默认 `off`：几百条的视频列表同步一次要打几十个分页请求，不该默默替用户做。
+   */
+  syncMode: VideoListSyncMode
+  /** 定时同步的间隔（毫秒）；只有 `interval` 模式有意义，其余为 0 */
+  syncIntervalMs: number
   lastSyncAt: number | null
   /** 播到第几条（下标）；同步后由主进程按 bvid 重定位 */
   lastIndex: number
@@ -478,6 +488,85 @@ export interface VideoListRecord {
    */
   isDefault?: boolean
 }
+
+/**
+ * 一条视频的**元数据**（导入预览与落库共用）
+ *
+ * 就是 `videos` 表里那些「这个视频是什么」的列，不含播放地址：
+ * 地址要等第一次播放时才解析（一次性预取几百个地址既慢又招风控）。
+ *
+ * 预览接口把条目按这个形状交给渲染层确认，确认后再原样传回来落库 ——
+ * 这样「预览看到的」和「真正写进去的」是同一份数据，中途不会再打一次接口。
+ */
+export interface VideoMetaInput {
+  bvid: string
+  title: string
+  cover: string | null
+  author: string | null
+  /** 时长（秒） */
+  duration: number | null
+}
+
+/**
+ * 「添加歌曲」的导入预览（确认框的数据源，**不写库**）
+ *
+ * 单曲与整个歌单两种形状：确认框按它画「一首歌」或「歌单详情 + 曲目列表」。
+ * 用户点确定后，渲染层把 `song` / `songs` 原样传回主进程落库。
+ */
+export type MusicImportPreview =
+  | { type: 'song'; song: PlaylistSong }
+  | {
+      type: 'playlist'
+      /** 音源（wy / tx / kw），只用于界面标注 */
+      source: string
+      name: string
+      cover: string | null
+      author: string | null
+      songs: PlaylistSong[]
+    }
+  | { type: 'none' }
+
+/**
+ * 这个列表参不参与「自动同步」（启动同步 / 定时同步）
+ *
+ * 本地列表没有远端来源，平台列表里选了「手动同步」的也不参与 —— 和歌单的
+ * `isAutoSyncable` 是同一套判断。
+ */
+export const isVideoListAutoSyncable = (list: VideoListRecord): boolean =>
+  list.kind !== 'local' && !!list.sourceId && list.syncMode !== 'off'
+
+/** 视频列表的同步间隔（毫秒）；非定时模式返回 0 */
+export const getVideoListSyncInterval = (list: VideoListRecord): number =>
+  list.syncMode === 'interval' ? Math.max(0, list.syncIntervalMs || 0) : 0
+
+/** 此刻是否到了该同步的时间 */
+export const isVideoListSyncDue = (list: VideoListRecord, now: number): boolean => {
+  const interval = getVideoListSyncInterval(list)
+  if (!interval) return false
+  if (!list.lastSyncAt) return true
+  return now - list.lastSyncAt >= interval
+}
+
+/**
+ * 「添加视频」的导入预览（确认框的数据源，**不写库**）
+ *
+ * 单条视频与整个列表两种形状：确认框按它画「视频详情」或「列表详情 + 每条视频」。
+ * 用户点确定后，渲染层把 `item` / `items` 原样传回主进程落库 ——
+ * 这样确认框里看到的和写进去的是同一份数据，中途不会再打一次接口。
+ */
+export type VideoImportPreview =
+  | { type: 'video'; item: VideoMetaInput }
+  | {
+      type: 'list'
+      kind: VideoListKind
+      name: string
+      cover: string | null
+      itemCount: number | null
+      items: VideoMetaInput[]
+      /** 远端列表里不支持的条目（合集里的子合集 / 番剧）数量 */
+      skipped: number
+    }
+  | { type: 'none' }
 
 /** 视频列表里的一条（= 一个视频） */
 export interface VideoListItem {
@@ -502,7 +591,7 @@ export interface VideoListItem {
    * 本地视频文件的绝对路径（**只有** `lf_` 条目有）
    *
    * 给界面用：丢了文件时能告诉用户「本来在哪」，重新定位时也能拿它当对话框的
-   * 默认目录。B 站条目恒为 null。
+   * 默认目录。某站条目恒为 null。
    */
   localPath?: string | null
   /**
@@ -548,9 +637,9 @@ export interface ParsedListInput {
  * 「拖进窗口的那个东西」被认成了什么
  *
  * 拖入只有三种有意义的结果，各自对应一条完全不同的进料管：
- *  - `music` —— **音乐歌单**链接（网易云 / QQ音乐 / 酷我）→ 切 MV，导入歌单；
- *  - `list`  —— **B 站列表**（收藏夹 / 合集 / 系列）→ 切 OV，导入视频列表；
- *  - `video` —— **单条 B 站视频** → 切 OV，塞进默认列表。
+ *  - `music` —— **音乐歌单**链接（wy / tx / kw）→ 切 MV，导入歌单；
+ *  - `list`  —— **某站列表**（收藏夹 / 合集 / 系列）→ 切 OV，导入视频列表；
+ *  - `video` —— **单条某站视频** → 切 OV，塞进默认列表。
  *
  * 识别放在**主进程**（`utils/dropInput.ts`）：链接的正则、音源判定、BV 号规则
  * 本来就都在主进程，渲染层只负责按 `type` 调对应的一个接口。

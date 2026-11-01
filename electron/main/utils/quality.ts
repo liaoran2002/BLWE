@@ -1,15 +1,15 @@
 /**
- * 从 B 站 playurl 响应里读出「当前实际在播的视频清晰度」
+ * 从某站 playurl 响应里读出「当前实际在播的视频清晰度」
  *
  * 关键点：请求里写的 `qn`（本项目固定填 64）**不等于**真正拿到的清晰度 ——
- * B 站会按登录态、会员等级、视频可用档位做降级，所以要看响应自己报的 `quality`。
+ * 某站会按登录态、会员等级、视频可用档位做降级，所以要看响应自己报的 `quality`。
  *
  * 两条链路的字段位置不同：
  *  - `fnval: 16`（dash）：真正播的是 `dash.video[]` 里的某一条，清晰度是它的 `id`；
  *  - `fnval: 1`（durl，渐进式 mp4）：清晰度在顶层的 `data.quality`。
  *
  * 展示名直接用 `support_formats` 里的 `display_desc` / `new_description`，
- * 那是 B 站自己播放器显示的文字（例如「1080P」/「1080P 高清」/「1080P 60帧」），
+ * 那是某站自己播放器显示的文字（例如「1080P」/「1080P 高清」/「1080P 60帧」），
  * 比按分辨率反推更准确，也能区分 60 帧、高码率这些同分辨率的档位。
  */
 import { VIDEO_QUALITY_OPTIONS } from '@common/constants'
@@ -44,7 +44,7 @@ interface PlayUrlLike {
  * 直接复用 `@common/constants` 的档位表，**别再抄一份**：同一份映射写两处，
  * 以后加档位（比如 8K 的变体）只改一处就会出现「设置里叫 X、角标里叫 Y」。
  *
- * schema v4 之后这就是**唯一**的档位名来源（那条「优先用 B 站 support_formats
+ * schema v4 之后这就是**唯一**的档位名来源（那条「优先用某站 support_formats
  * 文案」的分支已经删掉 —— 内置表本来就覆盖了全部 12 档，而每行存一份映射纯属冗余）。
  */
 const QUALITY_LABELS: Record<number, string> = Object.fromEntries(
@@ -54,7 +54,7 @@ const QUALITY_LABELS: Record<number, string> = Object.fromEntries(
 /**
  * 从 durl 地址反推清晰度
  *
- * **为什么能这么干**：B 站的 durl 地址把档位编码在文件名里。实测 24/24 成立：
+ * **为什么能这么干**：某站的 durl 地址把档位编码在文件名里。实测 24/24 成立：
  *
  * ```
  * ...-1-192.mp4  -> quality 64   (64 + 128)
@@ -64,7 +64,7 @@ const QUALITY_LABELS: Record<number, string> = Object.fromEntries(
  * 也就是说 `quality = URL 里的那个数字 - 128`。schema v4 正是因此删掉了
  * `videos.quality` 列 —— 从 `durl_url` 反推即可，不丢信息。
  *
- * ⚠️ 这是 B 站的**命名约定而不是契约**，所以反推失败时返回 `null`
+ * ⚠️ 这是某站的**命名约定而不是契约**，所以反推失败时返回 `null`
  * （调用方会当作「读不出档位」），**绝不猜一个值** ——
  * 宁可角标空着，也不要显示一个错的清晰度。
  */

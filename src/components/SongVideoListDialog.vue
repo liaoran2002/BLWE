@@ -85,7 +85,7 @@
         >
           <div class="index">{{ row.index + 1 }}</div>
 
-          <!-- 封面：歌单取平台专辑图，视频取 B 站缩略图 -->
+          <!-- 封面：歌单取平台专辑图，视频取某站缩略图 -->
           <div class="cover">
             <img
               v-if="coverOf(row.item) && !failedCovers[coverOf(row.item) as string]"
@@ -180,7 +180,7 @@ import { useQueueStore } from '../stores/queue';
 import { usePlaybackStore } from '../stores/playback';
 
 /**
- * 视频列表项（B 站搜索结果）
+ * 视频列表项（某站搜索结果）
  *
  * 只声明界面真正用到的展示字段。解析结果（播放地址）由主进程单独给出，
  * 不再整包回传到渲染层。
@@ -188,14 +188,14 @@ import { usePlaybackStore } from '../stores/playback';
 export interface VideoListItem {
   bvid: string;
   title: string;
-  /** B 站缩略图 */
+  /** 某站缩略图 */
   pic?: string | null;
   /** UP 主名 */
   author?: string | null;
   /**
    * 时长**秒数**（`null` / 缺省 = 未知）
    *
-   * B站搜索原始给的是 `"4:03"`，但主进程 `biliApi.extract` 在入口就转成秒了，
+   * 某站搜索原始给的是 `"4:03"`，但主进程 `biliApi.extract` 在入口就转成秒了，
    * 所以到渲染层这里**只可能是数字**。
    */
   duration?: number | null;
@@ -254,7 +254,7 @@ const haystackOf = (item: ListItem): string => {
  * 时长文案（**秒 -> `mm:ss`**）
  *
  * ⚠️ 数据源头已经统一成**秒**了：
- *  - B站搜索给的 `"4:03"` 在 `biliApi.extract` 入口就转成了秒；
+ *  - 某站搜索给的 `"4:03"` 在 `biliApi.extract` 入口就转成了秒；
  *  - 库里 `videos.duration` 一直是秒；
  *  - 歌单里的 `PlaylistSong.duration` 也是秒。
  *
@@ -429,7 +429,7 @@ export default defineComponent({
     /**
      * 标题 HTML
      *
-     * 视频项保留 B 站的 `<em>` 关键词高亮（这是原始行为，必须保留）；
+     * 视频项保留某站的 `<em>` 关键词高亮（这是原始行为，必须保留）；
      * 歌单项没有搜索词可高亮，但同样走净化，避免曲目名里的 `<` 之类被当成标签。
      */
     titleHtmlOf(item: ListItem): string {
@@ -444,7 +444,7 @@ export default defineComponent({
     albumOf(item: ListItem): string {
       return isVideoItem(item) ? '' : (item.album ?? '');
     },
-    /** 封面：歌单用平台专辑图，视频用 B 站缩略图 */
+    /** 封面：歌单用平台专辑图，视频用某站缩略图 */
     coverOf(item: ListItem): string | null {
       const f = fieldsOf(item)
       return normalizeImageUrl(f.pic ?? f.cover);
@@ -657,7 +657,7 @@ export default defineComponent({
   white-space: nowrap;
 }
 .lt-count {
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   opacity: 0.55;
 }
 
@@ -702,7 +702,7 @@ export default defineComponent({
   text-align: center;
   padding: 4px 0;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   background: rgba(var(--text-rgb), 0.16);
   border: 1px solid rgba(var(--text-rgb), 0.22);
   color: var(--panel-text);
@@ -743,13 +743,13 @@ export default defineComponent({
   min-width: 0;
 }
 .lists .title {
-  font-size: 13px;
+  font-size: calc(13px * var(--fs));
   line-height: 1.4;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* B 站搜索结果里的关键词高亮（<em class="keyword">），保留原有观感 */
+/*某站搜索结果里的关键词高亮（<em class="keyword">），保留原有观感 */
 .lists .title :deep(em),
 .lists .title em {
   font-style: normal;
@@ -761,7 +761,7 @@ export default defineComponent({
   align-items: center;
   gap: 8px;
   margin-top: 2px;
-  font-size: 11px;
+  font-size: calc(11px * var(--fs));
   opacity: 0.7;
   overflow: hidden;
 }
@@ -791,14 +791,14 @@ export default defineComponent({
   flex: none;
   padding: 0 5px;
   border-radius: 3px;
-  font-size: 10px;
+  font-size: calc(10px * var(--fs));
   line-height: 15px;
   color: #fff;
   background: var(--accent-danger);
 }
 .lists .duration {
   flex: none;
-  font-size: 11px;
+  font-size: calc(11px * var(--fs));
   opacity: 0.6;
   font-variant-numeric: tabular-nums;
 }
@@ -806,7 +806,7 @@ export default defineComponent({
 /* 过滤后一条都不剩 / 列表本身为空 */
 .lists li.empty {
   justify-content: center;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   opacity: 0.55;
   cursor: default;
 }

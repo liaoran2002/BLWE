@@ -762,7 +762,7 @@ export const convertPlaylistToLocal = (id: string): PlaylistRecord => {
 /**
  * ★ 按**内存歌单**里的一首歌查时长（秒）
  *
- * 用途：搜索 B站 MV 时按「视频时长 vs 歌曲时长 ±90 秒」过滤候选
+ * 用途：搜索 某站 MV 时按「视频时长 vs 歌曲时长 ±90 秒」过滤候选
  * （见 `biliApi.searchSongFiltered`）—— 时长差太多的多半不是同一首歌。
  *
  * 遍历所有歌单里的所有曲目，取第一个匹配的。**遍历内存里的 data**

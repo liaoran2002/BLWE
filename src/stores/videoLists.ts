@@ -1,5 +1,5 @@
 /**
- * B 站视频列表 store（渲染进程）
+ * 某站视频列表 store（渲染进程）
  *
  * ## 它和 `playlists` store 是**并列**关系，不是父子
  *
@@ -34,7 +34,14 @@ import type {
   VideoListItem,
   VideoListKind,
   VideoListRecord,
+  VideoListSyncMode,
   VideoListSyncResult,
+  VideoMetaInput,
+} from '@common/types/playlist'
+import {
+  getVideoListSyncInterval,
+  isVideoListAutoSyncable,
+  isVideoListSyncDue,
 } from '@common/types/playlist'
 
 export const useVideoListStore = defineStore('videoLists', () => {
@@ -107,11 +114,56 @@ export const useVideoListStore = defineStore('videoLists', () => {
     return ok
   }
 
-  /** 「添加视频」：解析链接后插到列表最前（置顶区） */
-  const addItem = async (id: string, input: string): Promise<VideoListItem> => {
-    const item = await api.addVideoListItem(id, input)
+  /**
+   * 「添加视频」第一步：解析成预览数据（**不写库**）
+   *
+   * 单条 → 视频详情；合集 / 收藏夹 / 系列 → 列表详情 + 每条视频。
+   * 界面拿它画确认框，用户点确定后再调 `addItem` / `addItems` 落库。
+   */
+  const previewImport = (input: string) => api.previewVideoImport(input)
+
+  /** 第二步（单条）：把确认过的那一条放进本地列表（置顶） */
+  const addItem = async (id: string, item: VideoMetaInput) => {
+    const result = await api.addVideoListItem(id, item)
     await load()
-    return item
+    return result
+  }
+
+  /** 第二步（批量）：把确认过的一批追加到本地列表末尾（只增不删） */
+  const addItems = async (id: string, items: VideoMetaInput[]) => {
+    const result = await api.addVideoListItems(id, items)
+    await load()
+    return result
+  }
+
+  /**
+   * 平台列表 → 本地列表
+   *
+   * 主进程会换一个 id（`bv_local_` 开头）并把条目整体搬过去。
+   * 这里顺手把 `activeId` 重映射 —— 否则「正在播的列表」会指向一个已经不存在的 id，
+   * 下一次写播进度就写到空处了（`player.activeVideoListId` 主进程已经改好）。
+   */
+  const convertToLocal = async (id: string): Promise<{ id: string; name: string }> => {
+    const result = await api.convertVideoListToLocal(id)
+    if (activeId.value === id) activeId.value = result.id
+    await load()
+    return result
+  }
+
+  /**
+   * 设置同步方式（和音乐歌单一样三档）
+   *
+   * `off` 手动同步 / `startup` 每次启动时同步 / `interval` 定时自动同步。
+   * 定时模式下 `intervalMs` 才算数。
+   */
+  const setSyncMode = async (
+    id: string,
+    mode: VideoListSyncMode,
+    intervalMs = 0,
+  ): Promise<boolean> => {
+    const ok = await api.setVideoListSyncMode(id, mode, intervalMs)
+    if (ok) await load()
+    return ok
   }
 
   /**
@@ -174,6 +226,66 @@ export const useVideoListStore = defineStore('videoLists', () => {
   }
 
   /**
+   * 批量同步（串行）
+   *
+   * 视频列表一次同步要打几十个分页请求，并发只会更快触发某站风控；
+   * 所以一条一条来，失败的不打断后面的。
+   */
+  const syncMany = async (ids: string[]): Promise<VideoListSyncResult[]> => {
+    const results: VideoListSyncResult[] = []
+    for (const id of ids) {
+      try {
+        results.push(await sync(id))
+      } catch (err) {
+        results.push({
+          id,
+          name: find(id)?.name ?? id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+    return results
+  }
+
+  /** 立即同步所有「参与自动同步」的平台列表（手动同步的不动） */
+  const syncAll = (): Promise<VideoListSyncResult[]> =>
+    syncMany(lists.value.filter(isVideoListAutoSyncable).map((item) => item.id))
+
+  /** 启动时需要同步的列表 id */
+  const getStartupSyncIds = (): string[] =>
+    lists.value
+      .filter((item) => isVideoListAutoSyncable(item) && item.syncMode === 'startup')
+      .map((item) => item.id)
+
+  /** 启动时按每个列表自己的策略同步 */
+  const syncOnStartupIfNeeded = async (): Promise<VideoListSyncResult[]> => {
+    const ids = getStartupSyncIds()
+    if (ids.length === 0) return []
+    return syncMany(ids)
+  }
+
+  /** 当前到点该做定时同步的列表 id */
+  const getDueSyncIds = (now = Date.now()): string[] =>
+    lists.value
+      .filter((item) => isVideoListAutoSyncable(item) && isVideoListSyncDue(item, now))
+      .map((item) => item.id)
+
+  /** 是否存在「定时同步」的列表（没有就不必让心跳管这边） */
+  const hasIntervalSync = computed(() =>
+    lists.value.some((item) => getVideoListSyncInterval(item) > 0),
+  )
+
+  /** 定时列表里最小的间隔（心跳按它走） */
+  const minSyncInterval = computed(() => {
+    const values = lists.value
+      .filter((item) => isVideoListAutoSyncable(item))
+      .map(getVideoListSyncInterval)
+      .filter((ms) => ms > 0)
+    return values.length > 0 ? Math.min(...values) : 0
+  })
+
+  /**
    * 列表条目（已在库里，不联网）
    *
    * 返回的就是播放队列能直接吃的东西 —— 不需要再转一次形状。
@@ -199,8 +311,18 @@ export const useVideoListStore = defineStore('videoLists', () => {
     remove,
     createLocal,
     rename,
+    previewImport,
     addItem,
+    addItems,
     addItemToDefault,
+    convertToLocal,
+    setSyncMode,
+    syncMany,
+    syncAll,
+    syncOnStartupIfNeeded,
+    getDueSyncIds,
+    hasIntervalSync,
+    minSyncInterval,
     importLocal,
     removeItem,
     setFavorite,

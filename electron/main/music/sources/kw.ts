@@ -1,5 +1,5 @@
 /**
- * 酷我音乐歌单解析
+ * kw 歌单解析
  *
  * 移植自 lx-music-desktop 的 src/renderer/utils/musicSdk/kw/songList.js
  *
@@ -57,13 +57,13 @@ const getListId = (rawInput: string): string => {
 
   // 波点分享链接：本项目未移植，明确报错
   if (/\/bodian\//.test(input)) {
-    throw new Error('暂不支持酷我「波点」类型的分享链接，请改用普通歌单链接或歌单 ID')
+    throw new Error('暂不支持 kw「波点」类型的分享链接，请改用普通歌单链接或歌单 ID')
   }
 
   const digest = parseDigestId(input)
   if (digest) {
     if (digest.digest === '13') {
-      throw new Error('暂不支持酷我专辑链接，请改用歌单链接')
+      throw new Error('暂不支持 kw 专辑链接，请改用歌单链接')
     }
     // digest 5 / 8 都能落到同一个歌单详情接口
     return digest.id
@@ -72,13 +72,13 @@ const getListId = (rawInput: string): string => {
   if (/[?&:/]/.test(input)) {
     const match = LIST_DETAIL_LINK.exec(input)
     if (!match) {
-      throw new Error('无法从该链接中解析出酷我歌单 ID，请直接粘贴歌单 ID')
+      throw new Error('无法从该链接中解析出 kw 歌单 ID，请直接粘贴歌单 ID')
     }
     return match[1]
   }
 
   if (!/^\d+$/.test(input)) {
-    throw new Error('酷我歌单 ID 应为纯数字')
+    throw new Error('kw 歌单 ID 应为纯数字')
   }
   return input
 }
@@ -94,13 +94,13 @@ const mapSongs = (songs: KwRawSong[] | undefined): ParsedSong[] => {
   for (const item of songs) {
     const song = toParsedSong(SOURCE, {
       name: decodeName(item.name),
-      // 酷我返回的 singer 字段名是 artist
+      // kw 返回的 singer 字段名是 artist
       singer: formatSingerName(decodeName(item.artist)),
       interval: formatPlayTime(parseInt(String(item.duration ?? ''), 10)),
       albumName: decodeName(item.album),
-      // 酷我列表接口不返回封面，这里留空（播放时用视频封面兜底）
+      // kw 列表接口不返回封面，这里留空（播放时用视频封面兜底）
       cover: null,
-      /** 酷我的歌曲 rid —— 取歌词要用它 */
+      /** kw 的歌曲 rid —— 取歌词要用它 */
       platformId: item.id ?? null,
     })
     if (song) result.push(song)
@@ -125,12 +125,12 @@ export const getListDetail = async (
       })
 
       if (body.result !== 'ok') {
-        throw new Error('酷我歌单接口返回异常')
+        throw new Error('kw 歌单接口返回异常')
       }
 
       const songs = mapSongs(body.musiclist)
       if (songs.length === 0) {
-        throw new Error('该酷我歌单没有解析到任何歌曲（歌单可能为空或已失效）')
+        throw new Error('该 kw 歌单没有解析到任何歌曲（歌单可能为空或已失效）')
       }
 
       return {
@@ -151,7 +151,7 @@ export const getListDetail = async (
       }
     },
     2,
-    '酷我歌单解析',
+    'kw 歌单解析',
   )
 }
 
@@ -160,12 +160,12 @@ export const getListDetail = async (
 /**
  * 这个链接是不是**单曲**
  *
- * 酷我的单曲页是 `https://www.kuwo.cn/play_detail/244908`
+ * kw 的单曲页是 `https://www.kuwo.cn/play_detail/244908`
  * （歌单是 `/playlist_detail/…`，字面上不含 `play_detail`，不会撞）。
  *
- * **只判断、不解析**：本项目还没移植酷我的单曲详情接口。
+ * **只判断、不解析**：本项目还没移植 kw 的单曲详情接口。
  * 之所以仍然导出它，是为了让下游能给出准确提示 ——
- * 「酷我单曲暂不支持」比「无法从该链接中解析出歌单 ID」清楚得多。
+ * 「kw 单曲暂不支持」比「无法从该链接中解析出歌单 ID」清楚得多。
  */
 export const isSongUrl = (input: string): boolean =>
   /\/play_detail\/\d+/.test(String(input ?? '')) || /[?&](?:musicId|rid)=\d+/.test(String(input ?? ''))

@@ -1,5 +1,5 @@
 /**
- * B 站接口封装（主进程）
+ * 某站接口封装（主进程）
  *
  * 原为 electron/biliApi.js（CommonJS），迁移为 TS 并补上类型。
  * 逻辑保持与迁移前一致，未做行为改动。
@@ -32,7 +32,7 @@ const MIXIN_KEY_ENC_TAB = [
   0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
 ]
 
-/** B 站接口返回体的公共形状（字段很多，只声明用到的） */
+/** 某站接口返回体的公共形状（字段很多，只声明用到的） */
 interface BiliResponse {
   code: number
   message?: string
@@ -321,7 +321,7 @@ async function biliHeaders(): Promise<Record<string, string>> {
 /**
  * ★ **被风控**时抛出的专用错误
  *
- * B站的风控返回的是 **HTTP 412**（「请求被拦截」，响应体是一整页 HTML
+ * 某站的风控返回的是 **HTTP 412**（「请求被拦截」，响应体是一整页 HTML
  * 而不是 JSON）。它和「网络断了 / 接口抽风」是**完全不同**的性质：
  *
  *  - 网络错误：等一下重试是合理的；
@@ -385,9 +385,9 @@ async function biliGet(url: string): Promise<BiliResponse> {
 const URL_EXPIRE_MARGIN_MS = 5 * 60 * 1000
 
 /**
- * 从 B 站播放地址里解析出过期时间戳（毫秒）
+ * 从某站播放地址里解析出过期时间戳（毫秒）
  *
- * B 站的视频直链是带签名时效的，常见形态：
+ * 某站的视频直链是带签名时效的，常见形态：
  *   ...?deadline=1789929926&...
  *   ...?e=ig8eux...&deadline=...      （部分 CDN 把参数塞进 e= 里）
  * 取不到时返回 null，表示无法判断（按「未知」处理，不当作过期）。
@@ -448,7 +448,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  */
 
 /**
- * B站搜索分区代码（`tids`）
+ * 某站搜索分区代码（`tids`）
  *
  *  - `''` / `'0'`  → **全站**搜索（不限制分区，音乐视频可能发在任意区）
  *  - `'3'`        → **音乐**区
@@ -466,7 +466,7 @@ const TIDS_MUSIC = '3'
  * ## 为什么必须有
  *
  * 一首歌要搜 4 轮（全站 / 音乐区 / MV / 括号内容），每次切歌就是 4 个请求；
- * 用户连点几首就是十几个请求打出去 —— B站**很快就返回 412 风控**。
+ * 用户连点几首就是十几个请求打出去 —— 某站**很快就返回 412 风控**。
  *
  * 实测（用最朴素的裸请求验证过）：同一个 IP 前后两个请求，
  * 一个正常返回 200、下一个直接 412。**请求密度**就是触发条件。
@@ -491,12 +491,12 @@ const throttleSearch = async (): Promise<void> => {
 }
 
 /**
- * 搜 B站（**单次请求**，不含降级逻辑）
+ * 搜 某站（**单次请求**，不含降级逻辑）
  *
  * ## ★ 没有重试（这是刻意的）
  *
  * 原来失败会递归重试 2 次（各等 1 秒）。那是**有害**的：
- *  - 风控 412 时重试只会加重封禁 —— B站要的是「停下来」；
+ *  - 风控 412 时重试只会加重封禁 —— 某站要的是「停下来」；
  *  - 真网络错误时，上层（渲染层）本来就会重搜，重试是重复劳动；
  *  - 一首歌 4 轮 × 每轮重试 2 次 = 最坏 12 个请求，正是被风控的元凶。
  *
@@ -572,7 +572,7 @@ export interface SearchVideoItem {
   pic?: string
   author?: string
   /**
-   * 时长**秒数**（`extract` 里已经把 B 站的 `"4:03"` 转成秒）
+   * 时长**秒数**（`extract` 里已经把某站的 `"4:03"` 转成秒）
    *
    * `null` / 缺省 = 时长未知（过滤时这种会被保留，不因缺数据而误杀）。
    */
@@ -606,14 +606,14 @@ export interface SearchVideoItem {
  *
  * 见 `singerForQuery`。
  *
- * 为什么必须拆：B 站对「歌名 + 一个它匹配不到的歌手名」**不会返回空**，
+ * 为什么必须拆：某站对「歌名 + 一个它匹配不到的歌手名」**不会返回空**，
  * 而是整体退化成「只按歌手名给相关结果」—— 那批结果标题里连歌名都没有，
  * 于是硬过滤的第一条（标题必须含歌名）把它们全挡掉，最终「取回 N → 过滤 0」。
  * 括号拆成空格后，歌手名的每个词独立参与匹配，不会再拖着歌名一起被丢掉。
  *
  * ## ⚠️ 不要用 `-`
  *
- * B站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 并排除含 B 的结果）——
+ * 某站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 并排除含 B 的结果）——
  * 写成 `歌名 - 歌手` 会变成「搜歌名、**排除**这个歌手」，正好和意图相反。
  *
  * ## 为什么前两轮搜同一句话、只换分区
@@ -630,7 +630,7 @@ export interface SearchVideoItem {
  *
  * ## 为什么第 5 轮去掉歌手名
  *
- * 前四轮都带歌手名。一旦 B 站上没有这个歌手的版本（翻唱 / 冷门版本很常见），
+ * 前四轮都带歌手名。一旦某站上没有这个歌手的版本（翻唱 / 冷门版本很常见），
  * 查询就会退化成「歌手搜索」，候选池里一条歌名都不剩，前三轮等于白搜。
  * 这时候唯一还能捞到歌的办法就是退回**只按歌名搜**。
  *
@@ -665,7 +665,7 @@ const squashSpaces = (s: string): string => s.replace(/\s+/g, ' ').trim()
  * 歌名 → 搜索词里的歌名：`歌名` → `歌名 歌曲`
  *
  * ★ **「歌曲」是一个独立的词，前面带空格**（用户明确要求）——
- * 不是拼成一个词。带空格时 B 站按两个词分别匹配（歌名与「歌曲」
+ * 不是拼成一个词。带空格时某站按两个词分别匹配（歌名与「歌曲」
  * 各自出现即可命中）；拼成一个词则要求标题里连着出现「歌名歌曲」，
  * 命中率低得多。
  *
@@ -686,7 +686,7 @@ const songForQuery = (songName: string): string => {
  * 歌手(组合)    →  歌手 组合
  * ```
  *
- * 拆开之后每个词独立参与匹配，B 站不会因为「带括号的整体匹配不到」
+ * 拆开之后每个词独立参与匹配，某站不会因为「带括号的整体匹配不到」
  * 而退化成一堆无关视频（详见文件上方 `搜索降级流程` 那段）。
  *
  * ⚠️ **只影响搜索词**：写库、展示、收藏用的仍是原始歌手名
@@ -756,7 +756,7 @@ export const buildFallbackKeyword = (
  * 降级是**多轮**：`歌名 歌曲 歌手`（全站）→ 同词换音乐区 → 加 `MV` → 加括号部分。
  */
 export interface SearchRoundDetail {
-  /** 这一轮发给 B 站的完整搜索词 */
+  /** 这一轮发给某站的完整搜索词 */
   keyword: string
   /** 这一轮用的分区代码（`''` = 全站，`'3'` = 音乐区） */
   tids: string
@@ -781,7 +781,7 @@ export interface SearchRoundDetail {
  *  2. `歌名 歌曲 歌手`，**音乐区**（`tids=3`）→ 同样「一页不够就两页」；
  *  3. `歌名 歌曲 歌手 MV` → 同上；
  *  4. `歌名 歌曲 歌手 <括号内容>`（没括号则 `可视化`）→ 同上；
- *  5. `歌名 歌曲`（**去掉歌手名**）→ 同上，救「B 站没有这个歌手的版本」的情况。
+ *  5. `歌名 歌曲`（**去掉歌手名**）→ 同上，救「某站没有这个歌手的版本」的情况。
  *
  * 每轮结果**累加**（按 bvid 去重），不是替换。
  * 每轮之前都会判「过滤后够不够 `minResults`」，够了就不再往下走。
@@ -859,7 +859,7 @@ export const searchSongFiltered = async (
    *
    * ## ★ `duration` 在这里**一次性转成秒**
    *
-   * B 站搜索接口给的是 `"4:03"` 这种**时分秒字符串**，而下游（过滤、排序、
+   * 某站搜索接口给的是 `"4:03"` 这种**时分秒字符串**，而下游（过滤、排序、
    * 写库、渲染）全都按**秒数**工作。所以在**进入我们代码的第一道门**就转好，
    * 之后**永远不再解析**。
    *
@@ -872,7 +872,7 @@ export const searchSongFiltered = async (
    *
    * ## `...item` 是**必须**的（别改成只挑几个字段）
    *
-   * 这里靠 `...item` 把 B站原始条目**整个**接住，只覆盖 `duration` 一个字段。
+   * 这里靠 `...item` 把 某站原始条目**整个**接住，只覆盖 `duration` 一个字段。
    *
    * 踩过：曾经改成「只挑 `bvid`/`title`/`pic`/`author`/`duration`」，
    * 结果把 `type` 也丢了 —— 而 `api:searchSong` 里**还有一处**
@@ -923,9 +923,9 @@ export const searchSongFiltered = async (
    * `rankVideos` 也是这套，所以「这里数的」和「用户看到的」是同一个数。
    * 唯一差别是不做排序（只取 `.length`，排序对条数没影响）。
    *
-   * ## ⚠️⚠️ 但**必须先把 B站自己的 `favorites` 字段清掉**（第二次踩）
+   * ## ⚠️⚠️ 但**必须先把 某站自己的 `favorites` 字段清掉**（第二次踩）
    *
-   * B站搜索接口返回的每条里**本来就有个 `favorites`** —— 它是
+   * 某站搜索接口返回的每条里**本来就有个 `favorites`** —— 它是
    * 「这条视频被多少人收藏了」（一个数字，几乎总是 truthy），
    * 而 `rankVideos` 用 `v.favorites` 判断「**是不是用户在我们这儿收藏的**」，
    * 并**豁免收藏项不参与过滤**。
@@ -978,10 +978,10 @@ export const searchSongFiltered = async (
    *
    * 原来「第 1 页过滤后不够 `minResults` 就再翻第 2 页」。
    * 但一首歌要跑 4 轮，每轮再翻页 = 最多 8 个请求 ——
-   * 而渲染层在搜索为空时还会重搜，实际密度远超 B站能接受的范围。
+   * 而渲染层在搜索为空时还会重搜，实际密度远超 某站能接受的范围。
    *
    * 五轮降级本来就覆盖了「换词再找」的需求，**翻页的边际收益不值得**。
-   * 所以现在每轮**只取第 1 页**（B站一页 42 条，够用）。
+   * 所以现在每轮**只取第 1 页**（某站一页 42 条，够用）。
    *
    * 正因为不翻页，原来那个「这一轮够不够、要不要翻第二页」的判断
    * （以及它需要的 `relax` 参数）也一并没有了 —— 函数变简单了。
@@ -1006,9 +1006,9 @@ export const searchSongFiltered = async (
      */
     const first = reusedFirstPage ?? (await searchSong(kw, 1, tids))
     /**
-     * B站返回非 0 时**不要把它自己的 message 透传给用户**
+     * 某站返回非 0 时**不要把它自己的 message 透传给用户**
      *
-     * `first.message` 是 B站原文（可能是 `-352`、风控说明之类的技术文案）。
+     * `first.message` 是 某站原文（可能是 `-352`、风控说明之类的技术文案）。
      * 它经 IPC 抛到渲染层就会被 `$message.error` 显示出来 —— 用户看不懂，
      * 而且把接口的内部说法写在了界面上。所以**统一换成中性文案**，
      * 原始 message 只打日志（排查用）。
@@ -1026,7 +1026,7 @@ export const searchSongFiltered = async (
   /**
    * ★ **第一轮返回 0 条 = 被风控**，不要再往下跑（用户明确要求）
    *
-   * 判断依据很硬：**B站搜索不会对一首正常存在的歌返回「0 条」**。
+   * 判断依据很硬：**某站搜索不会对一首正常存在的歌返回「0 条」**。
    * 只要搜索词里有歌名，它总能搜到点东西（哪怕不相关）。
    * 所以「第 1 轮就是 0 条」几乎只有一种解释：**请求被风控拦了** ——
    * 要么返回了 412（那会更早抛 `RateLimitError`），
@@ -1193,8 +1193,8 @@ export const searchSongFiltered = async (
       /**
        * 第 5 轮：**纯歌名，不带歌手名**
        *
-       * 前四轮全带歌手名。B 站上没有这个歌手的版本时（翻唱 / 冷门版本很常见），
-       * 「歌名 + 该歌手」这个组合匹配不到，B 站**不会返回空**，而是整体退化成
+       * 前四轮全带歌手名。某站上没有这个歌手的版本时（翻唱 / 冷门版本很常见），
+       * 「歌名 + 该歌手」这个组合匹配不到，某站**不会返回空**，而是整体退化成
        * 「只按歌手名给相关结果」—— 那批结果的标题里连歌名都没有，
        * 被硬过滤的第一条（标题必须含歌名）全部挡掉，前四轮等于白搜。
        *
@@ -1424,7 +1424,7 @@ export interface ResolveVideoResult {
 /**
  * 常规 CDN 域
  *
- * B 站的 playurl 会给每条流一个 `baseUrl` + 若干 `backupUrl`。其中 `baseUrl`
+ * 某站的 playurl 会给每条流一个 `baseUrl` + 若干 `backupUrl`。其中 `baseUrl`
  * 有时是 **P2P / 边缘节点**（实测见过 `*.mountaintoys.cn`、`*.szbdyd.com`），
  * 那种地址只对官方客户端有效，普通 HTTP 请求会被 **403** 拒掉 ——
  * 用户看到的现象就是「别的视频都能放，只有这一个怎么也放不出来」，而且不报任何错。
@@ -1468,7 +1468,7 @@ export const pickNormalCdnUrl = (
  * 为什么要它：卡顿时要能「换同一个清晰度的备用源」。
  * 只挑一个地址的话，备用源全丢了，卡顿只能干等降 durl。
  *
- * 返回顺序：常规 CDN 域优先，其余兜底；**去重**（B站有时同一地址
+ * 返回顺序：常规 CDN 域优先，其余兜底；**去重**（某站有时同一地址
  * 既放 `baseUrl` 又放 `backupUrl`）。
  */
 export const dashUrlsOf = (item: DashItem | undefined): string[] => {
@@ -1690,7 +1690,7 @@ import type { ParsedVideoInfo } from '@common/types/ipc'
 export type { ParsedVideoInfo }
 
 /**
- * 解析用户输入的「B 站视频链接 / BV 号」，取回标题、封面、UP 主
+ * 解析用户输入的「某站视频链接 / BV 号」，取回标题、封面、UP 主
  *
  * 只在「添加视频」里用：先尽量从文本里抠 BV 号，抠不到就跟随短链，
  * 再拿 view 接口把展示需要的信息取齐。
@@ -1704,7 +1704,7 @@ export const parseVideoInput = async (input: string): Promise<ParsedVideoInfo> =
     const finalUrl = await followShortLink(text)
     bvid = finalUrl?.match(BV_PATTERN)?.[0] ?? ''
   }
-  if (!bvid) throw new Error('没有识别出 BV 号，请粘贴 B 站视频链接或 BV 号')
+  if (!bvid) throw new Error('没有识别出 BV 号，请粘贴某站视频链接或 BV 号')
 
   const view = await biliGet(`${VIEW_API}?bvid=${bvid}`)
   /** 同上：不透传接口原文（用户看不懂），原文只打日志 */
@@ -1751,7 +1751,7 @@ const FAV_CREATED_API = 'https://api.bilibili.com/x/v3/fav/folder/created/list-a
  * ⚠️ **不要照名字去猜路径**。曾经按「收藏的合集 / 收藏的系列」各拼了一个
  * `x/space/fav/season/list`、`x/space/fav/series/list` —— 前者返回
  * `-404 啥都木有`，后者直接是 HTML 404 页面（路由根本不存在）。
- * 真正的入口是这个 `x/v3/fav/folder/collected/list`（见 `Bili23-Downloader_B站接口清单.md` 3.2）。
+ * 真正的入口是这个 `x/v3/fav/folder/collected/list`（见 `Bili23-Downloader_某站接口清单.md` 3.2）。
  */
 const FAV_COLLECTED_API = 'https://api.bilibili.com/x/v3/fav/folder/collected/list'
 const SEASON_ARCHIVES_API =
@@ -1782,8 +1782,54 @@ export interface BiliListDetail {
   skipped: number
 }
 
-/** 分页之间等一会：串行 + 300~500ms 是 B 站批量拉列表的经验值 */
+/** 分页之间等一会：串行 + 300~500ms 是某站批量拉列表的经验值 */
 const LIST_PAGE_DELAY_MS = 380
+
+const SPACE_INFO_API = 'https://api.bilibili.com/x/space/wbi/acc/info'
+const USER_CARD_API = 'https://api.bilibili.com/x/web-interface/card'
+
+/**
+ * 查 UP 主昵称（给合集 / 系列回填作者用）
+ *
+ * ## 为什么需要它
+ *
+ * 合集（`seasons_archives_list`）和系列（`series/archives`）的 `archives[]`
+ * **逐条不返回作者**，只有 bvid / 标题 / 封面 / 时长 —— 收藏夹那边有 `upper.name`，
+ * 这两个没有。但这两个列表天然只有一个作者：**整个列表就属于一个 UP 主**。
+ * 所以拉完用列表的 `mid` 查一次，把名字回填给所有条目，比每条都空着有用得多。
+ *
+ * ## 失败一律返回空串
+ *
+ * 未登录时 `acc/info` 常见 -352（风控），导入不能因为这个失败 ——
+ * 作者留空，界面显示「未知 UP 主」，其他一切照常。
+ * 先走 wbi 签名接口，不行再退老接口（两个入口的 `data` 形状不一样，见下）。
+ */
+const fetchUserName = async (mid: string): Promise<string> => {
+  const id = String(mid ?? '').trim()
+  if (!id) return ''
+
+  const urls: string[] = []
+  const mixinKey = await getMixinKeyCached()
+  if (mixinKey) urls.push(`${SPACE_INFO_API}?${encWbi({ mid: id }, mixinKey)}`)
+  /** 老接口不需要签名，作为兜底入口 */
+  urls.push(`${USER_CARD_API}?mid=${encodeURIComponent(id)}`)
+
+  for (const url of urls) {
+    try {
+      const res = await biliGet(url)
+      if (res.code !== 0) continue
+      const data = res.data as
+        | { name?: unknown; card?: { name?: unknown } }
+        | undefined
+      /** `acc/info` 把名字放在 `data.name`，老接口放在 `data.card.name` */
+      const name = data?.name ?? data?.card?.name
+      if (typeof name === 'string' && name.trim()) return name.trim()
+    } catch {
+      /* 这个入口不通就试下一个 */
+    }
+  }
+  return ''
+}
 
 const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -1979,6 +2025,21 @@ export const fetchBiliList = async (
     }
   }
 
+  /**
+   * 合集 / 系列：逐条没有作者，但整个列表只有一个作者 —— 查一次回填
+   *
+   * 收藏夹不走这里（它每条都带 `upper.name`，且收藏夹里本来就可能是不同 UP 主，
+   * 拿一个名字套全部是错的）。
+   */
+  if (kind !== 'fav' && options.mid && items.some((item) => !item.author)) {
+    const author = await fetchUserName(options.mid)
+    if (author) {
+      for (const item of items) {
+        if (!item.author) item.author = author
+      }
+    }
+  }
+
   return {
     kind,
     id,
@@ -2002,7 +2063,7 @@ export const fetchBiliList = async (
  * 十几个收藏夹靠名字区分很费眼，封面一眼就能认出来。所以顺手把 `cover` 带出去。
  *
  * 拿不到就是 `null`（老收藏夹没设封面的情况真实存在），界面那边退化成纯色块，
- * **不要**在主进程这里补一个占位图 URL —— 那是界面的事，而且 B 站没有稳定的
+ * **不要**在主进程这里补一个占位图 URL —— 那是界面的事，而且某站没有稳定的
  * 「默认封面」地址可拼。
  */
 export const fetchMyFavFolders = async (): Promise<
@@ -2022,7 +2083,7 @@ export const fetchMyFavFolders = async (): Promise<
       title: typeof item['title'] === 'string' ? item['title'] : '未命名收藏夹',
       count: typeof item['media_count'] === 'number' ? item['media_count'] : 0,
       /**
-       * B 站给的是 `//i0.hdslb.com/bfs/...` 这种**协议相对**地址。
+       * 某站给的是 `//i0.hdslb.com/bfs/...` 这种**协议相对**地址。
        * 这里**原样返回**，交给渲染层的 `normalizeImageUrl` 补协议 ——
        * 主进程已经有一处（`upsertVideoMeta` 存封面）也是这么分工的，
        * 两边各补一次迟早会出现「一处补了 http、一处补了 https」的差异。
@@ -2122,7 +2183,7 @@ export const fetchMySubscribedLists = async (): Promise<MySubList[]> => {
 /**
  * 从用户粘贴的链接 / 文本里识别「列表类型 + id」
  *
- * 正则照抄 Bili23 的 `url_pattern.py`（那套已经覆盖了 B 站各种入口形态）。
+ * 正则照抄 Bili23 的 `url_pattern.py`（那套已经覆盖了某站各种入口形态）。
  * 识别不出来返回 null —— 调用方要给用户一句「没认出这是列表链接」，
  * 而不是拿空 id 去打接口。
  */

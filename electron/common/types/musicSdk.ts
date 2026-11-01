@@ -8,19 +8,11 @@
  *    本项目是 contextIsolation + nodeIntegration:false，
  *    所以解析逻辑放在**主进程**，渲染进程只通过 IPC 拿结果。
  *  - LX 的歌曲对象里 qualitys/_qualitys/typeUrl 等字段是「取播放地址」用的，
- *    本项目的歌单只用来喂 B 站搜索，所以全部砍掉，只保留 歌名/歌手/时长。
+ *    本项目的歌单只用来喂某站搜索，所以全部砍掉，只保留 歌名/歌手/时长。
  */
 
 /** 支持的音源（与 LX 的 source key 保持一致） */
 export type MusicSource = 'wy' | 'tx' | 'kw' | 'kg'
-
-/** 音源显示名 */
-export const MUSIC_SOURCE_NAMES: Record<MusicSource, string> = {
-  wy: '网易云音乐',
-  tx: 'QQ音乐',
-  kw: '酷我音乐',
-  kg: '酷狗音乐',
-}
 
 /**
  * 解析出来的一首歌（归一化后的精简结构）
@@ -42,7 +34,7 @@ export interface ParsedSong {
   /** 来源音源 */
   source: MusicSource
   /**
-   * **平台侧歌曲 id**（QQ 的数字 id / 网易云的 id / 酷我的 rid…）
+   * **平台侧歌曲 id**（QQ 的数字 id / wy 的 id / kw 的 rid…）
    *
    * 为什么要留它：**取歌词必须要这个 id**。不留的话，取歌词得拿
    * 「歌名 + 歌手」再去平台搜一次 —— 而那是模糊搜索，可能搜到**别的版本**
@@ -77,7 +69,7 @@ export interface PlaylistDetail {
   /** 来源音源 */
   source: MusicSource
   /**
-   * ★ **平台侧歌单 id**（QQ 的 `disstid` / 网易云的 `id` / 酷我的 `rid`）
+   * ★ **平台侧歌单 id**（QQ 的 `disstid` / wy 的 `id` / kw 的 `rid`）
    *
    * 用途：让上层拼出歌单主键 `平台_平台歌单id`（如 `tx_8153225605`）。
    *
@@ -95,7 +87,7 @@ export interface PlaylistDetail {
 
 /** IPC 入参 */
 export interface GetPlaylistDetailParams {
-  /** 歌单链接或歌单 ID；网易云支持 `链接###token` 形式 */
+  /** 歌单链接或歌单 ID；wy 支持 `链接###token` 形式 */
   input: string
   /** 不传则根据链接自动识别音源 */
   source?: MusicSource

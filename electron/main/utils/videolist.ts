@@ -1,24 +1,31 @@
 /**
- * B 站视频列表（收藏夹 / 合集 / 系列 / 本地列表）的 CRUD + 同步（主进程）
+ * 某站视频列表（收藏夹 / 合集 / 系列 / 本地列表）的 CRUD + 同步（主进程）
  *
  * ## 它是 OV 模式（Other Video）的全部数据来源
  *
  * 音乐歌单（MV 模式）的链路是：歌名 + 歌手 → **搜索** → 一堆候选 → 选一个。
  * 视频列表的链路是：条目**本来就是视频**（带 bvid），没有搜索这一步。
  *
- * 但播放引擎那边不能有两条链路 —— 所以这里把每个条目伪装成
- * 「只有一个候选的搜索键」：`search_key = 'bv:<bvid>'`，
- * `api:searchSong` 看到前缀就短路，直接返回这一条（见 cache.listDirectCandidates）。
+ * 播放引擎那边只能有**一条**链路：条目自带 `bvid`，直接拿去解析地址，没有搜索这一步。
  *
- * ## 四张表各管什么
+ * ## 两张表各管什么
  *
  *  - `videolists`      列表元信息（名字 / 封面 / 进度 / 来源）
  *  - `videolist_items` 列表成员 + 顺序 + **收藏** + **来源**（sync / local）
- *  - `song_videos`     `bv:<bvid>` 的关系行 —— 让「候选列表」这个抽象对直连条目也成立
- *  - `videos`          只写**元数据**（标题/封面/UP 主/时长），**不写播放地址**
  *
- * ⚠️ 导入 500 条 = 500 行关系 + 500 行很窄的实体，**不是** 500 份 dash。
- * 地址一律等第一次播放时由 `cache.updateVideoResult()` 自动补。
+ * 视频本身的信息（标题 / 封面 / UP 主 / 时长）和播放地址在共用的 `videos` 表里 ——
+ * 这里只写元数据，**不写播放地址**：地址等第一次播放时由 `cache.updateVideoResult()` 补。
+ *
+ * ⚠️ 导入 500 条 = 500 行很窄的关系 + 500 行实体，**不是** 500 份 dash。
+ *
+ * ## 平台列表只读，本地列表可改
+ *
+ * `fav` / `season` / `series` 这三个 kind 的条目和名字都是**远端的投影**：
+ * 改名、增删条目在这里一律拒绝（主进程第一道闸，界面禁用按钮只是别让人白点）。
+ * 想随意编辑就先「转成本地列表」（`convertVideoListToLocal`）—— 转完 `kind = 'local'`，
+ * 与远端断开，改名 / 加删条目 / 拖文件全部放开。
+ *
+ * 收藏（`favorites`）**不算编辑**：它只把本地这一行挪到置顶区，不动远端顺序和条目集合。
  *
  * ## 顺序（ord）怎么维护：和音乐歌单那边「添加视频」完全一样的做法
  *
@@ -31,12 +38,16 @@
  *  - 手动添加 → 插到最前。
  */
 import type {
+  VideoImportPreview,
   VideoListItem,
   VideoListRecord,
+  VideoListSyncMode,
   VideoListSyncResult,
+  VideoMetaInput,
 } from '@common/types/playlist'
 import { fetchBiliList, parseVideoInput } from '../biliApi'
 import type { BiliListDetail, BiliListKind } from '../biliApi'
+import { classifyDropInput } from './dropInput'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, tx } from './db'
@@ -59,6 +70,7 @@ interface VideoListDbRow {
   cover: string | null
   item_count: number | null
   sync_mode: string
+  sync_interval_ms: number
   last_sync_at: number | null
   last_index: number
   created_at: number
@@ -90,6 +102,13 @@ const defaultListId = (): string => {
   }
 }
 
+/** `sync_mode` 列 -> `VideoListSyncMode`（脏值一律当 off，别让界面拿到未定义的行为） */
+export const toVideoSyncMode = (raw: unknown): VideoListSyncMode => {
+  if (raw === 'startup' || raw === 'interval') return raw
+  // 老库里可能残留 `manual`（「参与全部同步」那个已废弃的取值），按手动同步处理
+  return 'off'
+}
+
 /*
  * `defId` 由调用方传进来（列表可能有几十行，每一行都去 clone 一遍设置没意义）。
  */
@@ -101,7 +120,8 @@ const toRecord = (row: VideoListDbRow, defId: string = defaultListId()): VideoLi
   name: row.name,
   cover: row.cover,
   itemCount: row.item_count,
-  syncMode: row.sync_mode === 'manual' ? 'manual' : 'off',
+  syncMode: toVideoSyncMode(row.sync_mode),
+  syncIntervalMs: row.sync_interval_ms ?? 0,
   lastSyncAt: row.last_sync_at,
   lastIndex: row.last_index ?? 0,
   createdAt: row.created_at,
@@ -121,7 +141,7 @@ export const getVideoLists = (): VideoListRecord[] => {
     const rows = getDb()
       .prepare(
         `SELECT id, kind, source_id, mid, name, cover, item_count,
-                sync_mode, last_sync_at, last_index, created_at, updated_at
+                sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at
            FROM videolists
           ORDER BY CASE WHEN kind = 'local' THEN 0 ELSE 1 END, created_at ASC`,
       )
@@ -146,7 +166,7 @@ export const findVideoList = (id: string): VideoListRecord | null => {
     const row = getDb()
       .prepare(
         `SELECT id, kind, source_id, mid, name, cover, item_count,
-                sync_mode, last_sync_at, last_index, created_at, updated_at
+                sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at
            FROM videolists WHERE id = ?`,
       )
       .get(id) as VideoListDbRow | undefined
@@ -199,7 +219,7 @@ export const getVideoListItems = (id: string): VideoListItem[] => {
        * 本地文件条目把**路径**一起带出去
        *
        * 这里不带的话，界面既没法说「文件本来在哪」，也没法把重新定位的对话框
-       * 定位到那个目录。B 站条目的 `durl_url` 是直链（带签名、几分钟就过期），
+       * 定位到那个目录。某站条目的 `durl_url` 是直链（带签名、几分钟就过期），
        * 交给渲染层没有意义，所以只给 `lf_` 条目。
        *
        * 顺便注意：**这里不 stat**（见 `markLocalItemsMissing`）——
@@ -251,10 +271,10 @@ const refreshCount = (db: ReturnType<typeof getDb>, listId: string): void => {
  *
  * ```
  * 保留 = favorites = 1 OR origin = 'local'      → 维持原有相对顺序，放在最前
- * 其余 = 本次拉到的条目（去掉已保留的 bvid）     → 按 B 站顺序接在后面
+ * 其余 = 本次拉到的条目（去掉已保留的 bvid）     → 按某站顺序接在后面
  * ```
  *
- * 也就是说：**你收藏的、你手动加的，同步不会删**；哪怕它在 B 站那边已经取消了收藏，
+ * 也就是说：**你收藏的、你手动加的，同步不会删**；哪怕它在某站那边已经取消了收藏，
  * 只要本地还收藏着就留着（真要删就在列表里右键删掉）。
  *
  * 顺序重排后 `last_index` 由调用方按 bvid 重定位 —— 它记的是下标，会漂。
@@ -280,7 +300,7 @@ const applyRemoteItems = (
   const kept = old.filter((row) => row.favorites === 1 || row.origin === 'local')
   const keptBvids = new Set(kept.map((row) => row.bvid))
 
-  /** 远端还在、但本地没保留的 → 新增（顺序跟着 B 站） */
+  /** 远端还在、但本地没保留的 → 新增（顺序跟着某站） */
   const incoming = detail.items.filter((item) => !keptBvids.has(item.bvid))
   const added = incoming.filter((item) => !oldBvids.has(item.bvid)).length
   const removed = old.filter((row) => !remoteBvids.has(row.bvid)).length
@@ -364,8 +384,8 @@ export const addVideoList = async (
     db.prepare(
       `INSERT INTO videolists
          (id, kind, source_id, mid, name, cover, item_count,
-          sync_mode, last_sync_at, last_index, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'off', ?, ?, ?, ?)
+          sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'off', 0, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          name         = excluded.name,
          cover        = excluded.cover,
@@ -515,8 +535,8 @@ export const createLocalList = (name?: string): VideoListRecord => {
   db.prepare(
     `INSERT INTO videolists
        (id, kind, source_id, mid, name, cover, item_count,
-        sync_mode, last_sync_at, last_index, created_at, updated_at)
-     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 'manual', NULL, 0, ?, ?)`,
+        sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
+     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 'off', 0, NULL, 0, ?, ?)`,
   ).run(id, finalName, now, now)
   const record = findVideoList(id)
   if (!record) throw new Error('新建本地列表失败')
@@ -578,16 +598,29 @@ export const addItemToDefaultList = async (
 ): Promise<{ listId: string; listName: string; item: VideoListItem }> => {
   const list = ensureDefaultVideoList()
   if (!list) throw new Error('默认列表创建失败')
-  const item = await addLocalItem(list.id, input)
-  return { listId: list.id, listName: list.name, item }
+  /** 拖入是「直接播放」，不走预览确认 —— 这里自己解析一次 */
+  const info = await parseVideoInput(input)
+  const meta: VideoMetaInput = {
+    bvid: info.bvid,
+    title: info.title,
+    cover: info.pic,
+    author: info.author,
+    duration: info.duration,
+  }
+  addLocalItem(list.id, meta)
+  return {
+    listId: list.id,
+    listName: list.name,
+    item: { ...meta, favorites: false, origin: 'local' },
+  }
 }
 
 /**
  * 「拖入本地文件」：登记 + 挂进默认列表（整批置顶）
  *
- * 和 `addItemToDefaultList`（B 站单条视频）是**同一件事的另一种入参**：
+ * 和 `addItemToDefaultList`（某站单条视频）是**同一件事的另一种入参**：
  * 落点一样、置顶规则一样、续播一样，区别只在「地址从哪来」——
- * 那边是 B 站解析，这边是文件路径（进 `videos.durl_url`，见 `localVideo.ts`）。
+ * 那边是某站解析，这边是文件路径（进 `videos.durl_url`，见 `localVideo.ts`）。
  *
  * ## 为什么一批文件只 bump 一次
  *
@@ -656,7 +689,7 @@ export const addLocalFilesToDefault = (paths: string[]): LocalFilesImportResult 
       /**
        * 实体行：**只**写 bvid / 标题 / 作者 / 路径。
        *
-       * 不碰 `dash_*` —— 那些列对本地文件永远是 NULL（没有 B 站解析结果），
+       * 不碰 `dash_*` —— 那些列对本地文件永远是 NULL（没有某站解析结果），
        * 而 `dash_tried` / `playurl_login_state` 保持默认值即可，
        * 本地分支根本不会走到「要不要重取地址」那段判断（见 handler 里的短路）。
        */
@@ -725,6 +758,17 @@ export const addLocalFilesToDefault = (paths: string[]): LocalFilesImportResult 
 export const renameVideoList = (id: string, name: string): boolean => {
   const finalName = (name ?? '').trim()
   if (!id || !finalName) return false
+  /**
+   * 平台列表的名字是**远端的投影**：同步时会被 `detail.name` 无条件覆盖（见 `syncVideoList`），
+   * 所以这里不让改 —— 改了也会在下次同步时被冲掉，属于骗用户。
+   * 想改名就先转成本地列表。
+   */
+  const record = findVideoList(id)
+  if (!record) return false
+  if (!isLocalKind(record.kind)) {
+    console.warn('[videolist] 拒绝改名：平台列表的名字由远端决定')
+    return false
+  }
   try {
     getDb()
       .prepare(`UPDATE videolists SET name = ?, updated_at = ? WHERE id = ?`)
@@ -737,46 +781,279 @@ export const renameVideoList = (id: string, name: string): boolean => {
 }
 
 /**
- * 「添加视频」：解析链接 / BV 号 → 写进 videos → **插到列表最前**
+ * 设置**同步方式**（只对平台列表有意义）
  *
- * 和音乐歌单那边「添加视频」同一个做法：事务里把别人的 `ord` +1，自己写 0，
- * 于是新加的条目出现在置顶区最前。
- *
- * 已经在列表里的条目不报错，只把它挪到最前（用户的意图就是「我要它排第一」）。
+ * `manual` = 「全部同步」时带上它；`off` = 不参与批量同步，只有手动点那一下才更新。
+ * 本地列表没有远端来源，这个字段对它没有任何作用，直接拒绝。
  */
-export const addLocalItem = async (listId: string, input: string): Promise<VideoListItem> => {
-  const record = findVideoList(listId)
-  if (!record) throw new Error('列表不存在')
+export const setVideoListSyncMode = (
+  id: string,
+  mode: VideoListSyncMode,
+  intervalMs = 0,
+): boolean => {
+  const record = findVideoList(id)
+  if (!record) return false
+  if (isLocalKind(record.kind)) return false
+  const next = toVideoSyncMode(mode)
+  try {
+    getDb()
+      .prepare(
+        `UPDATE videolists SET sync_mode = ?, sync_interval_ms = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(next, next === 'interval' ? Math.max(0, Math.floor(intervalMs) || 0) : 0, Date.now(), id)
+    return true
+  } catch (err) {
+    console.error('[videolist] 设置同步方式失败:', err)
+    return false
+  }
+}
 
-  const info = await parseVideoInput(input)
+/**
+ * 平台列表 → 本地列表（**换 id**，不是复制）
+ *
+ * ## 为什么换 id
+ *
+ * 平台列表的 id 是 `bv_<kind>_<平台id>`，它本身就是「这个列表等于哪个远端来源」的声明。
+ * 转成本地之后没有远端来源了，id 必须跟着变 —— 否则下次「导入同一个收藏夹」
+ * 会命中这一行、把它按远端重建，用户手动改的东西全没了。
+ *
+ * ## 为什么整个搬走旧行
+ *
+ * 和音乐歌单的 `convertPlaylistToLocal` 一致：转换 = 这个列表换了身份，不是多出一个副本。
+ * 同一个收藏夹之后还能再导入成一个新的平台列表。
+ *
+ * ## 连带要改的东西
+ *
+ * `videolist_items.list_id` 没有外键，得手动跟着改；
+ * 正在播 / 被当成默认列表时要同步改设置项，否则渲染层下一次写播进度
+ * 会把记录写到已经消失的旧 id 上（静默丢数据）。
+ */
+export const convertVideoListToLocal = (id: string): { id: string; name: string } => {
+  const record = findVideoList(id)
+  if (!record) throw new Error('列表不存在')
+  if (isLocalKind(record.kind)) throw new Error('这已经是本地列表了')
+
+  const newId = `bv_local_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
   const db = getDb()
+  const now = Date.now()
 
   tx(() => {
-    upsertVideoMeta(db, info)
+    db.prepare(
+      `INSERT INTO videolists
+         (id, kind, source_id, mid, name, cover, item_count,
+          sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
+       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 'off', 0, NULL, ?, ?, ?)`,
+    ).run(newId, record.name, record.cover, record.itemCount, record.lastIndex, record.createdAt, now)
+
+    /**
+     * 条目整批搬过去，`origin` 一律改成 `local`
+     *
+     * 本地列表不再有远端，`sync` 这个来源标记在新家里没有意义；
+     * 而且 `origin` 参与「同步时保留哪些条目」的判断，留着会让语义自相矛盾。
+     */
+    db.prepare(
+      `INSERT INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
+       SELECT ?, bvid, ord, favorites, 'local', added_at
+         FROM videolist_items WHERE list_id = ?`,
+    ).run(newId, id)
+
+    db.prepare(`DELETE FROM videolist_items WHERE list_id = ?`).run(id)
+    db.prepare(`DELETE FROM videolists WHERE id = ?`).run(id)
+    refreshCount(db, newId)
+  })
+
+  /** 设置项重映射：正在播的那个 / 默认列表，都要跟着换成新 id */
+  try {
+    if (String(getSetting()['player.activeVideoListId'] ?? '') === id) {
+      updateSetting({ 'player.activeVideoListId': newId })
+    }
+    if (String(getSetting()['player.defaultVideoListId'] ?? '') === id) {
+      updateSetting({ 'player.defaultVideoListId': newId })
+    }
+  } catch (err) {
+    console.warn('[videolist] 转换后更新设置失败（不影响列表本身）:', err)
+  }
+
+  console.log(`[videolist] 《${record.name}》已转成本地列表：${id} -> ${newId}`)
+  return { id: newId, name: record.name }
+}
+
+/** 「添加视频」的结果（预览确认后落库） */
+export interface AddVideoItemsResult {
+  listId: string
+  listName: string
+  /** 本次真正新增的条数 */
+  added: number
+  /** 已经在列表里、跳过的条数 */
+  existed: number
+}
+
+/**
+ * 导入预览：用户确认之前**不写库**
+ *
+ * 按「贴的是一条视频，还是一个列表」分两种形状。渲染层拿它画确认框
+ * （一条时是封面 + 标题 + UP 主 + 时长；一个列表时头部是列表详情、下面是每条视频），
+ * 用户点确定后再把 `item` / `items` 原样传回来落库。
+ *
+ * 为什么确认后要「把数据传回来」而不是重新解析一次：
+ * 合集是几十个分页请求、几秒钟，重拉一遍既慢又容易撞 412；
+ * 而且两次拉取之间视频可能被删，会出现「确认框里有、写进去没有」。
+ */
+export type { VideoImportPreview }
+
+export const previewVideoImport = async (input: string): Promise<VideoImportPreview> => {
+  const raw = String(input ?? '').trim()
+  if (!raw) return { type: 'none' }
+
+  const target = classifyDropInput(raw)
+
+  if (target.type === 'video') {
+    const info = await parseVideoInput(target.input)
+    return {
+      type: 'video',
+      item: {
+        bvid: info.bvid,
+        title: info.title,
+        cover: info.pic,
+        author: info.author,
+        duration: info.duration,
+      },
+    }
+  }
+
+  if (target.type === 'list') {
+    const detail = await fetchBiliList(target.kind, target.id, {
+      mid: target.mid,
+      max: MAX_LIST_ITEMS,
+    })
+    return {
+      type: 'list',
+      kind: detail.kind,
+      name: detail.name,
+      cover: detail.cover,
+      itemCount: detail.itemCount,
+      items: detail.items,
+      skipped: detail.skipped,
+    }
+  }
+
+  return { type: 'none' }
+}
+
+/** 只有本地列表能改内容：平台列表的条目由远端决定 */
+const assertEditableList = (listId: string): VideoListRecord => {
+  const record = findVideoList(listId)
+  if (!record) throw new Error('列表不存在')
+  if (!isLocalKind(record.kind)) {
+    throw new Error('平台列表的条目由某站决定，先「转成本地列表」才能添加')
+  }
+  return record
+}
+
+/**
+ * 把一批条目**并进**一个本地列表（只增不删）
+ *
+ * 和 `applyRemoteItems`（同步用）的区别：那个是「按远端重建这个列表」；
+ * 这里是「把另一批东西加进来」—— 本地列表没有远端来源，不存在「远端删了本地也要删」。
+ *
+ * 追加到**末尾**：本地列表里的顺序是用户自己攒的，一次导入几十条不该把已有内容整体挤到后面。
+ */
+const mergeIntoLocal = (
+  db: ReturnType<typeof getDb>,
+  listId: string,
+  items: VideoMetaInput[],
+): { added: number; existed: number } => {
+  const existing = new Set(
+    (
+      db.prepare(`SELECT bvid FROM videolist_items WHERE list_id = ?`).all(listId) as Array<{
+        bvid: string
+      }>
+    ).map((row) => row.bvid),
+  )
+  const maxRow = db
+    .prepare(`SELECT COALESCE(MAX(ord), -1) AS m FROM videolist_items WHERE list_id = ?`)
+    .get(listId) as { m: number }
+
+  const insert = db.prepare(
+    `INSERT INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
+     VALUES (?, ?, ?, 0, 'local', ?)`,
+  )
+  let ord = maxRow.m + 1
+  let added = 0
+  let existed = 0
+  const now = Date.now()
+
+  for (const item of items) {
+    upsertVideoMeta(db, item)
+    if (existing.has(item.bvid)) {
+      existed += 1
+      continue
+    }
+    insert.run(listId, item.bvid, ord, now)
+    existing.add(item.bvid)
+    ord += 1
+    added += 1
+  }
+  refreshCount(db, listId)
+  return { added, existed }
+}
+
+/**
+ * 「添加视频」：把**一条**放进本地列表（置顶）
+ *
+ * 和音乐歌单那边「添加视频」同一个做法：事务里把别人的 `ord` +1、自己写 0。
+ * 已经在列表里的不报错，只把它挪到最前（用户的意图就是「我要它排第一」）。
+ *
+ * 入参是**预览时拿到的数据**（不是链接）：调用方已经让用户看过详情并确认过了。
+ */
+export const addLocalItem = (listId: string, item: VideoMetaInput): AddVideoItemsResult => {
+  const record = assertEditableList(listId)
+  const db = getDb()
+  let existed = 0
+
+  tx(() => {
+    upsertVideoMeta(db, item)
+    const row = db
+      .prepare(`SELECT 1 AS x FROM videolist_items WHERE list_id = ? AND bvid = ?`)
+      .get(listId, item.bvid)
+    if (row) existed = 1
     bumpOrders(db, listId)
     db.prepare(
-      `UPDATE videolist_items
-          SET ord = 0, added_at = ?
-        WHERE list_id = ? AND bvid = ?`,
-    ).run(Date.now(), listId, info.bvid)
-    /** 上面那条 UPDATE 没命中 = 库里还没有它 → 插一行（记住它是「手动加的」） */
-    db.prepare(
-      `INSERT OR IGNORE INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
-       VALUES (?, ?, 0, 0, 'local', ?)`,
-    ).run(listId, info.bvid, Date.now())
+      `INSERT INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
+       VALUES (?, ?, 0, 0, 'local', ?)
+       ON CONFLICT(list_id, bvid) DO UPDATE SET ord = 0, added_at = excluded.added_at`,
+    ).run(listId, item.bvid, Date.now())
     refreshCount(db, listId)
   })
 
-  console.log(`[videolist] 已添加到《${record.name}》：${info.bvid}`)
-  return {
-    bvid: info.bvid,
-    title: info.title,
-    cover: info.pic,
-    author: info.author,
-    duration: info.duration,
-    favorites: false,
-    origin: 'local',
-  }
+  console.log(`[videolist] 已添加到《${record.name}》：${item.bvid}`)
+  return { listId, listName: record.name, added: existed ? 0 : 1, existed }
+}
+
+/**
+ * 「添加视频」：把**一批**（预览过的合集 / 收藏夹 / 系列）追加到本地列表末尾
+ *
+ * 只增不删；已在列表里的按 bvid 跳过，不移动位置。
+ */
+export const addLocalItems = (
+  listId: string,
+  items: VideoMetaInput[],
+): AddVideoItemsResult => {
+  const record = assertEditableList(listId)
+  const list = Array.isArray(items) ? items : []
+  if (list.length === 0) return { listId, listName: record.name, added: 0, existed: 0 }
+
+  const db = getDb()
+  let added = 0
+  let existed = 0
+  tx(() => {
+    const merged = mergeIntoLocal(db, listId, list)
+    added = merged.added
+    existed = merged.existed
+  })
+
+  console.log(`[videolist] 已把 ${list.length} 条并入《${record.name}》：+${added}（已存在 ${existed}）`)
+  return { listId, listName: record.name, added, existed }
 }
 
 /**
@@ -816,6 +1093,13 @@ export const setItemFavorite = (listId: string, bvid: string, favorite: boolean)
 /** 从列表里删掉一条（只删关系；`videos` 的地址缓存留给 GC 判断） */
 export const removeVideoListItem = (listId: string, bvid: string): boolean => {
   if (!listId || !bvid) return false
+  /** 平台列表的条目是远端的投影：删了下次同步又回来，所以直接拒绝 */
+  const record = findVideoList(listId)
+  if (!record) return false
+  if (!isLocalKind(record.kind)) {
+    console.warn('[videolist] 拒绝删除条目：平台列表的条目由远端决定')
+    return false
+  }
   try {
     const db = getDb()
     tx(() => {

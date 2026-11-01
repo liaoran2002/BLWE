@@ -1,8 +1,8 @@
 /**
- * B 站视频列表 IPC
+ * 某站视频列表 IPC
  *
  * 通道分成两组，命名沿用现有风格：
- *  - `api:*`      —— 打 B 站接口的（识别链接、收藏夹、订阅合集）；
+ *  - `api:*`      —— 打某站接口的（识别链接、收藏夹、订阅合集）；
  *  - `videolists:*` —— 操作本地库的（列表 CRUD、同步、进度）。
  *
  * 为什么 `videolists:getItems` 不联网：条目在导入时就落库了，
@@ -25,15 +25,19 @@ import {
   addItemToDefaultList,
   addLocalFilesToDefault,
   addLocalItem,
+  addLocalItems,
   addVideoList,
+  convertVideoListToLocal,
   createLocalList,
   getVideoListItems,
   getVideoLists,
+  previewVideoImport,
   removeVideoList,
   removeVideoListItem,
   renameVideoList,
   setItemFavorite,
   setVideoListIndex,
+  setVideoListSyncMode,
   syncVideoList,
 } from '../utils/videolist'
 
@@ -58,7 +62,7 @@ export const registerVideoListHandlers = (): void => {
      * 走的是 `videolists:createLocal`，根本不会到这里。走到这里说明是调用方的 bug。
      */
     if (kind === 'local') {
-      throw new Error('本地列表不支持从 B 站导入，请用「添加视频」逐条添加')
+      throw new Error('本地列表不支持从某站导入，请用「添加视频」逐条添加')
     }
     return addVideoList(kind, sourceId, mid)
   })
@@ -69,7 +73,18 @@ export const registerVideoListHandlers = (): void => {
 
   mainHandle('videolists:rename', ({ id, name }) => renameVideoList(id, name))
 
-  mainHandle('videolists:addItem', ({ id, input }) => addLocalItem(id, input))
+  mainHandle('videolists:previewImport', ({ input }) => previewVideoImport(input))
+
+  mainHandle('videolists:addItem', ({ id, item }) => addLocalItem(id, item))
+
+  mainHandle('videolists:addItems', ({ id, items }) => addLocalItems(id, items))
+
+  /** 平台列表 → 本地列表（换 id；渲染层需要跟着重映射正在播 / 正在看的 id） */
+  mainHandle('videolists:convertToLocal', ({ id }) => convertVideoListToLocal(id))
+
+  mainHandle('videolists:setSyncMode', ({ id, mode, intervalMs }) =>
+    setVideoListSyncMode(id, mode, intervalMs ?? 0),
+  )
 
   /**
    * 拖入本地视频文件

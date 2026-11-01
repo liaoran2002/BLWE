@@ -47,7 +47,7 @@ import { LOCAL_BVID_PREFIX } from './localVideo'
 const NOT_LOCAL_VIDEO = `substr(bvid, 1, ${LOCAL_BVID_PREFIX.length}) <> '${LOCAL_BVID_PREFIX}'`
 
 /**
- * 「B 站 playurl 响应」的最小形状
+ * 「某站 playurl 响应」的最小形状
  *
  * **不是**整包响应，只含 `extractDashStreams` / `readQualityOptions` /
  * `readVideoQuality` 三个读取函数真正用到的字段。类型上用 `data: unknown`：
@@ -185,7 +185,7 @@ interface CachedSearchItem {
   /**
    * 时长**秒数**（`null` / 缺省 = 未知）
    *
-   * 上游（`biliApi.extract`）已经把 B站的 `"4:03"` 转成秒了，
+   * 上游（`biliApi.extract`）已经把 某站的 `"4:03"` 转成秒了，
    * 写库直接存这个值。
    */
   duration?: number | null
@@ -237,7 +237,7 @@ const stripHighlight = (title: string | null | undefined): string | null => {
 }
 
 /**
- * 把 `videos` 行的结构化列拼回「B 站 playurl 响应」的最小形状
+ * 把 `videos` 行的结构化列拼回「某站 playurl 响应」的最小形状
  *
  * **入参必须是完整行**（含地址列）。元数据行没有地址，调用方要先用
  * `getVideoAddress()` / `getVideoRow()` 单独取那一行。
@@ -394,7 +394,7 @@ const getVideoRow = (cacheKey: string, bvid: string): VideoDbRow | undefined =>
  * 能播的地址都是同一份。旧签名的 `cacheKey` 唯一作用就是「定位到 (search_key, bvid)
  * 那一行」，而在新结构里 `videos.bvid` 本身就是主键。
  *
- * 少一个参数也顺带让 **B 站列表的直连条目**能直接复用这个函数 ——
+ * 少一个参数也顺带让 **某站列表的直连条目**能直接复用这个函数 ——
  * 它们在 `song_videos` 里只有 `bv:<bvid>` 这一行，没有音乐那边的键。
  */
 export const getVideoAddress = (
@@ -927,7 +927,7 @@ export const prune = (): CacheStats => {
  * 语义是「回到干净状态」：**搜索候选、收藏、选中视频、播放地址**一起清掉。
  * 界面上那个按钮的文案也是「全部清除」，两边必须一致。
  *
- * ## ⚠️ 但要保住 B 站视频列表
+ * ## ⚠️ 但要保住某站视频列表
  *
  * 那些条目不是「缓存」，是用户导入的内容（收藏夹 / 合集）。如果按旧实现
  * 一句 `DELETE FROM videos` 全清，视频列表会变成几百行「只有 bvid、没有标题」的空壳。
@@ -1215,7 +1215,7 @@ export const setSelectedBvid = (cacheKey: string, bvid: string): void => {
  * 读「这份**搜索结果**是在什么登录态下取的」
  *
  * `null` = 未知（库里存 NULL）。**必须与 `false` 区分**：
- * 未登录时 B 站只返回部分结果，所以「已知未登录时搜的」可以据此判断
+ * 未登录时某站只返回部分结果，所以「已知未登录时搜的」可以据此判断
  * 「这份结果该重搜」；而「不知道当时登没登录」不能当成未登录，否则每次
  * 用这份缓存都会白重搜一遍。
  *

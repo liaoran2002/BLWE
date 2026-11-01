@@ -26,6 +26,8 @@ import {
   DEFAULT_THEME_COLOR,
   GLASS_BLUR_MAX,
   GLASS_BLUR_MIN,
+  FONT_SCALE_MAX,
+  FONT_SCALE_MIN,
   GLASS_SHADOW_MAX,
   GLASS_SHADOW_MIN,
   IDLE_OPACITY_MAX,
@@ -81,6 +83,8 @@ export interface UiThemeInput {
   'common.idleOpacity'?: number;
   'common.glassBlur'?: number;
   'common.glassShadow'?: number;
+  /** 界面字号缩放（百分比，-50 ~ 50） */
+  'ui.fontScale'?: number;
 }
 
 export const applyUiTheme = (input: UiThemeInput): void => {
@@ -123,6 +127,19 @@ export const applyUiTheme = (input: UiThemeInput): void => {
     ? Math.min(GLASS_SHADOW_MAX, Math.max(GLASS_SHADOW_MIN, shadow))
     : DEFAULT_SHADOW;
   root.style.setProperty('--glass-shadow-size', `${Math.round(shadowSize)}px`);
+
+  /**
+   * 界面字号缩放
+   *
+   * 存的是百分比（0 / ±10 / ±50），写进去的是倍率（1 / 1.1 / 1.5）——
+   * CSS 里每处字号是 `calc(13px * var(--fs))`，乘的是无单位数字。
+   * 托盘菜单是独立页面（`tray-menu.html`），不读这个变量，所以不受影响。
+   */
+  const fontPct = Number(input['ui.fontScale'])
+  const fontScale = Number.isFinite(fontPct)
+    ? Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, fontPct))
+    : 0
+  root.style.setProperty('--fs', (1 + fontScale / 100).toFixed(2));
 
   // ---- 深浅 ----
   // 底色偏暗 -> 白阴影 + Element Plus 暗色；偏亮 -> 黑阴影 + 亮色

@@ -2,7 +2,7 @@
   "name": "BiLiWallpaperEngine",
   "version": "1.0.0",
   "author": "liaoran2002",
-  "description": "BLWE（BiLiWallpaperEngine）：把 B 站视频列表 / 音乐歌单铺到桌面当壁纸的播放器。",
+  "description": "BLWE（BiLiWallpaperEngine）：把某站视频列表 / 音乐歌单铺到桌面当壁纸的播放器。",
   "main": "./out/main/index.js",
   "private": true,
   "scripts": {

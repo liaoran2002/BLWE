@@ -121,6 +121,13 @@ export interface AppSetting {
    * 这里只管存，解析统一走 `parseAspectRatio`（主进程、渲染层共用同一个函数）。
    */
   'common.customAspectRatios': string[]
+  /**
+   * 界面字号缩放（百分比，-50 ~ 50）
+   *
+   * 0 = 原样；正数放大、负数缩小。只影响应用窗口内的界面文字，
+   * 托盘菜单（`tray-menu.html` 独立页面）不受影响。
+   */
+  'ui.fontScale': number
   // #endregion
 
   // #region player
@@ -135,7 +142,7 @@ export interface AppSetting {
   /** 上次播放到的秒数（用于续播） */
   'player.resumeTime': number
   /**
-   * 当前在播的 **B 站视频列表** id（`bv_fav_123456` 这种）
+   * 当前在播的 **某站视频列表** id（`bv_fav_123456` 这种）
    *
    * 空字符串 = 当前在播音乐歌单（由 `playlists.currentId` 说话）。
    *
@@ -156,7 +163,7 @@ export interface AppSetting {
   'player.pauseOnDeviceChange': boolean
   /** 进全屏时自动锁定界面（隐藏标题栏与控制栏，只留左下/右下两个按钮） */
   'player.lockOnFullscreen': boolean
-  /** 默认视频清晰度（B 站 qn 档位代码，如 116 = 1080P 60帧） */
+  /** 默认视频清晰度（某站 qn 档位代码，如 116 = 1080P 60帧） */
   'player.videoQuality': number
   /** 默认音质（dash 音频流 id，如 30280 = 192K） */
   'player.audioQuality': number

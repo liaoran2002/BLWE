@@ -42,21 +42,21 @@ export type VideoControlAction =
   | 'playMode'
 
 /**
- * B 站搜索结果里的视频项
+ * 某站搜索结果里的视频项
  *
  * 与 SongVideoListDialog 的 VideoListItem 保持结构兼容（bvid/title/pic/author/duration）。
  */
 export interface BiliVideo {
   bvid: string
   title: string
-  /** B 站缩略图 */
+  /** 某站缩略图 */
   pic?: string | null
   /** UP 主 */
   author?: string | null
   /**
    * 时长**秒数**（`null` / 缺省 = 未知）
    *
-   * 主进程 `biliApi.extract` 在入口就把 B站的 `"4:03"` 转成秒了，
+   * 主进程 `biliApi.extract` 在入口就把 某站的 `"4:03"` 转成秒了，
    * 渲染层拿到的**只有数字**；展示时用 `formatDuration()` 转回 `mm:ss`。
    */
   duration?: number | null
@@ -138,7 +138,7 @@ export interface AppData {
   // ---- 歌单管理弹窗 ----
   /** 统一的歌单管理弹窗（新建/编辑/同步/曲目浏览都在里面） */
   playlistManagerVisible: boolean
-  /** B 站视频列表弹窗（收藏夹 / 合集 / 系列的导入与浏览） */
+  /** 某站视频列表弹窗（收藏夹 / 合集 / 系列的导入与浏览） */
   videoListVisible: boolean
   /**
    * 视频管理页当前**浏览**的列表 id
@@ -348,7 +348,7 @@ export interface AppData {
    * ★ **当前有几个网络请求在飞**（搜索 / 解析播放地址）
    *
    * 控制栏据此禁用「会再发请求」的控件（切歌、清晰度/音质切换）——
-   * 用户狂点会让请求成倍打出去，B站直接 412 风控。
+   * 用户狂点会让请求成倍打出去，某站直接 412 风控。
    *
    * 用**计数器**而不是布尔：切歌时「搜索 → 解析地址」是两段连续的请求，
    * 布尔会被先结束的那个提前清掉。

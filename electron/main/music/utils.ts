@@ -74,7 +74,7 @@ export const decodeName = (str: string | null | undefined): string => {
  *
  * 兼容多种入参形态：
  *  - 字符串：直接解码
- *  - `[{ name }]`（网易/QQ/酷狗的常见形态）
+ *  - `[{ name }]`（网易/QQ/kg 的常见形态）
  *  - `['张三', '李四']`（纯字符串数组）
  *  - `[{ name: '' }]`：空名会被跳过
  *
@@ -116,7 +116,7 @@ const getHost = (url: string): string => {
 /**
  * 根据分享链接自动识别音源
  *
- * 注意：不能只看 `id=` 参数 —— 网易云和酷我的链接都带 `id=`，
+ * 注意：不能只看 `id=` 参数 —— wy 和 kw 的链接都带 `id=`，
  * QQ 的移动端分享链接也带 `id=`，所以必须以 host 为准来判定。
  *
  * @returns 识别到的音源；无法识别返回 null
@@ -124,9 +124,9 @@ const getHost = (url: string): string => {
 export const detectSource = (input: string): MusicSource | null => {
   const text = input.trim()
   /**
-   * 酷我的 `digest-<n>__<id>` 是「链接被压缩过」的形式（分享出来的短串），
-   * 它既不含 `?&:/` 也不以字母开头以外的东西为线索，但前缀能确定是酷我：
-   * 不特判的话下面那行会直接 return null，酷我那条已经写好的解析分支永远走不到。
+   * kw 的 `digest-<n>__<id>` 是「链接被压缩过」的形式（分享出来的短串），
+   * 它既不含 `?&:/` 也不以字母开头以外的东西为线索，但前缀能确定是 kw：
+   * 不特判的话下面那行会直接 return null，kw 那条已经写好的解析分支永远走不到。
    */
   if (/^digest-\d+__\d+$/.test(text)) return 'kw'
   // 纯数字 / 其它 digest 形式：信息不足，交给调用方指定音源

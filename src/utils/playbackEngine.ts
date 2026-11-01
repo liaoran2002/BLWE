@@ -420,7 +420,7 @@ export class PlaybackEngine {
    * 歌：搜索 → 挑候选 → 解析地址
    *
    * 「挑哪个视频」的优先级没变（上次播的 → 搜索接口带回来的 → 第一个），
-   * 但**搜索永远不重试**：B 站不会对一首正常的歌返回 0 条，第 1 轮就空
+   * 但**搜索永远不重试**：某站不会对一首正常的歌返回 0 条，第 1 轮就空
    * 几乎只有一种解释 —— 被限流了，而重试恰恰是在限流状态下继续打请求。
    */
   private async resolveSongItem(
@@ -519,7 +519,7 @@ export class PlaybackEngine {
       throw new CancelledByFix()
     }
     if (res.code === 'AUTH_FAILED' || res.error === 'AUTH_FAILED') {
-      throw new Error('B 站登录已失效，请重新登录后再试')
+      throw new Error('某站登录已失效，请重新登录后再试')
     }
     throw new Error(res.error)
   }

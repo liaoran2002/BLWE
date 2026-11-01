@@ -1,99 +1,41 @@
 <template>
   <!--
-    B 站视频列表（收藏夹 / 合集 / 系列）
-
-    与「歌单管理」并列的第二条进料管：这里的每个条目**本来就是视频**，
-    导入后直接落库，播放时不再搜索。
-
-    为什么单独一个弹窗而不是塞进歌单管理：两种来源的表、id、同步方式都不一样，
-    混在一个界面里必然要到处判断「这条是歌还是视频」。分开之后，
-    两边各自简单，用户也一眼能看出自己在哪个来源里。
+    界面（弹窗 / 左列表 / 右侧三态 / 搜索 / 条目行）全部由 `ManagerDialog` 渲染，
+    这里只留三样属于视频列表的东西：
+      · 新建 / 编辑表单（四种内容来源在这一张表单里收口）
+      · 详情头右侧的动作按钮（同步 / 编辑 / 添加视频 / 从这里播放 / 删除）
+      · 条目行尾的按钮（定位 / 收藏置顶 / 移除）
   -->
-  <el-dialog
-    v-model="visible"
-    width="900px"
-    :show-close="false"
+  <ManagerDialog
+    v-model:visible="visible"
+    v-model:selected-id="selectedId"
+    title="视频管理"
+    :summary="`共 ${store.lists.length} 个列表 · ${totalItems} 条视频`"
     append-to-body
-    align-center
+    :lists="dialogLists"
+    :mode="dialogMode"
+    :detail="dialogDetail"
+    :rows="dialogRows"
+    :loading-rows="loadingItems"
+    create-label="新建列表"
+    switch-label="← 歌单管理"
+    :sync-all-disabled="syncableCount === 0 || store.syncing.length > 0"
+    :sync-all-loading="store.syncing.length > 0"
+    search-placeholder="搜索标题 / UP 主"
+    empty-list-text="还没有列表，点下面「新建列表」开始"
+    empty-main-text="从左边选一个列表查看条目，或点「新建列表」从链接 / 收藏夹 / 订阅合集导入"
+    :empty-rows-text="emptyRowsText"
+    empty-search-text="没有匹配的视频"
+    @create="startCreate"
+    @sync-all="syncAll"
+    @switch="void ui.openManager('mv')"
+    @play="onRowPlay($event)"
   >
-    <template #header>
-      <div class="vlm-head">
-        <span class="vlm-title">视频管理</span>
-        <span class="vlm-summary">
-          共 {{ store.lists.length }} 个列表 · {{ totalItems }} 条视频
-        </span>
-      </div>
-    </template>
+    <template #form>
+      <div v-if="creating" class="mgr-form">
+          <div class="mgr-form-title">新建列表</div>
 
-    <div class="vlm-body">
-      <!-- 左：列表 -->
-      <div class="vlm-side">
-        <div class="vlm-side-list">
-          <div
-            v-for="item in store.lists"
-            :key="item.id"
-            class="vlm-list-row"
-            :class="{ sel: item.id === selectedId, cur: item.id === store.activeId }"
-            @click="selectList(item.id)"
-          >
-            <div class="vlm-list-main">
-              <div class="vlm-list-name" :title="item.name">
-                <span v-if="item.id === store.activeId" class="vlm-dot" title="正在播放"></span>
-                {{ item.name }}
-              </div>
-              <div class="vlm-list-meta">
-                <span>{{ item.itemCount ?? '—' }} 条</span>
-                <span class="vlm-tag">{{ kindLabel(item.kind) }}</span>
-                <!-- 默认列表：拖入单条视频的落点，不能删（可以改名） -->
-                <span v-if="item.isDefault" class="vlm-tag vlm-tag-default" title="拖入单条视频会放进这里">
-                  默认
-                </span>
-                <span v-if="store.isSyncingOne(item.id)" class="vlm-syncing">同步中…</span>
-              </div>
-            </div>
-          </div>
-          <div v-if="store.lists.length === 0" class="vlm-empty">
-            还没有列表，点下面「新建列表」开始
-          </div>
-        </div>
-        <div class="vlm-side-actions">
-          <div class="vlm-side-row">
-            <!--
-              「新建列表」= 唯一入口（和歌单管理的「新建歌单」对称）
-
-              以前这里是「导入列表」+「新建本地列表」两个按钮，等于让用户先自己判断
-              「我要的是哪种列表」。现在合成一个：先建列表，再选内容从哪来
-              （空 / 链接 / 收藏夹 / 订阅合集）—— 建列表是目的，导入只是其中一种填法。
-            -->
-            <el-button size="small" type="primary" @click="startCreate">新建列表</el-button>
-            <el-button
-              size="small"
-              :disabled="syncableCount === 0 || store.syncing.length > 0"
-              :loading="store.syncing.length > 0"
-              @click="syncAll"
-            >
-              全部同步
-            </el-button>
-          </div>
-          <!-- 切回 MV 模式（和歌单管理里那个「视频管理 →」对称） -->
-          <el-button class="vlm-side-switch" size="small" @click="void ui.openManager('mv')">
-            ← 歌单管理
-          </el-button>
-        </div>
-      </div>
-
-      <!-- 右：新建表单 或 选中列表的条目 -->
-      <div class="vlm-main">
-        <!--
-          新建列表（内联表单，不另开弹窗）
-
-          和歌单管理「新建歌单」是同一套观感：左边列表固定不动，右边换成一列字段。
-          四种来源在这里收口，用户不需要先知道「本地列表 / 导入」的区别。
-        -->
-        <div v-if="creating" class="vlm-form">
-          <div class="vlm-form-title">新建列表</div>
-
-          <div class="vlm-field">
+          <div class="mgr-field">
             <label>列表名称</label>
             <el-input
               v-model="form.name"
@@ -103,7 +45,7 @@
             />
           </div>
 
-          <div class="vlm-field">
+          <div class="mgr-field">
             <label>内容来源</label>
             <el-radio-group v-model="form.source" size="small">
               <el-radio-button value="local">空列表</el-radio-button>
@@ -114,14 +56,14 @@
           </div>
 
           <!-- ① 粘贴链接 -->
-          <div v-if="form.source === 'link'" class="vlm-field">
+          <div v-if="form.source === 'link'" class="mgr-field">
             <el-input
               v-model="form.link"
               size="small"
               clearable
               placeholder="粘贴收藏夹 / 合集 / 系列链接，如 https://space.bilibili.com/123/favlist?fid=456"
             />
-            <div class="vlm-hint">
+            <div class="mgr-hint">
               支持：收藏夹（<code>/list/ml…</code>、<code>favlist?fid=…</code>）、
               合集 / 系列（<code>/lists/…?type=season|series</code>）
             </div>
@@ -135,8 +77,8 @@
             下拉里只剩一行字，选的时候要逐个读；封面能一眼认出来。
             交互照抄左边那个列表：点一下选中、选中行高亮。
           -->
-          <div v-else-if="form.source === 'fav'" class="vlm-field">
-            <div v-if="loadingFolders" class="vlm-hint">正在读取你的收藏夹…</div>
+          <div v-else-if="form.source === 'fav'" class="mgr-field">
+            <div v-if="loadingFolders" class="mgr-hint">正在读取你的收藏夹…</div>
             <template v-else>
               <div v-if="folders.length > 0" class="vlm-picker">
                 <div
@@ -161,9 +103,9 @@
                   <div class="vlm-pick-meta">{{ f.count }} 条</div>
                 </div>
               </div>
-              <div v-else class="vlm-hint">
+              <div v-else class="mgr-hint">
                 <span v-if="folderError">{{ folderError }}</span>
-                <span v-else>没有读到收藏夹。私密收藏夹需要先登录 B 站账号。</span>
+                <span v-else>没有读到收藏夹。私密收藏夹需要先登录某站账号。</span>
                 <el-button link type="primary" size="small" @click="loadFolders">重新读取</el-button>
               </div>
             </template>
@@ -174,8 +116,8 @@
             数据来自 `x/v3/fav/folder/collected/list`，那里 `type = 21` 的才是合集；
             收藏的「收藏夹」也在同一个响应里，但 media_id 语义不同，不收（见 biliApi.ts）。
           -->
-          <div v-else-if="form.source === 'sub'" class="vlm-field">
-            <div v-if="loadingSubs" class="vlm-hint">正在读取订阅合集…</div>
+          <div v-else-if="form.source === 'sub'" class="mgr-field">
+            <div v-if="loadingSubs" class="mgr-hint">正在读取订阅合集…</div>
             <template v-else>
               <div v-if="subs.length > 0" class="vlm-picker">
                 <div
@@ -200,53 +142,130 @@
                   <div class="vlm-pick-meta">{{ s.count }} 条</div>
                 </div>
               </div>
-              <div v-else class="vlm-hint">
+              <div v-else class="mgr-hint">
                 <span v-if="subError">{{ subError }}</span>
-                <span v-else>没有读到订阅合集。在 B 站收藏别人的合集之后，这里才会出现。</span>
+                <span v-else>没有读到订阅合集。在某站收藏别人的合集之后，这里才会出现。</span>
                 <el-button link type="primary" size="small" @click="loadSubs">重新读取</el-button>
               </div>
             </template>
           </div>
 
           <!-- ④ 空列表 -->
-          <div v-else class="vlm-hint">
+          <div v-else class="mgr-hint">
             不导入内容：建一个空列表，之后用「添加视频」一条条加，或者直接把视频链接拖进窗口。
           </div>
 
-          <div class="vlm-form-actions">
+          <div class="mgr-form-actions">
             <el-button size="small" @click="cancelCreate">取消</el-button>
             <el-button size="small" type="primary" :loading="creatingBusy" @click="submitCreate">
               {{ creatingBusy ? '处理中…' : form.source === 'local' ? '创建' : '导入' }}
             </el-button>
           </div>
-          <div class="vlm-hint">
+          <div class="mgr-hint">
             导入只写列表和条目（几百条会跑几秒），播放地址等第一次播放时才取 ——
             一次性预取几百个地址既慢又容易被风控。
           </div>
-        </div>
+      </div>
 
-        <!-- 条目 -->
-        <template v-else-if="selected">
-          <div class="vlm-main-head">
-            <div class="vlm-main-info">
-              <div class="vlm-main-name">{{ selected.name }}</div>
-              <div class="vlm-main-sub">
-                <span>{{ selected.itemCount ?? items.length }} 条</span>
-                <span class="vlm-tag">{{ kindLabel(selected.kind) }}</span>
-                <span>上次同步：{{ lastSyncText(selected.lastSyncAt) }}</span>
+      <div v-else-if="editing && selected" class="mgr-form">
+          <div class="mgr-form-title">编辑《{{ selected.name }}》</div>
+          <div class="mgr-hint" style="margin: -6px 0 12px">
+            {{ kindLabel(selected.kind) }} · {{ selected.itemCount ?? items.length }} 条
+          </div>
+
+          <div class="mgr-field">
+            <label>列表名称</label>
+            <div v-if="selected.kind !== 'local'" class="mgr-readonly">{{ selected.name }}</div>
+            <el-input v-else v-model="editForm.name" size="small" placeholder="列表名称" clearable />
+            <div v-if="selected.kind !== 'local'" class="mgr-hint">
+              平台列表的名字由某站决定（同步时会跟着远端变），想改名先转成本地列表
+            </div>
+          </div>
+
+          <template v-if="selected.kind !== 'local'">
+            <div class="mgr-field">
+              <label>同步方式</label>
+              <el-select v-model="editForm.syncMode" size="small" style="width: 100%">
+                <el-option label="手动同步" value="off" />
+                <el-option label="每次启动应用时同步" value="startup" />
+                <el-option label="定时自动同步" value="interval" />
+              </el-select>
+            </div>
+            <!-- 只有选了「定时」才需要间隔，和歌单管理那边完全一样 -->
+            <div v-if="editForm.syncMode === 'interval'" class="mgr-field">
+              <label>同步间隔</label>
+              <el-select v-model="editForm.intervalMs" size="small" style="width: 100%">
+                <el-option
+                  v-for="opt in SYNC_INTERVAL_OPTIONS"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+                />
+              </el-select>
+            </div>
+            <div class="mgr-field">
+              <label>来源</label>
+              <div class="mgr-readonly">
+                {{ kindLabel(selected.kind) }} · {{ selected.sourceId || '（无）' }}
               </div>
             </div>
-            <div class="vlm-main-actions">
-              <el-button size="small" @click="playList(selected)">从这里播放</el-button>
-              <el-button size="small" @click="addItem(selected)">添加视频</el-button>
-              <el-button size="small" @click="rename(selected)">重命名</el-button>
+          </template>
+
+          <div class="mgr-form-actions">
+            <el-button size="small" @click="cancelEdit">取消</el-button>
+            <el-button size="small" type="primary" :loading="saving" @click="saveEdit">
+              {{ saving ? '保存中…' : '保存' }}
+            </el-button>
+            <el-popconfirm
+              v-if="selected.kind !== 'local'"
+              title="转换后不再跟随某站同步，名字和条目都可以随便改。确定吗？"
+              confirm-button-text="转换"
+              cancel-button-text="算了"
+              width="280"
+              @confirm="convert(selected)"
+            >
+              <template #reference>
+                <el-button size="small" type="warning" plain>转成本地列表</el-button>
+              </template>
+            </el-popconfirm>
+          </div>
+        </div>
+    </template>
+
+    <template #actions>
+      <!-- 弹窗只在详情态渲染这个 slot，此时 selected 一定有值；v-if 是给类型收窄看的 -->
+      <template v-if="selected">
+              <!--
+                按钮顺序和歌单管理那一栏对齐：同步 → 编辑 → 操作 → 播放 → 删除。
+                本地列表没有"同步"；平台列表没有"添加视频"（条目由远端决定）。
+              -->
               <el-button
+                v-if="selected.kind !== 'local'"
                 size="small"
-                :disabled="selected.kind === 'local'"
                 :loading="store.isSyncingOne(selected.id)"
                 @click="syncOne(selected)"
               >
                 同步
+              </el-button>
+              <el-button size="small" @click="startEdit(selected)">编辑</el-button>
+              <el-button
+                v-if="selected.kind === 'local'"
+                size="small"
+                @click="openImport(selected)"
+              >
+                添加视频
+              </el-button>
+              <!--
+                和歌单管理那一栏同一个按钮、同一套文案：点了就是「切播放源 + 立刻起播」，
+                所以叫「从这里播放」；已经在播的那个显示「正在播放」并禁用。
+              -->
+              <el-button
+                size="small"
+                type="primary"
+                :disabled="isPlayingList(selected.id)"
+                @click="playList(selected)"
+              >
+                {{ isPlayingList(selected.id) ? '正在播放' : '从这里播放' }}
               </el-button>
               <!--
                 默认列表**不许删**（用户要求：可以改名，不能删）
@@ -272,113 +291,73 @@
                   </el-button>
                 </template>
               </el-popconfirm>
-            </div>
-          </div>
+      </template>
+    </template>
 
-          <div class="vlm-search">
-            <el-input v-model="keyword" size="small" placeholder="搜索标题 / UP 主" clearable />
-            <span class="vlm-search-count">{{ filtered.length }} / {{ items.length }}</span>
-          </div>
-
-          <div class="vlm-items">
-            <div
-              v-for="row in filtered"
-              :key="row.item.bvid"
-              class="vlm-item"
-              :class="{ playing: isPlaying(row), missing: row.item.missing }"
-              @click="onRowClick(selected, row)"
-            >
-              <div class="vlm-idx">{{ row.index + 1 }}</div>
-              <div class="vlm-thumb">
-                <img
-                  v-if="coverOf(row.item) && !failedCovers[coverOf(row.item) as string]"
-                  :src="coverOf(row.item) as string"
-                  alt=""
-                  referrerpolicy="no-referrer"
-                  loading="lazy"
-                  @error="onImgError"
-                />
-              </div>
-              <div class="vlm-item-info">
-                <div class="vlm-item-name" :title="row.item.localPath || row.item.title">
-                  {{ row.item.title || row.item.bvid }}
-                </div>
-                <div class="vlm-item-more">
-                  <span class="vlm-item-author">{{ row.item.author || '未知 UP 主' }}</span>
-                  <!--
-                    本地文件失效标：打开列表时主进程已经 stat 过一遍（`missing`），
-                    所以「哪几条播不了」在这里就能看见，不用等播到它才失败。
-                  -->
-                  <span
-                    v-if="row.item.missing"
-                    class="vlm-missing-tag"
-                    :title="`文件不在这个位置了：${row.item.localPath || '（路径未知）'}`"
-                  >
-                    文件丢失
-                  </span>
-                </div>
-              </div>
-              <div class="vlm-item-dur">{{ formatDuration(row.item.duration) }}</div>
-              <!-- 失效条目的主操作是「定位」，放到收藏前面（收藏对它没用） -->
-              <div
-                v-if="row.item.missing"
-                class="vlm-item-fix"
-                title="重新定位到这个文件的新位置（列表位置 / 收藏 / 进度都保留）"
-                @click.stop="relocate(selected, row.item)"
-              >
-                定位
-              </div>
-              <!--
-                收藏 = 置顶（主进程在事务里把它挪到 ord=0）
-
-                和 MV 候选列表的爱心是同一套交互，但存在 `videolist_items.favorites` 上 ——
-                同一个视频在 A 列表收藏了，B 列表不该跟着变实心。
-              -->
-              <div
-                class="vlm-item-fav"
-                :class="{ on: row.item.favorites }"
-                :title="row.item.favorites ? '取消收藏' : '收藏（会置顶）'"
-                @click.stop="toggleFav(selected, row.item)"
-              >
-                <svg
-                  width="15"
-                  height="15"
-                  viewBox="0 0 16 16"
-                  :fill="row.item.favorites ? 'currentColor' : 'none'"
-                  stroke="currentColor"
-                  stroke-width="1.4"
-                  stroke-linejoin="round"
+    <!--
+      行尾按钮：视频列表比歌单多出来的东西，正是这一行。
+      `row` 是归一化后的行，原始条目用 `itemAt(row)` 取（行一定来自 `items`）。
+    -->
+    <template #row-actions="{ row }">
+      <!-- 行只在详情态渲染，此时 selected 一定有值；v-if 是给类型收窄看的 -->
+      <template v-if="selected">
+                <!-- 失效条目的主操作是「定位」，放到收藏前面（收藏对它没用） -->
+                <div
+                  v-if="row.missing"
+                  class="vlm-item-fix"
+                  title="重新定位到这个文件的新位置（列表位置 / 收藏 / 进度都保留）"
+                  @click.stop="relocate(selected, itemAt(row))"
                 >
-                  <path d="M8 13.1S2.3 9.7 2.3 6.2c0-1.7 1.3-3 3-3 1.2 0 2.2.7 2.7 1.7.5-1 1.5-1.7 2.7-1.7 1.7 0 3 1.3 3 3 0 3.5-5.7 6.9-5.7 6.9z" />
-                </svg>
-              </div>
-              <div
-                class="vlm-item-del"
-                title="从列表移除（不影响 B 站上的收藏）"
-                @click.stop="removeItem(selected, row.item)"
-              >
-                ×
-              </div>
-            </div>
-            <div v-if="loadingItems" class="vlm-empty">正在读取条目…</div>
-            <div v-else-if="filtered.length === 0" class="vlm-empty">
-              {{
-                items.length === 0
-                  ? selected.kind === 'local'
-                    ? '这个本地列表还没有条目，点「添加视频」加一条'
-                    : '这个列表还没有条目，先同步一下'
-                  : '没有匹配的视频'
-              }}
-            </div>
-          </div>
-        </template>
+                  定位
+                </div>
+                <!--
+                  收藏 = 置顶（主进程在事务里把它挪到 ord=0）
 
-        <div v-else class="vlm-empty big">
-          从左边选一个列表查看条目，或点「新建列表」从链接 / 收藏夹 / 订阅合集导入
-        </div>
-      </div>
-    </div>
-  </el-dialog>
+                  和 MV 候选列表的爱心是同一套交互，但存在 `videolist_items.favorites` 上 ——
+                  同一个视频在 A 列表收藏了，B 列表不该跟着变实心。
+                -->
+                <div
+                  class="vlm-item-fav"
+                  :class="{ on: itemAt(row).favorites }"
+                  :title="itemAt(row).favorites ? '取消收藏' : '收藏（会置顶）'"
+                  @click.stop="toggleFav(selected, itemAt(row))"
+                >
+                  <svg
+                    width="15"
+                    height="15"
+                    viewBox="0 0 16 16"
+                    :fill="itemAt(row).favorites ? 'currentColor' : 'none'"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  >
+                    <path d="M8 13.1S2.3 9.7 2.3 6.2c0-1.7 1.3-3 3-3 1.2 0 2.2.7 2.7 1.7.5-1 1.5-1.7 2.7-1.7 1.7 0 3 1.3 3 3 0 3.5-5.7 6.9-5.7 6.9z" />
+                  </svg>
+                </div>
+                <div
+                  v-if="selected && selected.kind === 'local'"
+                  class="mgr-row-btn mgr-row-btn--x"
+                  title="从列表移除（不影响某站上的收藏）"
+                  @click.stop="removeItem(selected, itemAt(row))"
+                >
+                  ×
+                </div>
+      </template>
+    </template>
+  </ManagerDialog>
+
+
+  <!--
+    「添加视频」的确认框（局部子组件，只服务这个弹窗）
+    贴单条视频 → 一张详情；贴合集 / 收藏夹 / 系列 → 列表详情 + 下面每条视频。
+    确认之前不写库：点取消没有任何副作用。
+  -->
+  <VideoImportDialog
+    v-model:visible="importVisible"
+    :list-id="importTarget.id"
+    :list-name="importTarget.name"
+    @done="onImportDone"
+  />
 </template>
 
 <script lang="ts">
@@ -386,22 +365,24 @@ import { defineComponent } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { VideoListItem, VideoListRecord } from '@common/types/playlist';
 import { formatDuration } from '@common/utils/duration';
+import { SYNC_INTERVAL_OPTIONS } from '@common/constants';
 import api from '../api/electron';
+import ManagerDialog from './ManagerDialog.vue';
+import VideoImportDialog from './VideoImportDialog.vue';
+import type { ManagerDetail, ManagerList, ManagerMode, ManagerRow, ManagerTag } from '../types/manager';
+import type { VideoListSyncMode } from '@common/types/playlist';
 import { useVideoListStore } from '../stores/videoLists';
 import { normalizeImageUrl } from '../utils/image';
+import { errMsg } from '../utils/errorText';
+import { formatSyncTime } from '../utils/datetime';
 import { useUiStore } from '../stores/ui';
 import { useQueueStore } from '../stores/queue';
-
-export interface Row {
-  index: number;
-  item: VideoListItem;
-}
 
 /**
  * 订阅合集里的一项（主进程 `fetchMySubscribedLists` 的返回形状）
  *
  * `kind` 目前恒为 `'season'`（只收 `type = 21` 的合集）；类型里留着 `'series'`
- * 是因为「系列」也是 B 站的一类列表，将来若找到来源可以不做类型改动就接上。
+ * 是因为「系列」也是某站的一类列表，将来若找到来源可以不做类型改动就接上。
  */
 export interface SubList {
   kind: 'season' | 'series';
@@ -413,14 +394,26 @@ export interface SubList {
   cover: string | null;
 }
 
-const pad = (n: number): string => (n < 10 ? `0${n}` : String(n));
-
 export default defineComponent({
   name: 'VideoListManager',
+  components: { ManagerDialog, VideoImportDialog },
   data() {
     return {
+      SYNC_INTERVAL_OPTIONS,
       selectedId: '',
-      keyword: '',
+      /** 「添加视频」确认框的开关与目标列表 */
+      importVisible: false,
+      importTarget: { id: '', name: '' },
+      /** 右侧正在显示「编辑」表单 */
+      editing: false,
+      saving: false,
+      /**
+       * 编辑表单（和上面那个新建用的 `form` 分开：两者字段不同，复用会打架）
+       *
+       * `syncMode` 只有 `off` / `manual` 两个值 —— 视频列表没有间隔同步，
+       * 「参与全部同步」就是它唯一能配的东西。
+       */
+      editForm: { name: '', syncMode: 'off' as VideoListSyncMode, intervalMs: 0 },
       items: [] as VideoListItem[],
       loadingItems: false,
       failedCovers: {} as Record<string, boolean>,
@@ -495,27 +488,80 @@ export default defineComponent({
       return this.store.lists.reduce((sum, item) => sum + (item.itemCount ?? 0), 0);
     },
     /** 能被同步的列表数（本地列表没有远端来源，不参与「全部同步」） */
+    /** 参与「全部同步」的列表数（本地列表和关掉同步的都不算） */
     syncableCount(): number {
-      return this.store.lists.filter((item) => item.kind !== 'local').length;
+      return this.store.lists.filter(
+        (item) => item.kind !== 'local' && item.syncMode !== 'off',
+      ).length;
     },
     selected(): VideoListRecord | null {
       return this.store.find(this.selectedId);
     },
-    filtered(): Row[] {
-      // 行号必须是**原下标**：点第 N 行要播列表里的第 N 条，
-      // 筛过之后再从 0 数就会播错（和歌单管理那边同一个坑）
-      const rows: Row[] = this.items.map((item, index) => ({ index, item }));
-      const kw = this.keyword.trim().toLowerCase();
-      if (!kw) return rows;
-      return rows.filter(
-        (r) =>
-          (r.item.title || '').toLowerCase().includes(kw) ||
-          (r.item.author || '').toLowerCase().includes(kw),
-      );
+    /** 左栏列表：外壳不知道「视频列表」是什么，只认名字 / 数量 / 标签 / 状态 */
+    dialogLists(): ManagerList[] {
+      return this.store.lists.map((item) => {
+        const tags: ManagerTag[] = [{ text: this.kindLabel(item.kind) }];
+        if (item.isDefault) {
+          tags.push({ text: '默认', tone: 'default', title: '拖入单条视频会放进这里' });
+        }
+        return {
+          id: item.id,
+          name: item.name,
+          countText: `${item.itemCount ?? '—'} 条`,
+          tags,
+          current: this.isPlayingList(item.id),
+          syncing: this.store.isSyncingOne(item.id),
+        };
+      });
+    },
+    /** 详情头 */
+    dialogDetail(): ManagerDetail | null {
+      const s = this.selected;
+      if (!s) return null;
+      return {
+        name: s.name,
+        countText: `${s.itemCount ?? this.items.length} 条`,
+        tags: [{ text: this.kindLabel(s.kind) }],
+        meta: [`上次同步：${formatSyncTime(s.lastSyncAt)}`],
+      };
+    },
+    /** 右侧主区停在哪一态 */
+    dialogMode(): ManagerMode {
+      if (this.creating || this.editing) return 'form';
+      return this.selected ? 'detail' : 'empty';
+    },
+    /**
+     * 条目行
+     *
+     * `key` 用 bvid（同一个视频在列表里只会出现一次）；
+     * `index` 必须是**原始下标**，点第 N 行播列表里的第 N 条。
+     */
+    dialogRows(): ManagerRow[] {
+      const record = this.selected;
+      const isActive = !!record && this.isPlayingList(record.id);
+      return this.items.map((item, index) => ({
+        key: item.bvid,
+        index,
+        title: item.title || item.bvid,
+        titleTooltip: item.localPath || '',
+        subtitle: item.author || '未知 UP 主',
+        cover: normalizeImageUrl(item.cover),
+        duration: item.duration,
+        playing: isActive && index === record?.lastIndex,
+        missing: !!item.missing,
+        missingHint: `文件不在这个位置了：${item.localPath || '（路径未知）'}`,
+      }));
+    },
+    /** 空列表时的引导文案按类型分：本地列表要指去「添加视频」 */
+    emptyRowsText(): string {
+      return this.selected?.kind === 'local'
+        ? '这个本地列表还没有条目，点「添加视频」加一条'
+        : '这个列表还没有条目，先同步一下';
     },
   },
   watch: {
-    modelValue(v: boolean) {
+    /** 打开时重新读一遍列表并按 store 记忆选中（原来是 watch `modelValue`，那个 prop 早就不存在了） */
+    visible(v: boolean) {
       if (v) void this.onOpen();
     },
     browseId(v: string) {
@@ -525,9 +571,15 @@ export default defineComponent({
       }
     },
     selectedId(v: string) {
-      this.keyword = '';
-      if (v) void this.loadItems(v);
-      else this.items = [];
+      // 换了列表就退出编辑态，否则保存会写到新选中的列表上
+      this.editing = false;
+      if (v) {
+        // 左栏点击、打开时恢复、外部切换都从这里过一遍 ——「正在看哪个」只记一处
+        void this.ui.onVideoListBrowse(v);
+        void this.loadItems(v);
+      } else {
+        this.items = [];
+      }
     },
     /** 切到「收藏夹 / 订阅合集」时才去拉清单（每次打开弹窗都拉太浪费） */
     'form.source'(v: string) {
@@ -550,7 +602,7 @@ export default defineComponent({
       try {
         await this.store.load();
       } catch (err) {
-        ElMessage.error('读取列表失败：' + this.errMsg(err));
+        ElMessage.error('读取列表失败：' + errMsg(err));
         return;
       }
       /**
@@ -563,27 +615,30 @@ export default defineComponent({
       const target = preferred.find((id) => id && this.store.lists.some((item) => item.id === id));
       this.selectedId = target || this.store.lists[0]?.id || '';
     },
-    /** 左侧选中一个列表（只换浏览，不动播放） */
+    /**
+     * 选中一个列表（只换浏览，不动播放）
+     *
+     * 「正在看哪个」由 `selectedId` 的 watch 统一记录 —— 左栏点击也走那条路，
+     * 这里不再单独调一次（否则同一次切换会记两遍）。
+     */
     selectList(id: string): void {
       this.selectedId = id;
-      void this.ui.onVideoListBrowse(id);
     },
-    errMsg(err: unknown): string {
-      return err instanceof Error ? err.message : String(err);
+    /**
+     * 这个视频列表**此刻是不是真的在播**
+     *
+     * 和歌单侧对称：`activeId` 只在「播放源是视频列表」时才有意义，
+     * 播歌单时它会被 `onPlaylistSwitch` 清掉 —— 但那是别处的副作用，
+     * 不能当作这里的保证。`queue.mode === 'ov'` 才是唯一判据。
+     */
+    isPlayingList(id: string): boolean {
+      return this.queue.mode === 'ov' && id === this.store.activeId;
     },
     kindLabel(kind: string): string {
       if (kind === 'local') return '本地';
       if (kind === 'season') return '合集';
       if (kind === 'series') return '系列';
       return '收藏夹';
-    },
-    lastSyncText(at: number | null): string {
-      if (!at) return '从未';
-      const d = new Date(at);
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    },
-    coverOf(item: VideoListItem): string | null {
-      return normalizeImageUrl(item.cover);
     },
     onImgError(e: Event) {
       const img = e.target as HTMLImageElement;
@@ -592,17 +647,12 @@ export default defineComponent({
       if (Object.keys(this.failedCovers).length > 2000) this.failedCovers = {};
       this.failedCovers[src] = true;
     },
-    isPlaying(row: Row): boolean {
-      // 只有「当前在播的就是这个列表」时才有「正在播」这回事
-      if (this.selected?.id !== this.store.activeId) return false;
-      return row.index === this.selected?.lastIndex;
-    },
     async loadItems(id: string): Promise<void> {
       this.loadingItems = true;
       try {
         this.items = await this.store.items(id);
       } catch (err) {
-        ElMessage.error('读取条目失败：' + this.errMsg(err));
+        ElMessage.error('读取条目失败：' + errMsg(err));
         this.items = [];
       } finally {
         this.loadingItems = false;
@@ -630,13 +680,29 @@ export default defineComponent({
      *
      * 不播是因为播了必然失败（主进程 stat 都过不了），失败后还要再弹一次
      * 一模一样的确认框 —— 不如在这儿一步到位。
+     *
+     * 入参是弹窗归一化后的行（含 `index`），原始条目用 `itemAt(row)` 取。
      */
-    onRowClick(record: VideoListRecord, row: Row): void {
-      if (row.item.missing) {
-        void this.relocate(record, row.item);
+    onRowPlay(row: ManagerRow): void {
+      const record = this.selected;
+      if (!record) return;
+      const item = this.itemAt(row);
+      if (item.missing) {
+        void this.relocate(record, item);
         return;
       }
       this.playAt(record, row.index);
+    },
+    /**
+     * 行 → 原始条目
+     *
+     * 弹窗传回来的行一定是它从 `items` 里映射出来的（同一个下标），
+     * 所以这里不判空：真为空说明是 bug，早炸比静默播错好。
+     */
+    itemAt(row: ManagerRow): VideoListItem {
+      const item = this.items[row.index];
+      if (!item) throw new Error(`条目不存在：第 ${row.index} 行`);
+      return item;
     },
     /**
      * 重新定位一个本地文件
@@ -664,7 +730,7 @@ export default defineComponent({
         await this.loadItems(record.id);
         void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
-        ElMessage.error('重新定位失败：' + this.errMsg(err));
+        ElMessage.error('重新定位失败：' + errMsg(err));
       }
     },
     // #endregion
@@ -672,6 +738,8 @@ export default defineComponent({
     // #region 新建列表
     /** 打开新建表单（不动左栏选中项：取消时还能回到原来的列表） */
     startCreate(): void {
+      // 两个表单互斥：编辑态点「新建」时，编辑表单要让位
+      this.editing = false;
       this.creating = true;
       this.form.name = '';
       this.form.source = 'link';
@@ -687,30 +755,39 @@ export default defineComponent({
       return `${s.kind}_${s.id}`;
     },
     /** 添加视频：解析链接 / BV 号，插到列表最前（置顶区） */
-    async addItem(record: VideoListRecord): Promise<void> {
-      let input = '';
+    /**
+     * 「添加视频」：打开确认框
+     *
+     * 不在这里直接写库 —— 先让用户看到「这条视频是什么」或「这个合集里都有什么」，
+     * 确认之后 `VideoImportDialog` 才落库（它拿到的是预览数据，不会二次请求）。
+     */
+    openImport(record: VideoListRecord): void {
+      this.importTarget = { id: record.id, name: record.name };
+      this.importVisible = true;
+    },
+    /** 确认框写完库：重读条目，并让主面板跟着刷新 */
+    async onImportDone(): Promise<void> {
+      const id = this.importTarget.id;
+      if (!id) return;
+      await this.loadItems(id);
+      void this.ui.refreshBrowseAfterEdit();
+    },
+    /**
+     * 平台列表 → 本地列表
+     *
+     * 主进程会换一个 id（`bv_local_` 开头）并把条目整体搬过去。
+     * 这里要把「正在看的那个列表」和选中项一起重映射，否则界面会指向一个不存在的 id。
+     */
+    async convert(record: VideoListRecord): Promise<void> {
       try {
-        const { value } = await ElMessageBox.prompt(
-          '粘贴 B 站视频链接或 BV 号',
-          `添加到《${record.name}》`,
-          {
-            confirmButtonText: '添加',
-            cancelButtonText: '取消',
-            inputPlaceholder: 'BV1xx411c7mD 或 https://www.bilibili.com/video/BV...',
-          },
-        );
-        input = (value || '').trim();
-      } catch {
-        return;
-      }
-      if (!input) return;
-      try {
-        const item = await this.store.addItem(record.id, input);
-        await this.loadItems(record.id);
+        const result = await this.store.convertToLocal(record.id);
+        if (this.selectedId === record.id) this.selectedId = result.id;
+        if (this.ui.browseVideoListId === record.id) this.ui.browseVideoListId = result.id;
+        ElMessage.success(`《${result.name}》已转成本地列表，现在可以改名和增删条目了`);
+        await this.loadItems(result.id);
         void this.ui.refreshBrowseAfterEdit();
-        ElMessage.success(`已添加《${item.title || item.bvid}》`);
       } catch (err) {
-        ElMessage.error('添加失败：' + this.errMsg(err));
+        ElMessage.error('转换失败：' + errMsg(err));
       }
     },
     /** 收藏 / 取消收藏某一条（收藏会置顶） */
@@ -720,14 +797,14 @@ export default defineComponent({
         await this.loadItems(record.id);
         void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
-        ElMessage.error('收藏失败：' + this.errMsg(err));
+        ElMessage.error('收藏失败：' + errMsg(err));
       }
     },
-    /** 从列表移除一条（只是关系，不影响 B 站收藏夹） */
+    /** 从列表移除一条（只是关系，不影响某站收藏夹） */
     async removeItem(record: VideoListRecord, item: VideoListItem): Promise<void> {
       try {
         await ElMessageBox.confirm(
-          `从《${record.name}》移除《${item.title || item.bvid}》？（B 站上的收藏不受影响）`,
+          `从《${record.name}》移除《${item.title || item.bvid}》？（某站上的收藏不受影响）`,
           '移除条目',
           { confirmButtonText: '移除', cancelButtonText: '取消', type: 'warning' },
         );
@@ -742,32 +819,70 @@ export default defineComponent({
         await this.loadItems(record.id);
         void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
-        ElMessage.error('移除失败：' + this.errMsg(err));
+        ElMessage.error('移除失败：' + errMsg(err));
       }
     },
-    /** 重命名 */
-    async rename(record: VideoListRecord): Promise<void> {
-      let name = '';
+    /** 打开编辑页（和歌单管理的「编辑」同一套交互） */
+    startEdit(record: VideoListRecord): void {
+      this.creating = false;
+      this.editForm = {
+        name: record.name,
+        syncMode: record.syncMode,
+        // 没设过间隔时给一个默认值，避免用户选「定时」后是一个空框
+        intervalMs: record.syncIntervalMs || SYNC_INTERVAL_OPTIONS[3].value,
+      };
+      this.editing = true;
+    },
+    cancelEdit(): void {
+      this.editing = false;
+    },
+    /**
+     * 保存编辑
+     *
+     * 本地列表只有名字可改；平台列表只有同步方式可改（名字是远端的投影，
+     * 主进程也会拒绝改）。所以这里按 kind 分两条，不写成一堆 if。
+     */
+    async saveEdit(): Promise<void> {
+      const record = this.selected;
+      if (!record) return;
+      this.saving = true;
       try {
-        const { value } = await ElMessageBox.prompt('列表名称', '重命名', {
-          confirmButtonText: '保存',
-          cancelButtonText: '取消',
-          inputValue: record.name,
-        });
-        name = (value || '').trim();
-      } catch {
-        return;
-      }
-      if (!name || name === record.name) return;
-      try {
-        const ok = await this.store.rename(record.id, name);
-        if (!ok) {
-          ElMessage.error('重命名失败');
-          return;
+        if (record.kind === 'local') {
+          const name = this.editForm.name.trim();
+          if (!name) {
+            ElMessage.warning('名字不能为空');
+            return;
+          }
+          if (name !== record.name) {
+            const ok = await this.store.rename(record.id, name);
+            if (!ok) {
+              ElMessage.error('改名失败');
+              return;
+            }
+          }
+        } else if (
+          this.editForm.syncMode !== record.syncMode ||
+          (this.editForm.syncMode === 'interval' &&
+            this.editForm.intervalMs !== record.syncIntervalMs)
+        ) {
+          const ok = await this.store.setSyncMode(
+            record.id,
+            this.editForm.syncMode,
+            this.editForm.intervalMs,
+          );
+          if (!ok) {
+            ElMessage.error('设置同步方式失败');
+            return;
+          }
         }
+        ElMessage.success('已保存');
+        this.editing = false;
+        await this.loadItems(record.id);
         void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
-        ElMessage.error('重命名失败：' + this.errMsg(err));
+        ElMessage.error('保存失败：' + errMsg(err));
+      } finally {
+        this.saving = false;
       }
     },
     // #endregion
@@ -780,7 +895,7 @@ export default defineComponent({
         /**
          * 封面在这里就规整成绝对 https（`normalizeImageUrl`）
          *
-         * 不能留给模板：B 站给的是 `//i0.hdslb.com/…` 这种协议相对地址，
+         * 不能留给模板：某站给的是 `//i0.hdslb.com/…` 这种协议相对地址，
          * 页面 origin 是 `blwe://app` 或 `file://`，直接绑上去会被解析成
          * `blwe://i0.hdslb.com/…` —— 图全裂。
          *
@@ -799,7 +914,7 @@ export default defineComponent({
          * 用户此时要做的是「去登录」或「改用粘贴链接」，弹窗只会挡路。
          */
         this.folders = [];
-        this.folderError = this.errMsg(err);
+        this.folderError = errMsg(err);
       } finally {
         this.loadingFolders = false;
       }
@@ -819,7 +934,7 @@ export default defineComponent({
       } catch (err) {
         // 和收藏夹同一条原则：读不出来就在行内说原因，别弹窗挡路
         this.subs = [];
-        this.subError = this.errMsg(err);
+        this.subError = errMsg(err);
       } finally {
         this.loadingSubs = false;
       }
@@ -844,7 +959,7 @@ export default defineComponent({
           void this.ui.refreshBrowseAfterEdit();
           ElMessage.success(`已创建《${record.name}》，点「添加视频」往里加条目`);
         } catch (err) {
-          ElMessage.error('创建失败：' + this.errMsg(err));
+          ElMessage.error('创建失败：' + errMsg(err));
         } finally {
           this.creatingBusy = false;
         }
@@ -859,7 +974,7 @@ export default defineComponent({
       if (this.form.source === 'link') {
         const text = this.form.link.trim();
         if (!text) {
-          ElMessage.warning('请粘贴 B 站列表链接');
+          ElMessage.warning('请粘贴某站列表链接');
           return;
         }
         const parsed = await api.parseListInput(text);
@@ -907,7 +1022,7 @@ export default defineComponent({
         await this.loadItems(record.id);
         void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
-        ElMessage.error('导入失败：' + this.errMsg(err));
+        ElMessage.error('导入失败：' + errMsg(err));
       } finally {
         this.creatingBusy = false;
       }
@@ -927,17 +1042,38 @@ export default defineComponent({
             (r.skipped ? `（跳过 ${r.skipped} 个）` : ''),
         );
         if (this.selectedId === item.id) await this.loadItems(item.id);
+        // 正在播的就是这个列表 → 队列里的条目可能变了（增删都算）。
+        // `reloadCurrentPlaylistSongs` 只换 songs 数组、保持当前播放，不会打断。
+        if (this.store.activeId === item.id) void this.queue.reloadCurrentPlaylistSongs();
         void this.ui.refreshBrowseAfterEdit();
       } catch (err) {
-        ElMessage.error('同步失败：' + this.errMsg(err));
+        ElMessage.error('同步失败：' + errMsg(err));
       }
     },
+    /**
+     * 「全部同步」
+     *
+     * 走 store 的 `syncAll`：那里的过滤（本地列表跳过、手动同步的跳过）
+     * 和启动同步 / 定时同步用的是**同一份**判断，不会三处各写一套。
+     * store 内部串行、失败不打断后面的。
+     */
     async syncAll(): Promise<void> {
-      // 本地列表没有远端来源，跳过（按钮的禁用条件也按「可同步列表数」算）
-      for (const item of this.store.lists.filter((l) => l.kind !== 'local')) {
-        // 串行：并发拉列表很容易触发 412，而且这里的失败率不值得赌
-        // eslint-disable-next-line no-await-in-loop
-        await this.syncOne(item);
+      try {
+        const results = await this.store.syncAll();
+        const okCount = results.filter((r) => r.ok).length;
+        const failed = results.filter((r) => !r.ok);
+        if (okCount > 0) ElMessage.success(`已同步 ${okCount} 个列表`);
+        for (const r of failed) {
+          ElMessage.warning(`${r.name} 同步失败：${r.error ?? '未知错误'}`);
+        }
+        if (this.selectedId) await this.loadItems(this.selectedId);
+        // 正在播的列表如果在这次同步里，队列也得重载
+        if (results.some((r) => r.ok && r.id === this.store.activeId)) {
+          void this.queue.reloadCurrentPlaylistSongs();
+        }
+        void this.ui.refreshBrowseAfterEdit();
+      } catch (err) {
+        ElMessage.error('同步失败：' + errMsg(err));
       }
     },
     async remove(item: VideoListRecord): Promise<void> {
@@ -959,116 +1095,18 @@ export default defineComponent({
 </script>
 
 <style scoped>
-.vlm-head {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-}
-.vlm-title {
-  font-size: 16px;
-  font-weight: 600;
-}
-.vlm-summary {
-  font-size: 12px;
-  opacity: 0.55;
-}
-.vlm-body {
-  display: flex;
-  gap: 14px;
-  height: 60vh;
-}
-.vlm-side {
-  width: 240px;
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--panel-divider);
-  padding-right: 12px;
-}
-.vlm-side-list {
-  flex: 1;
-  overflow-y: auto;
-}
-.vlm-list-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 9px;
-  border-radius: 7px;
-  cursor: pointer;
-  margin-bottom: 2px;
-}
-.vlm-list-row:hover {
-  background: var(--panel-hover);
-}
-.vlm-list-row.sel {
-  background: var(--panel-active);
-}
-.vlm-list-row.cur .vlm-list-name {
-  font-weight: 600;
-}
-.vlm-list-main {
-  flex: 1;
-  min-width: 0;
-}
-.vlm-list-name {
-  font-size: 13px;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.vlm-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  flex: none;
-}
-.vlm-list-meta {
-  display: flex;
-  gap: 6px;
-  font-size: 11px;
-  opacity: 0.55;
-  margin-top: 2px;
-}
-.vlm-tag {
-  padding: 0 4px;
-  border-radius: 3px;
-  background: var(--panel-hover);
-}
-/* 「默认」标记：和普通来源标签区分开（它是身份，不是来源） */
-.vlm-tag-default {
-  color: var(--accent);
-}
-.vlm-syncing {
-  color: var(--accent);
-}
-.vlm-side-actions {
-  display: flex;
-  /* 竖排：第一行新建/同步，第二行切回歌单管理 */
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--panel-divider);
-}
-.vlm-side-row {
-  display: flex;
-  gap: 6px;
-}
-.vlm-side-actions :deep(.el-button) {
-  flex: 1;
-  margin-left: 0;
-}
-/* 「← 歌单管理」：它是切换器，视觉上要比动作按钮弱一档 */
-.vlm-side-switch {
-  opacity: 0.85;
-}
-/* 条目行尾：收藏爱心 / 移除 */
-.vlm-item-fav,
-.vlm-item-del {
+/*
+ * 只留「视频列表独有」的几块：行尾按钮（定位 / 收藏 / 移除）、收藏夹与订阅合集的封面网格，
+ * 以及表单里 <code> 的那点样式。弹窗骨架、左列表、条目行骨架、空态都在
+ * `ManagerDialog.vue` 里（非 scoped，类名 `mgr-`），两个管理器共用一份。
+ */
+/*
+ * 条目行尾：收藏爱心
+ *
+ * 「移除」那个 × 用的是 `ManagerDialog` 里的 `.mgr-row-btn`（歌单管理也用同一个），
+ * 这里只留爱心 —— 它有 `on` 状态，比通用按钮多一条规则。
+ */
+.vlm-item-fav {
   flex: none;
   display: inline-flex;
   align-items: center;
@@ -1079,8 +1117,7 @@ export default defineComponent({
   opacity: 0.45;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
 }
-.vlm-item-fav:hover,
-.vlm-item-del:hover {
+.vlm-item-fav:hover {
   background: var(--panel-hover);
   opacity: 1;
 }
@@ -1088,49 +1125,14 @@ export default defineComponent({
   opacity: 1;
   color: var(--accent-danger);
 }
-.vlm-item-del {
-  font-size: 16px;
-  line-height: 1;
-}
 
-/*
- * 失效的本地文件条目
- *
- * 做法是「压暗 + 保留点击」而不是「禁用」：点它不会播放（播了必然失败），
- * 而是直接弹重新定位 —— 用户看到一行灰的，第一反应就是「怎么修」，
- * 这时让他点了没反应是最糟的。
- */
-.vlm-item.missing .vlm-idx,
-.vlm-item.missing .vlm-item-name,
-.vlm-item.missing .vlm-item-dur {
-  opacity: 0.45;
-}
-.vlm-item.missing .vlm-thumb {
-  opacity: 0.4;
-}
-/* 下面那个角标是警告，不能被父级的 0.6 透明度一起压掉 */
-.vlm-item.missing .vlm-item-more {
-  opacity: 1;
-}
-.vlm-item.missing .vlm-item-author {
-  opacity: 0.5;
-}
-.vlm-missing-tag {
-  flex: none;
-  padding: 0 5px;
-  border-radius: 3px;
-  font-size: 10px;
-  line-height: 15px;
-  color: var(--accent-danger);
-  border: 1px solid var(--accent-danger);
-}
 /* 行尾的「定位」：失效条目的主操作，比图标按钮更需要被看见 */
 .vlm-item-fix {
   flex: none;
   height: 22px;
   padding: 0 7px;
   border-radius: 5px;
-  font-size: 11px;
+  font-size: calc(11px * var(--fs));
   line-height: 21px;
   color: var(--accent-strong);
   border: 1px solid transparent;
@@ -1141,168 +1143,7 @@ export default defineComponent({
   border-color: var(--accent-strong);
 }
 
-.vlm-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.vlm-main-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-bottom: 9px;
-}
-.vlm-main-info {
-  flex: 1;
-  min-width: 0;
-}
-.vlm-main-name {
-  font-size: 14px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.vlm-main-sub {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 11px;
-  opacity: 0.55;
-  margin-top: 3px;
-}
-.vlm-main-actions {
-  display: flex;
-  gap: 6px;
-  flex: none;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-.vlm-main-actions :deep(.el-button) {
-  margin-left: 0;
-}
-.vlm-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.vlm-search-count {
-  font-size: 11px;
-  opacity: 0.55;
-  flex: none;
-}
-.vlm-items {
-  flex: 1;
-  overflow-y: auto;
-  border: 1px solid var(--panel-divider);
-  border-radius: 8px;
-}
-.vlm-item {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 6px 9px;
-  cursor: pointer;
-  border-bottom: 1px solid var(--panel-hover);
-}
-.vlm-item:last-child {
-  border-bottom: none;
-}
-.vlm-item:hover {
-  background: var(--panel-hover);
-}
-.vlm-item.playing {
-  background: var(--panel-active);
-}
-.vlm-item.playing .vlm-item-name {
-  color: var(--accent-strong);
-  font-weight: 600;
-}
-.vlm-idx {
-  width: 30px;
-  flex: none;
-  text-align: right;
-  font-size: 11px;
-  opacity: 0.5;
-  font-variant-numeric: tabular-nums;
-}
-.vlm-thumb {
-  height: 32px;
-  min-width: 32px;
-  flex: none;
-  border-radius: 5px;
-  overflow: hidden;
-  background: rgba(128, 128, 128, 0.18);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.vlm-thumb img {
-  height: 32px;
-  width: auto;
-  max-width: 84px;
-  object-fit: contain;
-  display: block;
-}
-.vlm-item-info {
-  flex: 1;
-  min-width: 0;
-}
-.vlm-item-name {
-  font-size: 13px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.vlm-item-more {
-  display: flex;
-  gap: 7px;
-  font-size: 11px;
-  opacity: 0.6;
-  margin-top: 1px;
-  overflow: hidden;
-}
-.vlm-item-author {
-  max-width: 60%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.vlm-item-dur {
-  flex: none;
-  font-size: 11px;
-  opacity: 0.5;
-  font-variant-numeric: tabular-nums;
-}
-
-.vlm-form {
-  padding: 2px 4px;
-  overflow-y: auto;
-}
-.vlm-form-title {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 10px;
-}
-/* 和歌单管理的 `.plm-field` 保持同一套间距，两个弹窗看起来才是一家的 */
-.vlm-field {
-  margin-bottom: 12px;
-}
-.vlm-field label {
-  display: block;
-  font-size: 12px;
-  opacity: 0.7;
-  margin-bottom: 5px;
-}
-.vlm-hint {
-  font-size: 11px;
-  opacity: 0.55;
-  margin-top: 6px;
-  line-height: 1.6;
-}
-.vlm-hint code {
+.mgr-hint code {
   background: var(--panel-hover);
   padding: 0 3px;
   border-radius: 3px;
@@ -1359,7 +1200,7 @@ export default defineComponent({
   display: block;
 }
 .vlm-pick-name {
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   margin-top: 5px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1371,29 +1212,9 @@ export default defineComponent({
   font-weight: 600;
 }
 .vlm-pick-meta {
-  font-size: 11px;
+  font-size: calc(11px * var(--fs));
   opacity: 0.55;
   margin-top: 1px;
   font-variant-numeric: tabular-nums;
-}
-.vlm-form-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  padding-top: 10px;
-  margin-top: 8px;
-  border-top: 1px solid var(--panel-divider);
-}
-.vlm-empty {
-  padding: 24px 8px;
-  text-align: center;
-  font-size: 12px;
-  opacity: 0.5;
-}
-.vlm-empty.big {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 </style>

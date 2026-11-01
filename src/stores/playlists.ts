@@ -185,6 +185,28 @@ export const usePlaylistStore = defineStore('playlists', () => {
   }
 
   /**
+   * 从**本地歌单**删掉一条曲目
+   *
+   * 平台歌单的曲目是远端投影，删了下次同步又回来 —— 所以只对本地歌单生效。
+   * 界面上那个按钮也只对本地歌单渲染（两道闸，和改名 / 添加同一套规则）。
+   *
+   * 按**下标**删而不是按歌名：本地歌单允许同一首歌重复出现（用户手动加了两遍），
+   * 按 id 删会把两条一起干掉。下标就是 `songs` 数组的原始下标。
+   *
+   * @returns 真的删掉了才返回 true
+   */
+  const removeSongAt = async (playlistId: string, index: number): Promise<boolean> => {
+    if (!isLocalPlaylistId(playlistId)) return false
+    const target = playlists.value.find((p) => p.id === playlistId)
+    if (!target) return false
+    if (!Number.isInteger(index) || index < 0 || index >= target.songs.length) return false
+    await updatePlaylist(playlistId, {
+      songs: target.songs.filter((_, i) => i !== index),
+    })
+    return true
+  }
+
+  /**
    * 把平台歌单转成本地歌单（**不可逆**）
    *
    * 主进程会换一个新 id（`pl_<uuid>`），所以这里要做三件事：
@@ -320,6 +342,7 @@ export const usePlaylistStore = defineStore('playlists', () => {
     persist,
     addPlaylist,
     updatePlaylist,
+    removeSongAt,
     convertToLocal,
     removePlaylist,
     setCurrent,

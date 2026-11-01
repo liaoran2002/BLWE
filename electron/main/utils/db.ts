@@ -106,7 +106,7 @@ const loadSqlite = (): SqliteConstructor => {
  * 于是同一个 bvid 出现在两首歌的候选里就要存两份 27KB 的 dash，过期还要刷两遍。
  *
  * 曾经也试过拆出 `video_details`（按 bvid 唯一）又合回来 —— 那时的理由是
- * 「重复很少见」。这次必须拆，原因是新增的 **B 站视频列表**：
+ * 「重复很少见」。这次必须拆，原因是新增的 **某站视频列表**：
  * 列表条目不再经过搜索，同一个 bvid 同时被「音乐候选」和「视频列表」引用是常态，
  * 而删除其中一边的关系时**绝不能连带删掉另一边还在用的地址缓存**。
  *
@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS playlists (
 -- ## id = '平台_平台歌曲id'（如 'tx_101104624'）
 --
 -- ⚠️ 它**只在这里用**。'videos.search_key' 存的是**歌名**（见下面 videos 表）——
--- 那些表要拿键去搜 B站，用 id 搜不出任何东西。
+-- 那些表要拿键去搜 某站，用 id 搜不出任何东西。
 --
 -- 手动添加的歌没有平台 id，'songId()' 会退化成 '歌名-歌手'。
 CREATE TABLE IF NOT EXISTS songs (
@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_playlist_songs_song ON playlist_songs(song_id);
 -- ## 'search_key' 有两种取值
 --
 --   1. 音乐搜索的「歌名-歌手」（'新地球-林俊杰'）；
---   2. 直连条目的 'bv:<bvid>' —— B 站视频列表里的条目**本来就是视频**，
+--   2. 直连条目的 'bv:<bvid>' ——某站视频列表里的条目**本来就是视频**，
 --      这里给它留一行不是为了搜索，而是为了让「候选列表」这个抽象统一：
 --      api:searchSong 一看到 bv: 前缀就短路，直接返回这一条。
 CREATE TABLE IF NOT EXISTS song_videos (
@@ -235,7 +235,7 @@ CREATE TABLE IF NOT EXISTS videos (
   -- **durl 的清晰度编码在这个 URL 里**：实测「...-1-192.mp4」对应 quality 64、
   -- 「...-1-208.mp4」对应 80，即「URL 数字 = quality + 128」（24/24 样本成立，映射唯一）。
   -- 所以**不再单独存 quality 列** —— 读的时候从 URL 反推（见 utils/quality.ts）。
-  -- 这是 B 站的 URL 命名约定而不是契约，所以那边反推失败时**不显示档位**，绝不猜。
+  -- 这是某站的 URL 命名约定而不是契约，所以那边反推失败时**不显示档位**，绝不猜。
   durl_url       TEXT,
   -- dash 视频轨**完整数组**（JSON）：含 baseUrl + backupUrl + id / width / height / mime
   --
@@ -270,7 +270,7 @@ CREATE TABLE IF NOT EXISTS song_meta (
   -- **搜索结果**是在什么登录态下取的（0/1/NULL）。
   -- 刻意与 videos.playurl_login_state 分开：两者是不同时刻、不同请求的登录态快照 ——
   -- 搜索可能几小时前就做了，而地址是刚刚解析的。合并成一个字段必然互相覆盖。
-  -- 用途：未登录时 B 站只返回部分结果，登录后可用它判断「这份结果该重搜」。
+  -- 用途：未登录时某站只返回部分结果，登录后可用它判断「这份结果该重搜」。
   search_login_state INTEGER,
   updated_at    INTEGER NOT NULL
 );
@@ -282,7 +282,7 @@ CREATE INDEX IF NOT EXISTS idx_song_videos_bvid ON song_videos(bvid);
 -- 过期清理按 playurl_at 扫；这张表会随视频数一直长，没索引就得全表扫
 CREATE INDEX IF NOT EXISTS idx_videos_playurl_at ON videos(playurl_at);
 
--- 视频列表本身（B 站收藏夹 / 合集 / 系列 / 本地列表）
+-- 视频列表本身（某站收藏夹 / 合集 / 系列 / 本地列表）
 --
 -- 与 playlists（音乐平台歌单）**并列**、互不干扰：那是「歌名-歌手 → 要搜索」，
 -- 这是「条目就是视频」，两条通道各自独立的表，共同的下游只有 videos。
@@ -301,8 +301,13 @@ CREATE TABLE IF NOT EXISTS videolists (
   name         TEXT    NOT NULL,
   cover        TEXT,
   item_count   INTEGER,
-  -- 重新同步的策略（**不是**音乐那边的 sync_interval_ms）
-  sync_mode    TEXT    NOT NULL DEFAULT 'off',   -- off | manual
+  -- 重新同步的策略，和音乐歌单同一套语义
+  --   off      = 手动同步（只有点这个列表的「同步」才更新）
+  --   startup  = 每次启动应用时同步
+  --   interval = 定时自动同步（间隔见 sync_interval_ms）
+  sync_mode        TEXT    NOT NULL DEFAULT 'off',
+  -- 只对 interval 有意义；0 = 没设过
+  sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at INTEGER,
   -- 播到第几条（下标）。必须持久化：条目增删后要靠 bvid 重定位（见 utils/videolist.ts）
   last_index   INTEGER NOT NULL DEFAULT 0,
@@ -313,7 +318,7 @@ CREATE TABLE IF NOT EXISTS videolists (
 -- 列表成员 + 顺序
 --
 -- 为什么不能把 ord 塞进 videos：同一个视频可以同时在两个收藏夹、两个合集、
--- 以及一份音乐歌单里（B 站允许，且很常见）。videos 一行只能记一个 ord。
+-- 以及一份音乐歌单里（某站允许，且很常见）。videos 一行只能记一个 ord。
 -- 这和 playlist_songs、song_videos 是同一个模式（第三次出现）。
 --
 -- ## 主键是 (list_id, bvid)，**不含 ord**
@@ -332,8 +337,8 @@ CREATE TABLE IF NOT EXISTS videolist_items (
   ord        INTEGER NOT NULL DEFAULT 0,
   -- 收藏：1 = 在置顶区。同步时**保留**，不会被远端顺序冲掉
   favorites  INTEGER NOT NULL DEFAULT 0,
-  -- 来源：sync = 从 B 站拉的；local = 用户手动添加的。
-  -- 同步时 local 一律保留 —— B 站上没有它，删了就再也找不回来
+  -- 来源：sync = 从某站拉的；local = 用户手动添加的。
+  -- 同步时 local 一律保留 ——某站上没有它，删了就再也找不回来
   origin     TEXT    NOT NULL DEFAULT 'sync',
   -- 加入 / 置顶的时刻（同一秒内连续操作时的稳定排序依据）
   added_at   INTEGER NOT NULL DEFAULT 0,
@@ -427,15 +432,28 @@ const getDbPath = (): string => path.join(app.getPath('userData'), DB_FILE_NAME)
  *
  * 现在改成：把**建表语句本身**做一次哈希当 `user_version` 的值。
  * 于是：
- *  - 只要 `CREATE_TABLES_SQL` 有一个字符变了，指纹就变 → 自动重建；
+ *  - 只要 `CREATE_TABLES_SQL` 的**结构**有一个字符变了，指纹就变 → 自动重建；
+ *    （注释和空白会先被 `normalizeDdl` 抹掉，改注释、调缩进不会触发重建）
  *  - 忘了"升版本"这件事**不可能再发生**（因为根本没有版本号要维护）；
  *  - 开发阶段反复改 schema 不用管版本，改完重启就生效。
  *
  * 代价：**每次改 schema 都会清库**（开发阶段无所谓，本来也没数据）。
  * 真要保留数据，把 `CREATE_TABLES_SQL` 改成增量 `ALTER TABLE` 即可。
  */
+/**
+ * 把建表语句规整成「只含结构」的形态：去掉 `--` 注释、压缩空白
+ *
+ * 指纹必须只反映**结构**。以前直接哈希原文，于是改一句注释、调一次缩进，
+ * 指纹就变 → 下次启动把用户的库整个重建。注释不是结构，不该有这个权力。
+ */
+const normalizeDdl = (sql: string): string =>
+  sql
+    .replace(/--[^\n]*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
 const schemaFingerprint = (): number => {
-  const hash = createHash('sha256').update(CREATE_TABLES_SQL, 'utf8').digest()
+  const hash = createHash('sha256').update(normalizeDdl(CREATE_TABLES_SQL), 'utf8').digest()
   // `user_version` 是有符号 32 位整数，取前 4 字节并保证为正
   return hash.readUInt32BE(0) & 0x7fffffff
 }
@@ -643,7 +661,7 @@ const migrateSchema = (database: SqliteDatabase): void => {
  * 取数据库连接（惰性初始化 + 建表）
  *
  * 失败时**先 console.error 说明原因再抛**：静默降级成「没有缓存」会让用户
- * 以为是 B 站接口的问题，实际是本地库打不开（权限、磁盘满、文件被占用）。
+ * 以为是某站接口的问题，实际是本地库打不开（权限、磁盘满、文件被占用）。
  */
 export const getDb = (): SqliteDatabase => {
   if (db && db.open) return db
@@ -699,7 +717,7 @@ export const getDb = (): SqliteDatabase => {
  *
  * ## ⚠️ 必须同时看两张引用表
  *
- * 只看 `song_videos` 会把**视频列表正在用的地址缓存**删掉：B 站列表条目
+ * 只看 `song_videos` 会把**视频列表正在用的地址缓存**删掉：某站列表条目
  * 在 `song_videos` 里有 `bv:<bvid>` 一行，但那个关系可能在「清空缓存」或
  * 「重新同步」时被清过，而 `videolist_items` 仍然引用着它。
  *

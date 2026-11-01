@@ -113,7 +113,7 @@ export const playbackState = (): PlaybackState => ({
    * 那是主进程的命名细节，改一次就得全渲染层跟着改。
    *
    * 用途只有一个：`<video>` 报错时分开处理 —— 本地文件只有「丢了」和
-   * 「解不出来」两种可能，不该走 B 站那套「跳过缓存重试 → 跳下一条」。
+   * 「解不出来」两种可能，不该走某站那套「跳过缓存重试 → 跳下一条」。
    */
   currentBvidIsLocal: false,
 
@@ -807,7 +807,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
   /**
    * 换到**同一个清晰度**的另一个源（不重新解析，只换 URL）
    *
-   * 为什么值得做：卡顿往往是某个 CDN 节点的问题，B 站每条流都给了
+   * 为什么值得做：卡顿往往是某个 CDN 节点的问题，某站每条流都给了
    * `baseUrl` + 多个 `backupUrl`（不同 CDN）。换一个通常立刻就好，
    * 比降清晰度 / 重新解析都快。
    */
@@ -956,7 +956,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
     }
   
     /**
-     * ★ 本地文件：只有两种失败，别混进 B 站那套重试 / 跳过
+     * ★ 本地文件：只有两种失败，别混进某站那套重试 / 跳过
      *
      * 「跳过缓存重试一次」对本地文件是纯浪费（没有缓存、没有签名过期），
      * 「跳下一条」更糟：文件只是被挪走了，用户要的是**指回去**，不是绕过它。
@@ -999,7 +999,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
      *
      * 视频列表的条目是外部数据，已删除 / 私享 / 充电专属 / 地区限制都很常见。
      * 全部或大半失效时，`next()` 会一条接一条地跳，每条还要重解析两次 ——
-     * 几十条下来就是一批请求，B 站直接 412。
+     * 几十条下来就是一批请求，某站直接 412。
      * 所以连续跳过 5 条就**停下来**，把决定权交回用户。
      */
     if (this.queueStore.fromVideoList) {
@@ -1300,7 +1300,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
   /**
    * 把当前的 dash / durl 结果挂到 `<video>` 上
    *
-   * dash 走 MSE：B 站 dash 的音视频是两条独立的流，只给一条会没声音，
+   * dash 走 MSE：某站 dash 的音视频是两条独立的流，只给一条会没声音，
    * 所以由 DashSession 把两轨都塞进同一个 MediaSource；
    * 编码不支持或播放失败就自动退回 durl（720P 混流）。
    */
@@ -1339,7 +1339,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
   /**
    * 取「当前播放源」的曲目
    *
-   * 两个来源（B 站视频列表 / 音乐歌单）在播放层长得一模一样，
+   * 两个来源（某站视频列表 / 音乐歌单）在播放层长得一模一样，
    * 差别只有两点：`songs` 从哪来、播到第几条记在哪张表。
    * 这里一次抹平，续播和首启两条路就不用各写一遍分支 ——
    * 否则「视频列表忘了写 last_index」这种 bug 只会出现在其中一条路上。
@@ -1713,7 +1713,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
     /**
      * 提示要区分「被限流」和「其它失败」—— 两者**解决办法完全不同**
      *
-     * 主进程遇到 B 站的 HTTP 412（或「第 1 轮就返回 0 条」）会抛
+     * 主进程遇到某站的 HTTP 412（或「第 1 轮就返回 0 条」）会抛
      * `RateLimitError`，错误消息里已经写明「切歌太快」。那种情况说「网络有问题」
      * 会把用户引到完全错误的方向 —— 他需要的是**等一会儿**。
      */
@@ -1738,7 +1738,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
   /**
    * 主进程回传了更准的时长：更新列表那一行 + 回写库
    *
-   * B 站搜索接口**有些结果压根不带 `duration`**，缓存里就存成 NULL，
+   * 某站搜索接口**有些结果压根不带 `duration`**，缓存里就存成 NULL，
    * 列表那一行显示空秒数。真正开始播放时一定拿得到（view 响应里有），
    * 所以补上并回写 —— 不然下次重开还是空的，每次都要再补一遍。
    */
@@ -1862,7 +1862,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
      * 逐个补漏迟早会漏。放在这里，**任何**入口在请求在飞时都点不动。
      *
      * 为什么必须拦：切歌 = 重新搜索 + 解析地址（两个请求）。
-     * 连点就是请求成倍叠加，B站直接 412 风控。
+     * 连点就是请求成倍叠加，某站直接 412 风控。
      */
     if (this.uiStore.netBusy) {
       this.uiStore.notifyNetBusy();
@@ -2001,7 +2001,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
      *
      * 预热是「后台悄悄准备下一首」，用户并不着急 —— 而它同样要打两个请求
      * （搜索 + 解析）。如果主流程正在搜索/解析（`netBusy`），再叠上来
-     * 就是在同一时刻往上堆请求，正是 B站 412 的成因。
+     * 就是在同一时刻往上堆请求，正是 某站 412 的成因。
      *
      * 所以这里**让路**：等主流程忙完，下一跳心跳（每秒一次）再试。
      *
@@ -2056,7 +2056,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
          * **每秒发一次真网络请求，永不停止**。
          *
          * 症状：控制台同一个关键词刷几十行「搜索结果为空」，
-         * 界面变卡（尤其是「歌名-歌手」很长的缓存键，B 站必然搜不到）。
+         * 界面变卡（尤其是「歌名-歌手」很长的缓存键，某站必然搜不到）。
          *
          * 现在按「重试 3 次、间隔 3 秒」处理：没到上限就等下一轮心跳
          * （心跳本身是 1 秒一次，所以额外加一个 3 秒的节流由 `_warmTries` 的时间戳控制）。
@@ -2074,10 +2074,10 @@ export const playbackActions: ThisType<PlaybackContext> = {
           /**
            * 提示用户 —— 但**只在未登录时**弹，因为那才是他能采取行动的情况。
            *
-           * 已登录还搜不到，多半是这首歌本身在 B 站没有对应视频（歌名太长、
+           * 已登录还搜不到，多半是这首歌本身在某站没有对应视频（歌名太长、
            * 多歌手用「、」连起来那种），提示「请登录」是误导。
            *
-           * ⚠️ 文案**不描述 B 站的返回机制**（别说「未登录时只返回部分结果」）——
+           * ⚠️ 文案**不描述某站的返回机制**（别说「未登录时只返回部分结果」）——
            * 那是内部行为，写进用户可见的提示里没必要。
            */
           if (!this.sessionStore.isLoggedIn) {
@@ -2239,10 +2239,10 @@ export const playbackActions: ThisType<PlaybackContext> = {
    *
    * ## 为什么必须搬去主进程
    *
-   * 原来主进程按「收藏 + B 站顺序」写 `ord`，渲染层拿到后又按打分重排一遍 ——
+   * 原来主进程按「收藏 +某站顺序」写 `ord`，渲染层拿到后又按打分重排一遍 ——
    * 于是**界面顺序和库里顺序是两套**。「收藏再取消来提升顺序」这种依赖持久化
    * 顺序的用法一重新搜索就散（取消后 `favorites` 变 0、合并时不再保留位置，
-   * 它就回到 B 站顺序了）。
+   * 它就回到某站顺序了）。
    *
    * 现在 `rankVideos` 在**写库之前**执行，`videos.ord` 直接等于最终显示顺序，
    * 搜索返回的列表**已经是排好的** —— 渲染层不再有任何排序逻辑。
@@ -2279,7 +2279,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
    * ## ★ **不传 `skipCache`**（这里改过一次）
    *
    * 原来传的是 `skipCache: true`（「我改了清晰度，快重新取」）。但那是**多余**的：
-   * B站给的一条 dash 流里**本来就带全部候选档位**，我们库里存的
+   * 某站给的一条 dash 流里**本来就带全部候选档位**，我们库里存的
    * `playurl_result` 是**整个 playurl 响应**。所以换清晰度只需要
    * `extractDashStreams(缓存的 playurl, 新qn, 新audioId)` —— 从同一份响应里
    * 按新档位重新挑一条流，**根本不用联网**。
@@ -2349,7 +2349,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
   },
 
   /**
-   * 当前歌曲对应的视频封面（B 站缩略图）
+   * 当前歌曲对应的视频封面（某站缩略图）
    *
    * 优先用正在播放的那个视频的缩略图，其次用候选列表里那一条的缩略图。
    *

@@ -1,109 +1,52 @@
 <template>
-  <el-dialog
-    v-model="visible"
-    width="960px"
-    :show-close="false"
-    align-center
+  <!--
+    界面（弹窗 / 左列表 / 右侧三态 / 搜索 / 条目行）全部由 `ManagerDialog` 渲染，
+    这里只留两样真正属于「歌单」的东西：
+      · 表单（新建 / 编辑，按平台 / 本地分流的字段）
+      · 详情头右侧的动作按钮（同步 / 编辑 / 从这里播放 / 删除）
+  -->
+  <ManagerDialog
+    v-model:visible="visible"
+    v-model:selected-id="selectedId"
+    title="歌单管理"
+    :summary="`共 ${store.playlists.length} 个歌单 · ${totalSongs} 首`"
+    :lists="dialogLists"
+    :mode="dialogMode"
+    :detail="dialogDetail"
+    :rows="dialogRows"
+    current-hint="当前播放歌单"
+    create-label="新建歌单"
+    switch-label="视频管理 →"
+    :sync-all-disabled="store.playlists.length === 0 || store.isSyncing"
+    :sync-all-loading="store.isSyncing"
+    search-placeholder="搜索歌名 / 歌手 / 专辑"
+    empty-list-text="还没有歌单，点下面「新建歌单」开始"
+    empty-main-text="从左边选一个歌单查看曲目，或点「新建歌单」"
+    empty-rows-text="这个歌单还没有曲目"
+    empty-search-text="没有匹配的歌曲"
+    @create="startCreate"
+    @sync-all="syncAll"
+    @switch="void ui.openManager('ov')"
+    @play="play($event.index)"
   >
-    <template #header>
-      <div class="plm-head">
-        <span class="plm-title">歌单管理</span>
-        <span class="plm-summary">
-          共 {{ store.playlists.length }} 个歌单 · {{ totalSongs }} 首
-        </span>
-      </div>
-    </template>
+    <!--
+      编辑 / 新建（内联，不再单开弹窗）
 
-    <div class="plm-body">
-      <!-- 左：歌单列表 -->
-      <div class="plm-side">
-        <div class="plm-side-list">
-          <div
-            v-for="item in store.playlists"
-            :key="item.id"
-            class="plm-pl"
-            :class="{ sel: item.id === selectedId, cur: item.id === store.currentId }"
-            @click="selectedId = item.id"
-          >
-            <div class="plm-pl-main">
-              <div class="plm-pl-name" :title="item.name">
-                <span v-if="item.id === store.currentId" class="plm-dot" title="当前播放歌单"></span>
-                {{ item.name }}
-              </div>
-              <div class="plm-pl-meta">
-                <span>{{ item.songs.length }} 首</span>
-                <span v-if="item.isDefault" class="plm-tag plm-tag-default" title="拖入的单曲会放进这里，不能删除">
-                  默认
-                </span>
-                <span v-if="isLocal(item.id)" class="plm-tag" title="本地歌单：不跟随平台更新，可自由增删">本地</span>
-                <span v-else-if="item.source" class="plm-tag">{{ sourceLabel(item.source) }}</span>
-              </div>
-            </div>
-            <span
-              class="plm-spin"
-              :class="{ on: store.isSyncingOne(item.id) }"
-              title="同步中"
-              v-if="store.isSyncingOne(item.id)"
-            >
-              <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                <path
-                  d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2v3.5H10"
-                  stroke="currentColor"
-                  stroke-width="1.4"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </span>
-          </div>
+      **两类歌单的表单不一样，这不是偷懒**：
+      平台歌单（`tx_8153225605`）的名字、链接、曲目都属于平台，应用内只让改同步方式；
+      本地歌单（`pl_` 前缀）没有同步，链接框退化成「导入器」——
+      贴链接保存 = 把那个歌单的歌追加进来一次，导完不留链接。
+    -->
+    <template #form>
+      <div class="mgr-form">
 
-          <div v-if="store.playlists.length === 0" class="plm-empty">
-            还没有歌单，点下面「新建歌单」开始
-          </div>
-        </div>
-
-        <div class="plm-side-actions">
-          <div class="plm-side-row">
-            <el-button size="small" type="primary" @click="startCreate">新建歌单</el-button>
-            <el-button
-              size="small"
-              :disabled="store.playlists.length === 0 || store.isSyncing"
-              :loading="store.isSyncing"
-              @click="syncAll"
-            >
-              全部同步
-            </el-button>
-          </div>
-          <!--
-            切换工作区：点它 = 切到 OV 模式并打开「视频管理」
-
-            放在这一排按钮**下面**（用户要求）：上面两个是「歌单管理」自己的动作，
-            这个是「换个管理器」，语义不同，不该混在同一排里。
-          -->
-          <el-button class="plm-side-switch" size="small" @click="void ui.openManager('ov')">
-            视频管理 →
-          </el-button>
-        </div>
-      </div>
-
-      <!-- 右：编辑表单 或 选中歌单的曲目 -->
-      <div class="plm-main">
-        <!--
-          编辑 / 新建（内联，不再单开弹窗）
-
-          **两类歌单的表单不一样，这不是偷懒**：
-          平台歌单（`tx_8153225605`）的名字、链接、曲目都属于平台，应用内只让改同步方式；
-          本地歌单（`pl_` 前缀）没有同步，链接框退化成「导入器」——
-          贴链接保存 = 把那个歌单的歌追加进来一次，导完不留链接。
-        -->
-        <div v-if="editing" class="plm-form">
-          <div class="plm-form-title">
+          <div class="mgr-form-title">
             {{ editingId ? (editingLocal ? '编辑本地歌单' : '平台歌单设置') : '新建歌单' }}
           </div>
 
-          <div class="plm-field">
+          <div class="mgr-field">
             <label>歌单名称</label>
-            <div v-if="editingRemote" class="plm-readonly">{{ form.name || '（同步后以平台为准）' }}</div>
+            <div v-if="editingRemote" class="mgr-readonly">{{ form.name || '（同步后以平台为准）' }}</div>
             <el-input
               v-else
               v-model="form.name"
@@ -111,14 +54,14 @@
               placeholder="不填会自动取远端歌单名"
               clearable
             />
-            <div v-if="editingRemote" class="plm-hint">
+            <div v-if="editingRemote" class="mgr-hint">
               平台歌单的名字跟着平台走，要改请去平台上改；同步时会自动更新过来
             </div>
           </div>
 
-          <div class="plm-field">
+          <div class="mgr-field">
             <label>{{ editingLocal ? '导入其他歌单' : '歌单链接' }}</label>
-            <div v-if="editingRemote" class="plm-readonly">{{ form.sourceUrl || '（无）' }}</div>
+            <div v-if="editingRemote" class="mgr-readonly">{{ form.sourceUrl || '（无）' }}</div>
             <el-input
               v-else
               v-model="form.sourceUrl"
@@ -126,11 +69,11 @@
               :placeholder="
                 editingLocal
                   ? '粘贴歌单链接，保存后把里面的歌追加进来'
-                  : '粘贴 网易云 / QQ音乐 / 酷我音乐 的歌单分享链接'
+                  : '粘贴 wy / tx / kw 的歌单分享链接'
               "
               clearable
             />
-            <div class="plm-hint">
+            <div class="mgr-hint">
               <template v-if="editingRemote">平台歌单的链接由平台管理，不能修改</template>
               <template v-else-if="editingLocal">
                 只导入一次：已有的歌自动跳过；导入后不保存链接，也不会建立同步
@@ -139,7 +82,7 @@
             </div>
           </div>
 
-          <div v-if="!editingId" class="plm-field">
+          <div v-if="!editingId" class="mgr-field">
             <label>或手动填</label>
             <el-input
               v-model="form.manualSongs"
@@ -152,7 +95,7 @@
 
           <!-- 本地歌单没有同步这个概念，整块不显示 -->
           <template v-if="!editingLocal">
-            <div class="plm-field">
+            <div class="mgr-field">
               <label>同步方式</label>
               <el-select v-model="form.syncMode" size="small" style="width: 100%">
                 <el-option label="手动同步" value="off" />
@@ -161,7 +104,7 @@
               </el-select>
             </div>
 
-            <div v-if="form.syncMode === 'interval'" class="plm-field">
+            <div v-if="form.syncMode === 'interval'" class="mgr-field">
               <label>同步间隔</label>
               <el-select v-model="form.intervalMs" size="small" style="width: 100%">
                 <el-option
@@ -174,7 +117,7 @@
             </div>
           </template>
 
-          <div class="plm-form-actions">
+          <div class="mgr-form-actions">
             <el-button size="small" @click="cancelEdit">取消</el-button>
             <el-button size="small" type="primary" :loading="saving" @click="saveForm">
               {{ saving ? (editingId ? '保存中…' : '解析中…') : editingId ? '保存' : '创建' }}
@@ -196,25 +139,13 @@
               </template>
             </el-popconfirm>
           </div>
-        </div>
+        
+      </div>
+    </template>
 
-        <!-- 曲目列表 -->
-        <template v-else-if="selected">
-          <div class="plm-main-head">
-            <div class="plm-main-info">
-              <div class="plm-main-name">{{ selected.name }}</div>
-              <div class="plm-main-sub">
-                <span>{{ selected.songs.length }} 首</span>
-                <span v-if="isLocal(selected.id)" class="plm-tag">本地</span>
-                <span v-else-if="selected.source" class="plm-tag">{{ sourceLabel(selected.source) }}</span>
-                <!-- 本地歌单没有同步这个概念，同步方式 / 上次同步对它无意义 -->
-                <template v-if="!isLocal(selected.id)">
-                  <span>{{ syncLabel(selected) }}</span>
-                  <span>上次同步：{{ lastSyncText(selected) }}</span>
-                </template>
-              </div>
-            </div>
-            <div class="plm-main-actions">
+    <template #actions>
+      <!-- 外壳只在「详情态」渲染这个 slot，此时 selected 一定有值；v-if 是给类型收窄看的 -->
+      <template v-if="selected">
               <el-button
                 v-if="!isLocal(selected.id)"
                 size="small"
@@ -228,10 +159,10 @@
               <el-button
                 size="small"
                 type="primary"
-                :disabled="selected.id === store.currentId"
+                :disabled="isPlayingPlaylist(selected.id)"
                 @click="setCurrent(selected)"
               >
-                {{ selected.id === store.currentId ? '当前歌单' : '设为当前' }}
+                {{ isPlayingPlaylist(selected.id) ? '正在播放' : '从这里播放' }}
               </el-button>
               <el-popconfirm
                 title="确定删除这个歌单吗？不可恢复。"
@@ -253,83 +184,50 @@
                   </el-button>
                 </template>
               </el-popconfirm>
-            </div>
-          </div>
+      </template>
+    </template>
 
-          <div class="plm-search">
-            <el-input
-              v-model="keyword"
-              size="small"
-              placeholder="搜索歌名 / 歌手 / 专辑"
-              clearable
-            />
-            <span class="plm-search-count">{{ filtered.length }} / {{ selected.songs.length }}</span>
-          </div>
+    <!--
+      行尾的「从歌单移除」
 
-          <div class="plm-songs">
-            <div
-              v-for="row in filtered"
-              :key="row.index"
-              class="plm-song"
-              :class="{ playing: isPlayingRow(row) }"
-              @click="play(row.index)"
-            >
-              <div class="plm-idx">{{ row.index + 1 }}</div>
-              <div class="plm-thumb">
-                <img
-                  v-if="coverOf(row.song) && !failedCovers[coverOf(row.song) as string]"
-                  :src="coverOf(row.song) as string"
-                  alt=""
-                  referrerpolicy="no-referrer"
-                  loading="lazy"
-                  @error="onImgError"
-                />
-              </div>
-              <div class="plm-song-info">
-                <div class="plm-song-name" :title="row.song.name">{{ row.song.name }}</div>
-                <div class="plm-song-more">
-                  <span class="plm-song-singer">{{ row.song.singer || '未知歌手' }}</span>
-                  <span v-if="row.song.album" class="plm-song-album" :title="row.song.album">
-                    {{ row.song.album }}
-                  </span>
-                </div>
-              </div>
-              <div class="plm-song-dur">{{ formatDuration(row.song.duration) }}</div>
-            </div>
-            <div v-if="filtered.length === 0" class="plm-empty">
-              {{ selected.songs.length === 0 ? '这个歌单还没有曲目' : '没有匹配的歌曲' }}
-            </div>
-          </div>
-        </template>
-
-        <div v-else class="plm-empty big">从左边选一个歌单查看曲目，或点「新建歌单」</div>
-      </div>
-    </div>
-  </el-dialog>
+      只在**本地歌单**出现：平台歌单的曲目是远端的投影，删了下次同步又回来，
+      所以那种歌单整行都不给按钮（和改名、添加歌曲是同一套规则）。
+    -->
+    <template #row-actions="{ row }">
+      <template v-if="selected && isLocal(selected.id)">
+        <div
+          class="mgr-row-btn mgr-row-btn--x"
+          title="从歌单移除"
+          @click.stop="removeSong(selected, row)"
+        >
+          ×
+        </div>
+      </template>
+    </template>
+  </ManagerDialog>
 </template>
 
 <script lang="ts">
 import { defineComponent } from 'vue';
 import { ElMessage } from 'element-plus';
-import { SOURCE_LABELS, SYNC_INTERVAL_OPTIONS } from '@common/constants';
+import { SYNC_INTERVAL_OPTIONS } from '@common/constants';
 import type { PlaylistRecord, PlaylistSong } from '@common/types/playlist';
 import {
   isLocalPlaylistId,
   mergePlaylistSongs,
   parseCacheKey,
+  songId,
+  sourceOfSongId,
 } from '@common/types/playlist';
-// 库里存的是**秒**（schema v2 起统一），展示要转回 mm:ss；反向转换在解析音源时用
-import { formatDuration } from '@common/utils/duration';
 import api from '../api/electron';
+import ManagerDialog from './ManagerDialog.vue';
+import type { ManagerDetail, ManagerList, ManagerMode, ManagerRow, ManagerTag } from '../types/manager';
 import { usePlaylistStore } from '../stores/playlists';
 import { normalizeImageUrl } from '../utils/image';
+import { errMsg } from '../utils/errorText';
+import { formatSyncTime } from '../utils/datetime';
 import { useUiStore } from '../stores/ui';
 import { useQueueStore } from '../stores/queue';
-
-export interface Row {
-  index: number;
-  song: PlaylistSong;
-}
 
 export interface EditorForm {
   name: string;
@@ -339,21 +237,17 @@ export interface EditorForm {
   intervalMs: number;
 }
 
-const pad = (n: number): string => (n < 10 ? `0${n}` : String(n));
-
 export default defineComponent({
   name: 'PlaylistManager',
+  components: { ManagerDialog },
   data() {
     return {
       SYNC_INTERVAL_OPTIONS,
       selectedId: '',
-      keyword: '',
       editing: false,
       editingId: '',
       saving: false,
       originalSongs: [] as PlaylistSong[],
-      /** 加载失败的封面地址（按地址记，换一个地址就有一次新机会） */
-      failedCovers: {} as Record<string, boolean>,
       form: {
         name: '',
         sourceUrl: '',
@@ -392,10 +286,6 @@ export default defineComponent({
         this.ui.playlistManagerVisible = v;
       },
     },
-    /** 当前播放歌单的 id（用于高亮「当前」） */
-    currentPlaylistId(): string {
-      return this.store.currentId || '';
-    },
     /** 当前播放到第几首（仅当展示的是当前歌单时有意义） */
     currentIndex(): number {
       return this.queue.currentIndex;
@@ -419,72 +309,145 @@ export default defineComponent({
     editingRemote(): boolean {
       return !!this.editingId && !isLocalPlaylistId(this.editingId);
     },
-    filtered(): Row[] {
+    /**
+     * 给外壳的左栏列表
+     *
+     * 外壳不知道「歌单」是什么，只认 `ManagerList`：名字 / 数量文案 / 标签 / 是否在播 /
+     * 是否同步中。映射只有十几行，换来的是一条链路的唯一实现。
+     */
+    dialogLists(): ManagerList[] {
+      return this.store.playlists.map((p) => {
+        const tags: ManagerTag[] = [];
+        if (p.isDefault) {
+          tags.push({ text: '默认', tone: 'default', title: '拖入的单曲会放进这里，不能删除' });
+        }
+        if (isLocalPlaylistId(p.id)) {
+          tags.push({ text: '本地', title: '本地歌单：不跟随平台更新，可自由增删' });
+        } else if (p.source) {
+          /**
+           * 只显示短码（wy / tx / kw）
+           *
+           * **不给 tooltip**：之前把中文名挂在 `title` 上，鼠标一悬停就能看清是哪家，
+           * 截图一样会露 —— 要么只留短码，要么等于没藏。
+           */
+          tags.push({ text: this.sourceLabel(p.source) });
+        }
+        return {
+          id: p.id,
+          name: p.name,
+          countText: `${p.songs.length} 首`,
+          tags,
+          current: this.isPlayingPlaylist(p.id),
+          syncing: this.store.isSyncingOne(p.id),
+        };
+      });
+    },
+    /** 详情头：名字 / 数量 / 标签 / 同步状态（本地歌单没有同步，那两项不出现） */
+    dialogDetail(): ManagerDetail | null {
+      const s = this.selected;
+      if (!s) return null;
+      const local = isLocalPlaylistId(s.id);
+      const tags: ManagerTag[] = [];
+      if (local) tags.push({ text: '本地' });
+      else if (s.source) tags.push({ text: this.sourceLabel(s.source) });
+      const meta: string[] = local
+        ? []
+        : [this.syncLabel(s), `上次同步：${formatSyncTime(s.lastSyncAt)}`];
+      return { name: s.name, countText: `${s.songs.length} 首`, tags, meta };
+    },
+    /** 右侧主区停在哪一态：编辑/新建 → 表单，选中 → 详情，否则空态 */
+    dialogMode(): ManagerMode {
+      if (this.editing) return 'form';
+      return this.selected ? 'detail' : 'empty';
+    },
+    /**
+     * 给外壳的条目行
+     *
+     * `key` 用下标：歌单里的歌目前没有稳定的行 id（同一首歌可能重复出现两次），
+     * `index` 必须是**原始下标** —— 点第 N 行播列表里的第 N 条，过滤后从 0 数会播错。
+     */
+    dialogRows(): ManagerRow[] {
       const songs = this.selected?.songs ?? [];
-      const rows: Row[] = songs.map((song, index) => ({ index, song }));
-      const kw = this.keyword.trim().toLowerCase();
-      if (!kw) return rows;
-      return rows.filter(
-        (r) =>
-          r.song.name.toLowerCase().includes(kw) ||
-          (r.song.singer || '').toLowerCase().includes(kw) ||
-          (r.song.album || '').toLowerCase().includes(kw),
-      );
+      const isCurrent = this.isPlayingPlaylist(this.selected?.id ?? '');
+      /**
+       * 平台标记只在**本地歌单**里显示
+       *
+       * 平台歌单整列都来自同一个来源（详情头已经有一个平台标签了），
+       * 行内再标一遍是重复；本地歌单会混进多个平台的歌，久了确实记不住。
+       *
+       * 取值优先 `song.source`，老数据没有就退回 `songId()` 的前缀解析。
+       */
+      const showTag = !!this.selected && isLocalPlaylistId(this.selected.id);
+      return songs.map((song, index) => ({
+        key: index,
+        index,
+        title: song.name,
+        subtitle: song.singer || '未知歌手',
+        extra: song.album || '',
+        tag: showTag ? song.source || sourceOfSongId(songId(song)) || '' : '',
+        cover: normalizeImageUrl(song.cover),
+        duration: song.duration,
+        playing: isCurrent && index === this.currentIndex,
+      }));
     },
   },
   watch: {
-    modelValue(v: boolean) {
+    /** 打开时自动选中当前播放的歌单（原来是 watch `modelValue`，那个 prop 早就不存在了） */
+    visible(v: boolean) {
       if (v) this.onOpen();
     },
   },
   methods: {
-    /** 图片地址规整（协议相对 URL 在 file:// 页面下会坏掉） */
-    normalizeImageUrl,
     /** 打开时：默认选中当前歌单（或第一个），并清掉上次的编辑态 */
     onOpen() {
       this.editing = false;
-      this.keyword = '';
       const exists = this.store.playlists.some((p) => p.id === this.selectedId);
       if (!exists) {
         this.selectedId = this.store.currentId || this.store.playlists[0]?.id || '';
       }
     },
-    onImgError(e: Event) {
-      /**
-       * 记下坏掉的封面地址，而不是给 <img> 写内联 `display: none`。
-       *
-       * 曲目行是 `:key="row.index"`，切歌单时同一位置的 DOM 会被复用，
-       * Vue 只 patch `src`，那个内联样式不会被清掉 ——
-       * 结果一个歌单里坏了一张封面，别的歌单同一行的封面就永远是空的。
-       */
-      const img = e.target as HTMLImageElement;
-      const src = img.getAttribute('src');
-      if (!src) return;
-      if (Object.keys(this.failedCovers).length > 2000) this.failedCovers = {};
-      this.failedCovers[src] = true;
-    },
-    /** 封面地址（规整成 https）；空值交给模板判空 */
-    coverOf(song: PlaylistSong): string | null {
-      return normalizeImageUrl(song.cover);
-    },
     /**
-     * 时长（秒 -> `mm:ss`）给模板用
+     * 平台在界面上只显示**短码**（`wy` / `tx` / `kw`）
      *
-     * 曲目行显示时长走这个方法，而不是直接 `{{ song.duration }}` ——
-     * 库里存的是秒（`402`），直接显示会变成「402」而不是「06:42」。
+     * 界面上**任何地方**都不出现中文全名，包括 tooltip —— 悬停提示一样会露，
+     * 所以这类标签不挂 `title`。
      */
-    formatDuration,
-    isPlayingRow(row: Row): boolean {
-      // 只有展示的是「当前播放歌单」时才高亮当前曲
-      if (this.selected?.id !== this.store.currentId) return false;
-      return row.index === this.currentIndex;
-    },
     sourceLabel(source: string): string {
-      return SOURCE_LABELS[source] ?? source;
+      return source;
     },
     /** 这个歌单是不是本地歌单（模板里用它决定显示「本地」、隐藏同步相关） */
     isLocal(id: string): boolean {
       return isLocalPlaylistId(id);
+    },
+    /**
+     * 这个歌单**此刻是不是真的在播**
+     *
+     * 不能只看 `store.currentId`：它是「上次听的歌单」，播视频列表时不会被清掉
+     * （留着是为了切回歌单时能接上位置）。只看它的话，正在播视频、切到歌单管理，
+     * 那个歌单会亮着「正在播放」，条目行也高亮 —— 用户看到的正是这个。
+     *
+     * `queue.mode === 'mv'` 才是「当前播放源是歌单」的唯一判据。
+     */
+    /**
+     * 从当前歌单删掉一条曲目
+     *
+     * 只对本地歌单开放（平台歌单的曲目由平台决定，按钮本身也不渲染）。
+     *
+     * **不做二次确认**：删错的成本是「再点一次添加」，而为每一首弹一次确认，
+     * 清一个几十首的歌单会变成点几十次弹窗。视频那边之所以确认，是因为
+     * 移除会连带丢掉收藏和播放进度，这里没有这类副作用。
+     */
+    async removeSong(record: PlaylistRecord, row: ManagerRow): Promise<void> {
+      const ok = await this.store.removeSongAt(record.id, row.index);
+      if (!ok) {
+        ElMessage.warning('这条已经不在了');
+        return;
+      }
+      // 正在播的就是这个歌单 → 队列里的曲目要跟着变（只换数组，不打断当前播放）
+      if (this.isPlayingPlaylist(record.id)) void this.queue.reloadCurrentPlaylistSongs();
+    },
+    isPlayingPlaylist(id: string): boolean {
+      return this.queue.mode === 'mv' && id === this.store.currentId;
     },
     /**
      * 平台歌单 → 本地歌单（不可逆）
@@ -504,10 +467,10 @@ export default defineComponent({
         this.editing = false;
         this.editingId = '';
         this.resetForm();
-        if (record.id === this.store.currentId) void this.queue.reloadCurrentPlaylistSongs();
+        if (this.isPlayingPlaylist(record.id)) void this.queue.reloadCurrentPlaylistSongs();
         ElMessage.success(`《${record.name}》已转成本地歌单，可以自由增删歌曲了`);
       } catch (err) {
-        ElMessage.error(err instanceof Error ? err.message : String(err));
+        ElMessage.error(errMsg(err));
       } finally {
         this.saving = false;
       }
@@ -529,11 +492,6 @@ export default defineComponent({
         default:
           return '手动同步';
       }
-    },
-    lastSyncText(item: PlaylistRecord): string {
-      if (!item.lastSyncAt) return '从未';
-      const d = new Date(item.lastSyncAt);
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     },
 
     // #region 编辑 / 新建（内联）
@@ -609,7 +567,7 @@ export default defineComponent({
           this.editingId = '';
           this.resetForm();
         } catch (err) {
-          ElMessage.error(err instanceof Error ? err.message : String(err));
+          ElMessage.error(errMsg(err));
         } finally {
           this.saving = false;
         }
@@ -682,7 +640,7 @@ export default defineComponent({
           }
           this.selectedId = editedId;
           /** 改的正好是当前播放的歌单：曲目可能变了，通知队列重载（不重起播放） */
-          if (editedId === this.store.currentId) void this.queue.reloadCurrentPlaylistSongs();
+          if (this.isPlayingPlaylist(editedId)) void this.queue.reloadCurrentPlaylistSongs();
         } else {
           const created = await this.store.addPlaylist({
             name: finalName,
@@ -703,7 +661,7 @@ export default defineComponent({
         this.editingId = '';
         this.resetForm();
       } catch (err) {
-        ElMessage.error(err instanceof Error ? err.message : String(err));
+        ElMessage.error(errMsg(err));
       } finally {
         this.saving = false;
       }
@@ -733,7 +691,7 @@ export default defineComponent({
         }
         for (const r of failed) ElMessage.warning(`${r.name}：${r.error ?? '同步失败'}`);
       } catch (err) {
-        ElMessage.error(err instanceof Error ? err.message : String(err));
+        ElMessage.error(errMsg(err));
       }
     },
     async setCurrent(item: PlaylistRecord) {
@@ -745,14 +703,14 @@ export default defineComponent({
       try {
         await this.store.setCurrent(item.id);
       } catch (err) {
-        ElMessage.error('切换歌单失败：' + (err instanceof Error ? err.message : String(err)));
+        ElMessage.error('切换歌单失败：' + errMsg(err));
         return;
       }
       ElMessage.success(`已切换为《${item.name}》`);
       void this.queue.onPlaylistSwitch(item.id);
     },
     async remove(item: PlaylistRecord) {
-      const wasCurrent = item.id === this.store.currentId;
+      const wasCurrent = this.isPlayingPlaylist(item.id);
       try {
         const ok = await this.store.removePlaylist(item.id);
         /**
@@ -766,7 +724,7 @@ export default defineComponent({
           return;
         }
       } catch (err) {
-        ElMessage.error('删除歌单失败：' + (err instanceof Error ? err.message : String(err)));
+        ElMessage.error('删除歌单失败：' + errMsg(err));
         return;
       }
       ElMessage.success(`已删除《${item.name}》`);
@@ -780,7 +738,12 @@ export default defineComponent({
     /** 点歌单里的某首歌：切到该歌单并播放 */
     async play(index: number) {
       if (!this.selected) return;
-      if (this.selected.id !== this.store.currentId) {
+      /**
+       * 判据是「此刻在播的就是这个歌单」，不是「它是 currentId」：
+       * 正在播视频时 `currentId` 还停在上次那个歌单，按老判据会跳过切源，
+       * 直接拿视频队列去播第 index 条。
+       */
+      if (!this.isPlayingPlaylist(this.selected.id)) {
         await this.store.setCurrent(this.selected.id);
         void this.queue.onPlaylistSwitch(this.selected.id);
       }
@@ -791,323 +754,9 @@ export default defineComponent({
 });
 </script>
 
-<style scoped>
-.plm-head {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-}
-.plm-title {
-  font-size: 16px;
-  font-weight: 600;
-}
-.plm-summary {
-  font-size: 12px;
-  opacity: 0.55;
-}
-.plm-body {
-  display: flex;
-  gap: 14px;
-  height: 62vh;
-}
+<!--
+  这里没有样式块：弹窗骨架、左列表、条目行、空态，以及表单里那些
+  `mgr-form` / `mgr-field` / `mgr-hint` / `mgr-readonly` 的外观，
+  全部由 `ManagerDialog.vue` 的非 scoped 样式提供（两个管理器共用一份）。
+-->
 
-/* 左侧歌单列表 */
-.plm-side {
-  width: 240px;
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--panel-divider);
-  padding-right: 12px;
-}
-.plm-side-list {
-  flex: 1;
-  overflow-y: auto;
-}
-.plm-pl {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 9px;
-  border-radius: 7px;
-  cursor: pointer;
-  margin-bottom: 2px;
-}
-.plm-pl:hover {
-  background: var(--panel-hover);
-}
-.plm-pl.sel {
-  background: var(--panel-active);
-}
-.plm-pl.cur .plm-pl-name {
-  font-weight: 600;
-}
-.plm-pl-main {
-  flex: 1;
-  min-width: 0;
-}
-.plm-pl-name {
-  font-size: 13px;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.plm-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  flex: none;
-}
-.plm-pl-meta {
-  display: flex;
-  gap: 6px;
-  font-size: 11px;
-  opacity: 0.55;
-  margin-top: 2px;
-}
-.plm-tag {
-  padding: 0 4px;
-  border-radius: 3px;
-  background: var(--panel-hover);
-}
-
-/* 「默认」标签：和来源标签（网易云 / QQ）区分开 —— 它是身份，不是来源 */
-.plm-tag-default {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-}
-.plm-spin {
-  flex: none;
-  color: var(--accent);
-}
-.plm-spin.on svg {
-  animation: plm-rotate 0.9s linear infinite;
-}
-@keyframes plm-rotate {
-  to {
-    transform: rotate(360deg);
-  }
-}
-.plm-side-actions {
-  display: flex;
-  /* 竖排：上面一行是歌单自己的动作，下面一行是「切到视频管理」 */
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--panel-divider);
-}
-.plm-side-row {
-  display: flex;
-  gap: 6px;
-}
-.plm-side-actions :deep(.el-button) {
-  flex: 1;
-  margin-left: 0;
-}
-
-/* 右侧主区 */
-.plm-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.plm-main-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-bottom: 9px;
-}
-.plm-main-info {
-  flex: 1;
-  min-width: 0;
-}
-.plm-main-name {
-  font-size: 14px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.plm-main-sub {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 11px;
-  opacity: 0.55;
-  margin-top: 3px;
-}
-.plm-main-actions {
-  display: flex;
-  gap: 6px;
-  flex: none;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-.plm-main-actions :deep(.el-button) {
-  margin-left: 0;
-}
-.plm-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.plm-search-count {
-  font-size: 11px;
-  opacity: 0.55;
-  flex: none;
-}
-.plm-songs {
-  flex: 1;
-  overflow-y: auto;
-  border: 1px solid var(--panel-divider);
-  border-radius: 8px;
-}
-.plm-song {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 6px 9px;
-  cursor: pointer;
-  border-bottom: 1px solid var(--panel-hover);
-}
-.plm-song:last-child {
-  border-bottom: none;
-}
-.plm-song:hover {
-  background: var(--panel-hover);
-}
-.plm-song.playing {
-  background: var(--panel-active);
-}
-.plm-song.playing .plm-song-name {
-  color: var(--accent-strong);
-  font-weight: 600;
-}
-.plm-idx {
-  width: 26px;
-  flex: none;
-  text-align: right;
-  font-size: 11px;
-  opacity: 0.5;
-  font-variant-numeric: tabular-nums;
-}
-.plm-thumb {
-  /* 只管高度，宽度按原图比例自适应，图片居中 */
-  height: 32px;
-  min-width: 32px;
-  flex: none;
-  border-radius: 5px;
-  overflow: hidden;
-  background: rgba(128, 128, 128, 0.18);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.plm-thumb img {
-  height: 32px;
-  width: auto;
-  max-width: 84px;
-  object-fit: contain;
-  display: block;
-}
-.plm-song-info {
-  flex: 1;
-  min-width: 0;
-}
-.plm-song-name {
-  font-size: 13px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.plm-song-more {
-  display: flex;
-  gap: 7px;
-  font-size: 11px;
-  opacity: 0.6;
-  margin-top: 1px;
-  overflow: hidden;
-}
-.plm-song-singer {
-  flex: none;
-  max-width: 45%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.plm-song-album {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.plm-song-dur {
-  flex: none;
-  font-size: 11px;
-  opacity: 0.5;
-  font-variant-numeric: tabular-nums;
-}
-
-/* 内联表单 */
-.plm-form {
-  padding: 2px 4px;
-  overflow-y: auto;
-}
-.plm-form-title {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 12px;
-}
-.plm-field {
-  margin-bottom: 12px;
-}
-.plm-field label {
-  display: block;
-  font-size: 12px;
-  opacity: 0.7;
-  margin-bottom: 5px;
-}
-.plm-hint {
-  font-size: 11px;
-  opacity: 0.5;
-  margin-top: 4px;
-}
-/*
- * 只读字段（平台歌单的名字 / 链接）
- *
- * 长得像输入框但不可编辑：用户一眼能看出「这里有值，但不归我改」，
- * 比直接隐藏或换成纯文本更接近编辑表单的语境。
- */
-.plm-readonly {
-  padding: 5px 11px;
-  border-radius: 4px;
-  background: var(--panel-hover);
-  font-size: 12px;
-  opacity: 0.8;
-  word-break: break-all;
-}
-.plm-form-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--panel-divider);
-}
-.plm-empty {
-  padding: 24px 8px;
-  text-align: center;
-  font-size: 12px;
-  opacity: 0.5;
-}
-.plm-empty.big {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-</style>

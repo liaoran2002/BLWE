@@ -52,7 +52,7 @@
 桌面端高画质的实现是 **dash 双轨 + MSE 合成**：
 
 ```
-B站 playurl 返回两条裸 fMP4 流（**不给 MPD 清单**）：
+某站 playurl 返回两条裸 fMP4 流（**不给 MPD 清单**）：
   videoUrl   video/mp4   codecs: avc1.xxxxx
   audioUrl   audio/mp4   codecs: mp4a.40.2
        ↓ 桌面端
@@ -65,7 +65,7 @@ MediaSource + 两个 SourceBuffer 合成 → 一个 <video> 播放
 | **iOS**（AVPlayer） | ❌ 不支持"两条 URL 手动合并"，只吃 HLS | 只能退回 **durl 混流 = 720P 封顶** |
 | **浏览器**（手机 WebView） | ✅ `MediaSource` 可用 | 可用，但手机上 MSE 不如原生硬解稳 |
 
-**关键**：B站**不提供 HLS**，所以 iOS 没有高画质路径。既然**不上架 App Store**、目标只是自用，**iOS 直接不做**，问题消失。
+**关键**：某站**不提供 HLS**，所以 iOS 没有高画质路径。既然**不上架 App Store**、目标只是自用，**iOS 直接不做**，问题消失。
 
 > 顺带记：`durl` 是渐进式 mp4 混流，代码里明确写着**封顶 720P**（`biliApi.ts` 注释：实测 `fnval: 1` 这条通道封顶 720P）。
 > 所以 iOS 即便退守 durl，也只有 720P。
@@ -106,15 +106,15 @@ Kotlin 原生反而**更直接**：ExoPlayer 本来就支持，UI 用 Compose，
 | `main/utils/cache.ts` | 1125 | 搜索缓存 + 收藏 + 播放地址 + 过期清理 |
 | `main/ipc/biliApiHandlers.ts` | 877 | 搜索/解析的**编排**（缓存命中判断、合并收藏、写库前排序） |
 | `main/utils/playlist.ts` | 749 | 多歌单（增删改查、同步、按歌重算 `lastIndex`） |
-| `main/music/sources/wy.ts` | 321 | 网易云歌单解析 |
-| `main/music/sources/tx.ts` | 261 | QQ 音乐歌单解析 |
+| `main/music/sources/wy.ts` | 321 | wy 歌单解析 |
+| `main/music/sources/tx.ts` | 261 | tx 歌单解析 |
 | `main/music/http.ts` | 208 | HTTP 层（自写，替代 LX 的 needle） |
 | `main/music/utils.ts` | 202 | 各音源字段归一 |
-| `main/music/sources/kw.ts` | 156 | 酷我歌单解析 |
+| `main/music/sources/kw.ts` | 156 | kw 歌单解析 |
 | `main/utils/quality.ts` | 140 | 清晰度档位选择 |
 | `main/utils/store.ts` + `atomicJson.ts` | 148 | 原子写 JSON |
 | `main/music/index.ts` | 85 | 音源分发 + host 自动识别 |
-| `main/music/sources/wyCrypto.ts` | 67 | 网易云加密（AES/RSA） |
+| `main/music/sources/wyCrypto.ts` | 67 | wy 加密（AES/RSA） |
 | `common/utils/duration.ts` | 60 | 时长解析（`"4:03"` → 秒） |
 | `common/types/playlist.ts` | 273 | 类型 + `songId` / `playlistKey` / `sourceOfSongId` 等纯函数 |
 | `common/types/app_setting.ts` | 168 | 设置类型 |
@@ -136,7 +136,7 @@ Kotlin 原生反而**更直接**：ExoPlayer 本来就支持，UI 用 Compose，
 import { net, session } from 'electron'     ← 唯一一行
 
 net.fetch(NAV_API)          ← 读 nav 接口（拿 img_key/sub_key 算 WBI 签名）
-net.fetch(url)              ← biliGet：所有 B站请求
+net.fetch(url)              ← biliGet：所有 某站请求
 net.fetch(url)              ← 短链跟随（b23.tv → BV 号）
 session.cookies.get({})     ← 读登录 cookie（SESSDATA 等）
 ```
@@ -149,12 +149,12 @@ session.cookies.get({})     ← 读登录 cookie（SESSDATA 等）
 
 | 功能块 | 桌面行数 | Kotlin 估算 | 说明 |
 | :--- | ---: | ---: | :--- |
-| **B站 API**（签名/搜索/解析地址） | 1317 | ~900 | WBI 签名、`searchSongFiltered`（四级降级）、`extractDashStreams`、`readQualityOptions` |
+| **某站 API**（签名/搜索/解析地址） | 1317 | ~900 | WBI 签名、`searchSongFiltered`（四级降级）、`extractDashStreams`、`readQualityOptions` |
 | **过滤排序**（`videoRank`） | 600 | ~450 | 纯逻辑逐行翻译（**必须与桌面行为一致**） |
 | **缓存**（`cache.ts`） | 1125 | ~600 | 桌面那套防抖/预热日志可省 |
 | **多歌单**（`playlist.ts`） | 749 | ~500 | 含同步、`lastIndex` 按歌重算 |
 | **DB 层** | 456 | ~250 | DDL 搬 Room，DAO 重写 |
-| **歌单解析**（`music/*`） | 1092 | ~700 | 3 个音源 + 网易云加密 |
+| **歌单解析**（`music/*`） | 1092 | ~700 | 3 个音源 + wy 加密 |
 | **清晰度档位** | 140 | ~100 | |
 | **设置** | 224 | ~150 | 手机版只需音量/清晰度/过滤词/容差等 |
 | **小计** | | **~3,650** | |
@@ -263,7 +263,7 @@ box-shadow: var(--glass-shadow);
 
 ### 6.1 核心：两条裸流合并
 
-B站**不给 MPD 清单**，只有两条裸 fMP4 URL。Android Media3 的接法：
+某站**不给 MPD 清单**，只有两条裸 fMP4 URL。Android Media3 的接法：
 
 ```kotlin
 // 两条裸 URL 各自当 ProgressiveMediaSource，再合并成一个
@@ -377,13 +377,13 @@ val factory = DefaultHttpDataSource.Factory()
 
 | 风险 | 说明 | 应对 |
 | :--- | :--- | :--- |
-| **B站风控** | 手机 App 请求比桌面更容易被识别（无浏览器指纹） | UA 伪装 + `OkHttp` 的 `ConnectionSpec`/TLS 配置；必要时复用 `curl_cffi` 式指纹（Android 可用 `okhttp-tls` 自定义） |
+| **某站风控** | 手机 App 请求比桌面更容易被识别（无浏览器指纹） | UA 伪装 + `OkHttp` 的 `ConnectionSpec`/TLS 配置；必要时复用 `curl_cffi` 式指纹（Android 可用 `okhttp-tls` 自定义） |
 | **WBI 签名** | 需 `md5` + 参数按 key 排序 + 混入 `img_key`/`sub_key` | Kotlin `MessageDigest` 直接翻译；**注意 `tids` 必须在签名前设置**（桌面端踩过：顺序反了导致 `w_rid` 不覆盖 `tids`，搜索全挂） |
-| **网易云加密** | `wyCrypto.ts`（67 行）涉及 AES/RSA | `javax.crypto` 直接翻译 |
+| **wy 加密** | `wyCrypto.ts`（67 行）涉及 AES/RSA | `javax.crypto` 直接翻译 |
 | **TV 遥控器** | Compose 的焦点系统与触屏不同 | 用 `TvLazyRow` / `Modifier.focusable`；**TV 与手机 UI 要分开布局**（Compose 可用 `if (isTv)` 切换） |
 | **后台播放** | 锁屏 / 切后台要能继续播 | `MediaSessionService` + 前台通知 + `FOREGROUND_SERVICE` 权限 |
 | **判据漂移** | `videoRank` 在两端各写一份，行为可能不一致 | **用一个测试集锁住行为**：拿真实搜索结果的 JSON，两端跑同一套断言（桌面已有一批实测数据可用） |
-| **不确定项** | ExoPlayer 对 B站 fMP4 的**分片时长/progressive 模式**兼容性未实测 | 实施前先跑 POC：解析一条真实 dash URL，用 `ProgressiveMediaSource` 播 |
+| **不确定项** | ExoPlayer 对 某站 fMP4 的**分片时长/progressive 模式**兼容性未实测 | 实施前先跑 POC：解析一条真实 dash URL，用 `ProgressiveMediaSource` 播 |
 
 ---
 
@@ -467,9 +467,9 @@ interface CookieStore {
 
 **未实测的**（实施前需 POC）：
 
-- ExoPlayer 能否直接播 B站 dash 的裸 fMP4（`ProgressiveMediaSource` 兼容性）
-- 手机浏览器 / WebView 的 `MediaSource.isTypeSupported()` 对 B站 dash mimeType 的支持情况
-- B站对移动端 UA / TLS 指纹的风控强度
+- ExoPlayer 能否直接播 某站 dash 的裸 fMP4（`ProgressiveMediaSource` 兼容性）
+- 手机浏览器 / WebView 的 `MediaSource.isTypeSupported()` 对 某站 dash mimeType 的支持情况
+- 某站对移动端 UA / TLS 指纹的风控强度
 
 ---
 

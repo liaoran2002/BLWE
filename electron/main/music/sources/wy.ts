@@ -1,5 +1,5 @@
 /**
- * 网易云音乐歌单解析
+ * wy 歌单解析
  *
  * 移植自 lx-music-desktop 的 src/renderer/utils/musicSdk/wy/songList.js
  *
@@ -76,11 +76,11 @@ const getSingers = (song: WySong): string => {
 
 const getAlbumName = (song: WySong): string | undefined => song.al?.name ?? song.album?.name
 
-/** 网易云专辑封面 */
+/** wy 专辑封面 */
 const getCover = (song: WySong): string | null =>
   song.al?.picUrl ?? song.album?.picUrl ?? null
 
-/** 把网易云的歌曲项转成 ParsedSong */
+/** 把 wy 的歌曲项转成 ParsedSong */
 const toSong = (song: WySong): ParsedSong | null =>
   toParsedSong(SOURCE, {
     name: song.name,
@@ -88,7 +88,7 @@ const toSong = (song: WySong): ParsedSong | null =>
     interval: getInterval(song),
     albumName: getAlbumName(song),
     cover: getCover(song),
-    /** 网易云的歌曲 id —— 取歌词（以及落月 API 的 `id` 参数）都要它 */
+    /** wy 的歌曲 id —— 取歌词（以及落月 API 的 `id` 参数）都要它 */
     platformId: song.id ?? null,
   })
 
@@ -132,11 +132,11 @@ const getListId = async (
     const fromResolvedPath = /^.+\/playlist\/(\d+)\/\d+\/.+$/.exec(resolved)
     if (fromResolvedPath) return { id: fromResolvedPath[1], token }
     if (/^\d+$/.test(resolved)) return { id: resolved, token }
-    throw new Error('无法从该链接中解析出网易云歌单 ID，请直接粘贴歌单 ID')
+    throw new Error('无法从该链接中解析出 wy 歌单 ID，请直接粘贴歌单 ID')
   }
 
   if (!/^\d+$/.test(input)) {
-    throw new Error('网易云歌单 ID 应为纯数字')
+    throw new Error('wy 歌单 ID 应为纯数字')
   }
   return { id: input, token }
 }
@@ -247,7 +247,7 @@ const fetchSongDetail = async (ids: string[]): Promise<ParsedSong[]> => {
         body: params.toString(),
       },
     )
-    if (body.code !== 200) throw new Error('网易云歌曲详情接口返回异常')
+    if (body.code !== 200) throw new Error('wy 歌曲详情接口返回异常')
     bodies.push(...mapSongs(body.songs))
   }
   return bodies
@@ -264,14 +264,14 @@ export const getListDetail = async (
     async () => {
       const body = await fetchPlaylistDetail(id, token)
       if (body.code !== 200 || !body.playlist) {
-        throw new Error(`网易云歌单接口返回异常（code=${body.code}）`)
+        throw new Error(`wy 歌单接口返回异常（code=${body.code}）`)
       }
 
       const playlist = body.playlist
       let songs = mapSongs(playlist.tracks)
 
       /**
-       * 关键兜底：网易云在未登录/被裁剪时，`tracks` 可能只有 10 首，
+       * 关键兜底：wy 在未登录/被裁剪时，`tracks` 可能只有 10 首，
        * 而 `trackIds` 才是完整的曲目清单。
        * （实测 linuxapi 通道就是这种情况，所以数量对不上时必须按 trackIds 补全，
        *   否则会把 200 首的歌单静默截断成 10 首。）
@@ -295,7 +295,7 @@ export const getListDetail = async (
       }
 
       if (songs.length === 0) {
-        throw new Error('该网易云歌单没有解析到任何歌曲（歌单可能为空、已失效或需要 Token）')
+        throw new Error('该 wy 歌单没有解析到任何歌曲（歌单可能为空、已失效或需要 Token）')
       }
 
       return {
@@ -316,7 +316,7 @@ export const getListDetail = async (
       }
     },
     2,
-    '网易云歌单解析',
+    'wy 歌单解析',
   )
 }
 
@@ -325,7 +325,7 @@ export const getListDetail = async (
 /**
  * 这个链接是不是**单曲**（而不是歌单 / 榜单 / 私人雷达）
  *
- * 网易云的单曲页形态比歌单多：
+ * wy 的单曲页形态比歌单多：
  *  - `https://music.163.com/song?id=347230`
  *  - `https://music.163.com/#/song?id=347230`（旧版 hash 路由，实际请求里 `#` 后面常被保留）
  *  - `https://music.163.com/#/song/347230`
@@ -349,7 +349,7 @@ export const getSongId = (rawInput: string): string => {
   const byPath = /\/song\/(\d+)/.exec(input)
   if (byPath) return byPath[1]
   if (/^\d+$/.test(input)) return input
-  throw new Error('无法从该链接中解析出网易云歌曲 ID，请直接粘贴歌曲页链接')
+  throw new Error('无法从该链接中解析出 wy 歌曲 ID，请直接粘贴歌曲页链接')
 }
 
 /**

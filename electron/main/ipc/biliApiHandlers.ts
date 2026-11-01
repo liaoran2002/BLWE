@@ -1,5 +1,5 @@
 /**
- * B 站接口相关 IPC
+ * 某站接口相关 IPC
  *
  * 逻辑与迁移前的 electron/ipcHandlers.js 保持一致，仅补充类型。
  *
@@ -38,7 +38,7 @@ interface ApiContext {
 /**
  * 缓存里的一条搜索结果条目
  *
- * `title` / `pic` / `author` 等字段直接来自 B 站搜索接口，
+ * `title` / `pic` / `author` 等字段直接来自某站搜索接口，
  * 解析播放地址时**必须原样保留**（见 resolveVideo 里的合并注释）。
  *
  * **这里不再有 `view_result` / `playurl_result`**：schema v2 把解析结果拆成了
@@ -53,7 +53,7 @@ interface CachedSearchItem {
   /**
    * 时长**秒数**（`null` / 缺省 = 未知）
    *
-   * B站搜索给的是 `"4:03"`，但 `biliApi.extract` 在入口就转成秒了，
+   * 某站搜索给的是 `"4:03"`，但 `biliApi.extract` 在入口就转成秒了，
    * 库里 `videos.duration` 也是秒 —— 所以这里**不再接受字符串**。
    */
   duration?: number | null
@@ -255,7 +255,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
     /**
      * 第 1 轮搜索词：`歌名 歌曲 歌手`（**全站**，不传 tids；歌名后的「歌曲」与歌手名的括号拆分见 `buildPrimaryKeyword`）
      *
-     * ⚠️ **不用 `-`**：B站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 排除 B），
+     * ⚠️ **不用 `-`**：某站搜索把 `-` 当**排除语法**（"A -B" = 搜 A 排除 B），
      * 写成 `歌名 - 歌手` 会变成「搜歌、**排除**这个歌手」，正好反了。
      *
      * ## ★ 歌名必须**剥过括号**，和 `searchSongFiltered` 内部用的一致
@@ -282,7 +282,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
     const result = await biliApi.searchSong(primaryKeyword)
 
     /**
-     * ⚠️ **不透传 B站的 message**（同 `biliApi.searchRounds` 那条）
+     * ⚠️ **不透传 某站的 message**（同 `biliApi.searchRounds` 那条）
      *
      * `result.message` 是接口原文（技术措辞），会经 IPC 显示到界面上 ——
      * 用户看不懂，也没必要把接口的说法暴露出去。原文只打日志。
@@ -302,7 +302,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
      *  - 时长差超过容差（默认 300 秒）的丢掉（那多半不是同一首歌 —— 合集、live 全场、串烧）。
      *
      * 为什么这件事放在主进程而不是渲染层：
-     *  - 降级要再发搜索请求（渲染层不该直接打 B站接口）；
+     *  - 降级要再发搜索请求（渲染层不该直接打 某站接口）；
      *  - 结果要**写进缓存**，而缓存是主进程的事。
      *
      * ⚠️ 这里**只做网络部分**（搜、降级）。过滤与排序的**判据**统一在
@@ -390,7 +390,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
      * 为什么和 `videos.playurl_login_state` 分开：两者是**不同时刻、不同请求**的快照 ——
      * 搜索可能几小时前就做了，而播放地址是刚刚解析的。合成一个字段必然互相覆盖。
      *
-     * 用途：未登录时 B 站只返回部分结果（这正是界面提示「登录后再试」的依据），
+     * 用途：未登录时某站只返回部分结果（这正是界面提示「登录后再试」的依据），
      * 有了这个快照就能判断「这份结果该不该在登录后重搜」。
      *
      * `ensureLoginState()` 可能返回 `null`（这次没问到）—— 那时**不覆盖**已有值，
@@ -446,7 +446,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
      *    连网络都不会碰一下，用户只能手动点「刷新」才有救。
      *
      * 所以这里直接跳过写入：空结果永远不落盘，下次自然就是真实搜索。
-     * 注意判断的是**过滤后的视频条数**，不是 `code` —— B 站有时会正常返回
+     * 注意判断的是**过滤后的视频条数**，不是 `code` ——某站有时会正常返回
      * 但 `result` 里全是非视频条目（番剧 / 专栏），对播放器来说等于空。
      *
      * **这里刻意不把「库里已有的收藏项」拼进返回值**（虽然规则 1-4 也说得通）。
@@ -470,7 +470,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
      * 打包后的程序不写（`isDev` 判断在模块内部）。
      *
      * 为什么放在**这里**（`merged` 之后、`rankVideos` 之前）：
-     *  - 再往前是 `freshItems`，那只是 B 站返回的原始一条条，**不含收藏项**；
+     *  - 再往前是 `freshItems`，那只是某站返回的原始一条条，**不含收藏项**；
      *  - 再往后就被过滤掉了，看不到"哪些被挡、长什么样"。
      *
      * 所以要的是**过滤的输入**（含收藏项的那个合并结果）。
@@ -641,7 +641,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
   /**
    * ★ 补一条视频的时长（只改 `videos.duration`）
    *
-   * 场景：B 站搜索接口**有些结果不带 `duration`**，缓存里就是 NULL，
+   * 场景：某站搜索接口**有些结果不带 `duration`**，缓存里就是 NULL，
    * 视频列表那一行显示空秒数。而这条视频一旦真的开始播放，主进程解析时
    * 一定能拿到时长（view 响应里有），渲染层就会调这个接口补进库。
    *
@@ -662,7 +662,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
     /**
      * 关掉缓存也要写**本地文件**的时长
      *
-     * 时长不是「缓存」：B 站视频的时长重解析一次就有，本地文件没有 ffmpeg
+     * 时长不是「缓存」：某站视频的时长重解析一次就有，本地文件没有 ffmpeg
      * 只能靠探针读一次。跟着缓存开关一起失效，等于每次拖进来都要重探。
      */
     if (!cacheEnabled() && !isLocalBvid(bvid)) return
@@ -681,13 +681,13 @@ export const registerApiHandlers = (context: ApiContext): void => {
        * ★ 本地视频文件：**在最前面短路**，一步都不往后走
        *
        * 位置很关键，三个都必须绕开：
-       *  1. `ensureLoginState()` —— 它每次都会（必要时）打 B 站 nav 接口。
+       *  1. `ensureLoginState()` —— 它每次都会（必要时）打某站 nav 接口。
        *     放在后面的话，「没登录 / 断网」时播自己硬盘上的文件也会先卡一次网络，
-       *     而且失败会影响登录态判断。本地文件跟 B 站账号毫无关系。
+       *     而且失败会影响登录态判断。本地文件跟某站账号毫无关系。
        *  2. 「缓存地址是否过期」那段 —— 本地文件没有签名时效，
        *     但它的 `playurl_at` 是 NULL（导入时不写），会被判成「过期」而重新解析，
-       *     也就是拿 `lf_xxx` 去请求 B 站 playurl，必然失败。
-       *  3. `updateVideoResult()` —— 那会把 `durl_url`（= 路径）当成 B 站直链覆盖掉。
+       *     也就是拿 `lf_xxx` 去请求某站 playurl，必然失败。
+       *  3. `updateVideoResult()` —— 那会把 `durl_url`（= 路径）当成某站直链覆盖掉。
        *
        * 地址由 `blwe-media://` 协议给（见 `mediaProtocol.ts`），
        * 渲染层拿到的仍然是一个普通 URL，`<video src>` 那条路一行都不用改。
@@ -813,7 +813,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
         const loginChanged = loggedIn === true && cachedLoginState === false
         /**
          * 关键：以前只判断「缓存里有没有数据」，从不检查播放地址是否过期。
-         * B 站直链带签名时效（deadline），实测缓存里 38 条地址有 21 条已过期，
+         * 某站直链带签名时效（deadline），实测缓存里 38 条地址有 21 条已过期，
          * 于是播放器拿到死链 -> 触发 error -> 用户看到「视频加载失败，已跳过」。
          * 这里加上时效校验，过期就重新解析。dash 的两条流都要检查。
          */
@@ -836,7 +836,7 @@ export const registerApiHandlers = (context: ApiContext): void => {
           }
           if (!urlUsable && (cachedDurl || cachedDash)) {
             /**
-             * 这条是**预期内**的，不是故障：实测 B 站直链签名寿命中位正好 120 分钟。
+             * 这条是**预期内**的，不是故障：实测某站直链签名寿命中位正好 120 分钟。
              * 所以「隔一阵再听」必然碰到，重新解析即可 —— 不解析反而会拿死链去播。
              */
             console.log(`[video] 缓存地址已过期，重新解析:`, bvid)

@@ -118,13 +118,25 @@ export interface SystemActions {
 export type SystemContext = SystemState & SystemGetters & SystemActions;
 
 export const systemActions: ThisType<SystemContext> = {
-  /** 启动时按设置自动同步歌单（失败只提示，不打断启动） */
+  /**
+   * 启动时按各自策略自动同步（歌单 + 视频列表）
+   *
+   * 两边**串行**跑：同时开两串请求只会更快撞某站风控，而启动同步本来就是
+   * 后台任务（`void runStartupSync()`），慢一点不影响续播。
+   * 失败只提示，不打断启动。
+   */
   async runStartupSync(): Promise<void> {
     try {
-      const results = await this.playlistsStore.syncOnStartupIfNeeded();
-      await this.reportSyncResults(results, '自动同步');
+      const playlistResults = await this.playlistsStore.syncOnStartupIfNeeded();
+      await this.reportSyncResults(playlistResults, '自动同步');
     } catch (err) {
-      console.warn('[sync] 启动同步失败', err);
+      console.warn('[sync] 启动同步（歌单）失败', err);
+    }
+    try {
+      const videoResults = await this.videoListsStore.syncOnStartupIfNeeded();
+      await this.reportSyncResults(videoResults, '自动同步');
+    } catch (err) {
+      console.warn('[sync] 启动同步（视频列表）失败', err);
     }
   },
 
@@ -175,9 +187,19 @@ export const systemActions: ThisType<SystemContext> = {
    */
   setupSyncTimer(): void {
     this.clearSyncTimer();
-    if (!this.playlistsStore.hasIntervalSync) return;
+    /**
+     * 歌单和视频列表共用**一个**心跳
+     *
+     * 心跳间隔取两边「最小的那个周期」，每次心跳只同步真正到点的那边 ——
+     * 各列表的周期可以不同，但只需要一个定时器，不会因为多一类列表就多一个 timer。
+     */
+    const intervals = [
+      this.playlistsStore.hasIntervalSync ? this.playlistsStore.minSyncInterval : 0,
+      this.videoListsStore.hasIntervalSync ? this.videoListsStore.minSyncInterval : 0,
+    ].filter((ms) => ms > 0);
+    if (intervals.length === 0) return;
     // 兜底 5 分钟，避免配置成极小值导致疯狂请求
-    const interval = Math.max(5 * 60 * 1000, this.playlistsStore.minSyncInterval || 0);
+    const interval = Math.max(5 * 60 * 1000, Math.min(...intervals));
     this._syncTimer = setInterval(() => {
       void this.runIntervalSync();
     }, interval);
@@ -191,18 +213,31 @@ export const systemActions: ThisType<SystemContext> = {
     }
   },
 
-  /** 定时心跳：只同步到点的歌单 */
+  /** 定时心跳：只同步到点的歌单和视频列表 */
   async runIntervalSync(): Promise<void> {
     // 已有同步在跑就跳过这一轮，避免请求叠加
     if (this.playlistsStore.isSyncing) return;
-    const dueIds = this.playlistsStore.getDueSyncIds();
-    if (dueIds.length === 0) return;
-    try {
-      const results = await this.playlistsStore.sync(dueIds);
-      // 无变化时静默，避免每次心跳都弹提示
-      await this.reportSyncResults(results, '定时同步', true);
-    } catch (err) {
-      console.warn('[sync] 定时同步失败', err);
+    if (this.videoListsStore.syncing.length > 0) return;
+
+    const duePlaylistIds = this.playlistsStore.getDueSyncIds();
+    if (duePlaylistIds.length > 0) {
+      try {
+        const results = await this.playlistsStore.sync(duePlaylistIds);
+        // 无变化时静默，避免每次心跳都弹提示
+        await this.reportSyncResults(results, '定时同步', true);
+      } catch (err) {
+        console.warn('[sync] 定时同步（歌单）失败', err);
+      }
+    }
+
+    const dueVideoIds = this.videoListsStore.getDueSyncIds();
+    if (dueVideoIds.length > 0) {
+      try {
+        const results = await this.videoListsStore.syncMany(dueVideoIds);
+        await this.reportSyncResults(results, '定时同步', true);
+      } catch (err) {
+        console.warn('[sync] 定时同步（视频列表）失败', err);
+      }
     }
   },
 
@@ -224,7 +259,7 @@ export const systemActions: ThisType<SystemContext> = {
      * 以前这里只认 `getSong()`（只对歌有效），播视频时就走到了那个兜底。
      */
     const item = this.queueStore.currentItem;
-    const title = titleOf(item) || 'B站音乐视频';
+    const title = titleOf(item) || '某站音乐视频';
     /**
      * 变量按项目惯例叫 `singer`
      *

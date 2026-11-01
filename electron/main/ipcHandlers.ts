@@ -71,13 +71,13 @@ export const registerIpcHandlers = (context: IpcContext): void => {
   // 登录 / 登出
   registerAuthHandlers(context)
 
-  // B 站接口
+  // 某站接口
   registerApiHandlers({ biliApi, cacheManager })
 
   // 歌单
   registerPlaylistHandlers()
 
-  // B 站视频列表（收藏夹 / 合集 / 系列）
+  // 某站视频列表（收藏夹 / 合集 / 系列）
   registerVideoListHandlers()
 
   // 音乐平台歌单解析（移植自 LX 的 musicSdk）

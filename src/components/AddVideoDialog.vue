@@ -22,7 +22,7 @@
       <div class="av-row">
         <el-input
           v-model="input"
-          placeholder="粘贴 B 站视频链接或 BV 号（支持分享短链）"
+          placeholder="粘贴某站视频链接或 BV 号（支持分享短链）"
           clearable
           @keyup.enter="parse"
         />
@@ -60,7 +60,7 @@
         </div>
       </div>
       <div v-else class="av-empty">
-        {{ parsed ? '解析成功后会显示封面与标题' : '把 B 站视频链接粘到上面，点「解析」' }}
+        {{ parsed ? '解析成功后会显示封面与标题' : '把某站视频链接粘到上面，点「解析」' }}
       </div>
 
       <!-- 确认 / 取消 -->
@@ -77,6 +77,7 @@ import { defineComponent } from 'vue';
 import { ElMessage } from 'element-plus';
 import type { ParsedVideoInfo } from '@common/types/ipc';
 import api from '../api/electron';
+import { errMsg } from '../utils/errorText';
 import { normalizeImageUrl } from '../utils/image';
 import { useUiStore } from '../stores/ui';
 
@@ -143,9 +144,6 @@ export default defineComponent({
     },
   },
   methods: {
-    errMsg(err: unknown): string {
-      return err instanceof Error ? err.message : String(err);
-    },
     async parse(): Promise<void> {
       const text = this.input.trim();
       if (!text) {
@@ -164,7 +162,7 @@ export default defineComponent({
       } catch (err) {
         if (req !== this._req) return;
         this.info = null;
-        ElMessage.error(this.errMsg(err));
+        ElMessage.error(errMsg(err));
       } finally {
         if (req === this._req) this.parsing = false;
       }
@@ -234,7 +232,7 @@ export default defineComponent({
   font-size: 14px;
   font-weight: 600;
   color: var(--panel-text);
-  /* 最多两行，超出省略（B 站标题很长） */
+  /* 最多两行，超出省略（某站标题很长） */
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;

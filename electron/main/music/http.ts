@@ -7,7 +7,7 @@
  *
  * 实测发现：在主进程里用 `net.request` 请求腾讯的 c.y.qq.com / u.y.qq.com 时，
  * 会稳定返回 `net::ERR_BLOCKED_BY_CLIENT`；而同一时刻同样的 URL、同样的请求头，
- * 用 Node 的 `https` 却能正常拿到 100KB+ 数据（网易云 / 酷我也是全程正常）。
+ * 用 Node 的 `https` 却能正常拿到 100KB+ 数据（wy / kw 也是全程正常）。
  * 因此这里改用 Node 内建 http/https，行为可预期，也不再受 Chromium 网络栈影响。
  *
  * ## 额外好处：彻底解决短链跳转

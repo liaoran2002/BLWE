@@ -1,5 +1,5 @@
 /**
- * 网易云加密
+ * wy 加密
  *
  * 移植自 lx-music-desktop 的 src/renderer/utils/musicSdk/wy/utils/crypto.js
  *

@@ -5,8 +5,8 @@
  *
  * 三类链接各有各的规矩，而且这些规矩**本来就都写在主进程**：
  *  - 音乐歌单：`music/utils.ts` 的 `detectSource`（按 host 判平台，`digest-…` 特判）；
- *  - B 站列表：`biliApi.ts` 的 `parseListInput`（收藏夹 / 合集 / 系列各有几种地址形态）；
- *  - B 站单视频：`biliApi.ts` 的 `BV_PATTERN` + 短链跟随。
+ *  - 某站列表：`biliApi.ts` 的 `parseListInput`（收藏夹 / 合集 / 系列各有几种地址形态）；
+ *  - 某站单视频：`biliApi.ts` 的 `BV_PATTERN` + 短链跟随。
  *
  * 渲染层再抄一份正则，就会出现「粘贴能导入、拖进来认不出」这种两边不一致的 bug。
  * 所以这里只做识别（**不联网、不写库**），真正的导入由渲染层接着调对应的一个接口。
@@ -14,7 +14,7 @@
  * ## 顺序为什么是「音乐 → 列表 → 视频」
  *
  * 三类互斥（host 不同），顺序其实只影响「一条文本同时像两种」的极端情况：
- * 音乐平台的分享文案里可能带数字 id，B 站列表链接里也可能含 BV 号
+ * 音乐平台的分享文案里可能带数字 id，某站列表链接里也可能含 BV 号
  * （`?bvid=` 之类）。先按平台判，再按列表判，最后才当单视频 ——
  * 越具体的规则越先跑。
  */
@@ -33,10 +33,10 @@ export const classifyDropInput = (text: string): DropInputTarget => {
    * ① 音乐（歌单 / 单曲）
    *
    * 「是歌还是单」由 `classifyMusicInput` 判 —— 各平台的单曲页形态不一样
-   * （网易云 `/song?id=`、QQ `songDetail/<mid>`、酷我 `/play_detail/<id>`），
+   * （wy `/song?id=`、QQ `songDetail/<mid>`、kw `/play_detail/<id>`），
    * 这套知识必须和解析放在一起，否则又会出现「识别说单曲、解析当歌单」的漂移。
    *
-   * 未接入的平台（酷狗）一律归到 `music`：链接是认得的，只是还没做，
+   * 未接入的平台（kg）一律归到 `music`：链接是认得的，只是还没做，
    * 让导入那一步去报「XX 的歌单解析尚未接入」，比这里说「没认出来」准确。
    */
   const musicKind = classifyMusicInput(raw)
@@ -44,7 +44,7 @@ export const classifyDropInput = (text: string): DropInputTarget => {
   if (musicKind === 'playlist') return { type: 'music', url: raw }
 
   /**
-   * ② B 站列表（收藏夹 / 合集 / 系列）
+   * ②某站列表（收藏夹 / 合集 / 系列）
    *
    * 合集点开播放页时地址是 `/list/{mid}?sid=…`，和单视频页 `/video/BV…`
    * 长得完全不一样，所以「先列表后视频」不会互相抢。
@@ -58,7 +58,7 @@ export const classifyDropInput = (text: string): DropInputTarget => {
   if (BV_PATTERN.test(raw)) return { type: 'video', input: raw }
 
   /**
-   * ④ 短链：只有 `b23.tv` 这种才知道是 B 站的，但**看不出是视频还是列表**。
+   * ④ 短链：只有 `b23.tv` 这种才知道是某站的，但**看不出是视频还是列表**。
    * 交给「单视频」那条路 —— `parseVideoInput` 会跟随 302 再抠 BV 号；
    * 万一它其实是个列表链接，那边会报「没有识别出 BV 号」，提示也算清楚。
    */

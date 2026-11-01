@@ -74,7 +74,7 @@ export const boot = {
     }
   
     /**
-     * 加载 B 站视频列表（纯读库，不联网）
+     * 加载某站视频列表（纯读库，不联网）
      *
      * 同时恢复「上次在播的是哪个视频列表」：没有这一步，用户今天导入的收藏夹
      * 明天开机又会回到音乐歌单，等于每次都要重新点一遍。
@@ -108,7 +108,7 @@ export const boot = {
     // 后台做启动同步，不阻塞续播
     void system.runStartupSync();
     // 按歌单的定时同步策略装心跳（记下指纹，免得后续无关的配置广播重建它）
-    system._syncKey = `${playlists.hasIntervalSync}|${playlists.minSyncInterval}`;
+    system._syncKey = `${playlists.hasIntervalSync}|${playlists.minSyncInterval}|${videoLists.hasIntervalSync}|${videoLists.minSyncInterval}`;
     system.setupSyncTimer();
   
     // 优先续播；没有可续播内容时退回「当前歌单的第一首」
@@ -201,7 +201,7 @@ export const boot = {
     // 配置在 src/main.ts 里已经拉取完成，这里直接初始化播放状态
     void boot.init();
     /**
-     * 拖入导入（B 站视频 / 合集 / 收藏夹 / 音乐歌单）
+     * 拖入导入（某站视频 / 合集 / 收藏夹 / 音乐歌单）
      *
      * 挂在 document 上而不是某个元素上：拖进窗口的任何位置都算，
      * 包括标题栏、控制栏、视频画面。`dragover` 里必须 preventDefault，
@@ -421,7 +421,9 @@ export const boot = {
           }
           // 只有「有没有定时歌单 / 最小间隔」变了才重建定时器，
           // 否则播放中每 5 秒广播一次 resumeTime 会把 30 分钟的心跳无限推迟。
-          const syncKey = `${playlists.hasIntervalSync}|${playlists.minSyncInterval}`;
+          // 这个 watch 不在 boot() 的作用域里，视频列表那边要现取（Pinia 单例，无开销）
+          const videoLists = useVideoListStore();
+          const syncKey = `${playlists.hasIntervalSync}|${playlists.minSyncInterval}|${videoLists.hasIntervalSync}|${videoLists.minSyncInterval}`;
           if (syncKey !== system._syncKey) {
             system._syncKey = syncKey;
             system.setupSyncTimer();

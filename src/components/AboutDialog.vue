@@ -27,11 +27,11 @@
         </div>
       </div>
 
-      <div class="ab-title">BiLiWallpaperEngine(简称:BLWE)</div>
-      <div class="ab-desc">把 B 站视频列表 / 音乐歌单铺到桌面当壁纸的播放器</div>
+      <div class="ab-title">BLWE(全称:BiLiWallpaperEngine)</div>
+      <div class="ab-desc">把某站视频列表 / 音乐歌单铺到桌面当壁纸的播放器</div>
 
       <div class="ab-link" title="用系统浏览器打开" @click="openRepo">
-        https://github.com/liaoran2002/BiLiMusicVideo
+        https://github.com/liaoran2002/BLWE
       </div>
 
       <div class="ab-thanks">大肥鱼，没有你我写不出来啊！<br>虽然花了我40块钱加6元鲸圆券！但是你不是吃白饭的大肥鱼！</div>
@@ -51,7 +51,7 @@ import { useUiStore } from '../stores/ui';
  * 用 `new URL(..., import.meta.url)` 引静态图：Vite 会在构建时把它换成产物里的真实路径，
  * 既不用给 `*.jpg` 补模块声明，也不会在打包后 404。
  */
-const REPO_URL = 'https://github.com/liaoran2002/BiLiMusicVideo';
+const REPO_URL = 'https://github.com/liaoran2002/BLWE';
 
 export default defineComponent({
   name: 'AboutDialog',
@@ -120,25 +120,25 @@ export default defineComponent({
   background: var(--panel-hover);
 }
 .ab-name {
-  font-size: 13px;
+  font-size: calc(13px * var(--fs));
   font-weight: 600;
 }
 .ab-role {
-  font-size: 11px;
+  font-size: calc(11px * var(--fs));
   opacity: 0.6;
 }
 .ab-heart {
-  font-size: 16px;
+  font-size: calc(16px * var(--fs));
   opacity: 0.75;
   color: var(--accent-danger);
 }
 .ab-title {
-  font-size: 16px;
+  font-size: calc(16px * var(--fs));
   font-weight: 600;
   letter-spacing: 0.02em;
 }
 .ab-desc {
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   opacity: 0.75;
   margin-top: 6px;
   line-height: 1.6;
@@ -146,7 +146,7 @@ export default defineComponent({
 .ab-link {
   display: inline-block;
   margin-top: 12px;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   color: var(--accent);
   cursor: pointer;
   text-decoration: underline;
@@ -157,7 +157,7 @@ export default defineComponent({
 }
 .ab-thanks {
   margin-top: 16px;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   opacity: 0.6;
 }
 </style>

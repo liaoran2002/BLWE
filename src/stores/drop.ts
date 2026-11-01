@@ -164,7 +164,7 @@ export const dropActions: ThisType<DropContext> = {
    * 识别在主进程（`api:classifyDrop`），这里只按 `type` 分四路：
    *  - 音乐歌单 → 导入成歌单，从第一首起播（工作区自动变 MV）；
    *  - 音乐单曲 → 追加进默认歌单，播它（同上）；
-   *  - B 站列表（收藏夹 / 合集 / 系列）→ 导入成视频列表（工作区自动变 OV）；
+   *  - 某站列表（收藏夹 / 合集 / 系列）→ 导入成视频列表（工作区自动变 OV）；
    *  - 单条视频 → 放进默认列表（同上）。
    *
    * ⚠️ 这几路**不再自己切工作区**。工作区是播放源的投影（`queue.mode`），
@@ -186,7 +186,7 @@ export const dropActions: ThisType<DropContext> = {
     }
     if (target.type === 'none') {
       ElMessage.warning(
-        '没认出这是什么：拖 B 站视频 / 合集 / 收藏夹链接，或网易云 / QQ音乐的歌曲、歌单链接',
+        '没认出这是什么：拖某站视频 / 合集 / 收藏夹链接，或 wy / tx 的歌曲、歌单链接',
       );
       return;
     }
@@ -240,7 +240,7 @@ export const dropActions: ThisType<DropContext> = {
     await this.queueStore.onPlaylistSwitch(record.id);
   },
 
-  /** 拖入的是 **B 站列表**：导入（已有则同步）→ 从上次那个视频起播 */
+  /** 拖入的是 **某站列表**：导入（已有则同步）→ 从上次那个视频起播 */
   async dropImportList(target: { kind: 'fav' | 'season' | 'series'; id: string; mid?: string }): Promise<void> {
     this.uiStore.closeManagers();
     const { record, skipped, existed } = await this.videoListsStore.add(
@@ -272,7 +272,7 @@ export const dropActions: ThisType<DropContext> = {
   /**
    * 拖入的是**本地视频文件**：登记进默认列表 → 播第一个 → 后台补时长
    *
-   * 和拖入「单条 B 站视频」是同一条路（同样进默认列表、同样置顶、同样续播），
+   * 和拖入「单条某站视频」是同一条路（同样进默认列表、同样置顶、同样续播），
    * 唯一不同的是地址来源。这也是当初「给本地文件发一个 `lf_` 开头的 bvid」
    * 那个决定换来的东西：播放、收藏、续播、托盘媒体信息全都不用加分支。
    */

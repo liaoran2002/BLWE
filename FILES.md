@@ -36,7 +36,7 @@
 - [12. 定时暂停 / 定时关闭](#12-%E5%AE%9A%E6%97%B6%E6%9A%82%E5%81%9C--%E5%AE%9A%E6%97%B6%E5%85%B3%E9%97%AD)
 - [13. 缓存与过期](#13-%E7%BC%93%E5%AD%98%E4%B8%8E%E8%BF%87%E6%9C%9F)
 - [14. 打包与代码保护](#14-%E6%89%93%E5%8C%85%E4%B8%8E%E4%BB%A3%E7%A0%81%E4%BF%9D%E6%8A%A4)
-- [15. B 站视频列表（导入 → 播放 → 续播）](#15-b-%E7%AB%99%E8%A7%86%E9%A2%91%E5%88%97%E8%A1%A8%E5%AF%BC%E5%85%A5--%E6%92%AD%E6%94%BE--%E7%BB%AD%E6%92%AD)
+- [15.某站视频列表（导入 → 播放 → 续播）](#15-b-%E7%AB%99%E8%A7%86%E9%A2%91%E5%88%97%E8%A1%A8%E5%AF%BC%E5%85%A5--%E6%92%AD%E6%94%BE--%E7%BB%AD%E6%92%AD)
 
 ---
 
@@ -154,7 +154,7 @@
 | `tray.ts` | 托盘状态上报 + 自绘菜单四条 + 任务栏进度 |
 | `biliApiHandlers.ts` | ★ **搜索 / 解析视频 / 收藏**，见下面单独一节 |
 | `playlist.ts` | 歌单三条：`get` / `save` / `sync` |
-| `videolists.ts` | ★ **B 站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ getItems/ setIndex/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
+| `videolists.ts` | ★ **某站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ getItems/ setIndex/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
 | `music.ts` | `music:getPlaylistDetail` + `music:importPlaylist` —— ★ 前者是**唯一的加工点**：归一化曲目字段 + 拼好歌单主键，见下 |
 | `cache.ts` | 缓存三条：`clearAll` / `getStats` / `prune` |
 
@@ -187,7 +187,7 @@ return { info, songs, total, page, limit, source, id }
 > 交给 `setBounds` 会抛错 —— 那这次菜单就弹不出来了，
 > 而报错点在主进程里，排查时完全想不到是「页面量了个坏高度」。
 
-### `biliApi.ts` —— B站接口封装
+### `biliApi.ts` —— 某站接口封装
 
 **职责**：登录态（nav）、WBI 签名、搜索、view、playurl。
 纯「取数据」层，**不做过滤排序、不读设置、不碰缓存**。
@@ -226,7 +226,7 @@ return { info, songs, total, page, limit, source, id }
 - **`searchSong(keyword, page = 1, tids = 全站)`**：**单次尝试，失败就抛**。
   没有 `retryCount`、没有递归重试（那是被风控的元凶）。
   发请求前先过 `throttleSearch()`（**500ms 节流**，模块级时间戳跨调用共享）。
-- **`RateLimitError` / `isRateLimitError`**：B站返回 **HTTP 412**（风控拦截页）
+- **`RateLimitError` / `isRateLimitError`**：某站返回 **HTTP 412**（风控拦截页）
   时抛的专用错误。`biliGet` 里单独识别 412，上层靠 `isRateLimitError` 分辨
   「被限流」和「普通网络错误」—— 前者**必须停手**，后者才谈重试。
 
@@ -234,7 +234,7 @@ return { info, songs, total, page, limit, source, id }
   > 网络错误等一等重试是合理的；风控 412 再发只会让封禁更久 ——
   > 必须立刻停手并让用户知道「是你切歌太快了」。
 - **第 1 轮返回 0 条 = 被风控**，`searchSongFiltered` 直接抛 `RateLimitError`
-  （**不再跑第 2/3/4 轮**）。判据：B站搜索**不会**对一首正常存在的歌返回「0 条」。
+  （**不再跑第 2/3/4 轮**）。判据：某站搜索**不会**对一首正常存在的歌返回「0 条」。
 - **降级轮遇到 412 整轮中止**：catch 里 `if (isRateLimitError(err)) throw err`；
   其它错误才当「这一轮没成」继续。
 - **降级是「累加合并」不是「替换」**：每一轮的结果按 `bvid` 去重后**追加**到结果池。
@@ -242,7 +242,7 @@ return { info, songs, total, page, limit, source, id }
   > 用户原话：「降级的意思是降级搜索，**不是要把之前的结果不要啊**」。
   > 原来的实现是「哪一轮过滤后更多就用哪一轮」，于是第 1 轮的 10 条会被降级轮的
   > 36 条**整个顶掉**。
-- **`countPassing` 必须先把 B站返回的 `favorites` 置 false**：B站搜索接口返回的每条里
+- **`countPassing` 必须先把 某站返回的 `favorites` 置 false**：某站搜索接口返回的每条里
   本来就有个 `favorites`（「这条视频被多少人收藏了」，一个数字、几乎总是 truthy），
   而 `rankVideos` 用 `v.favorites` 判断「是不是**用户在我们这儿**收藏的」并**豁免过滤**。
 
@@ -256,7 +256,7 @@ return { info, songs, total, page, limit, source, id }
   > 措辞注意：`R轮 = 1` 时走的是**主搜索词**，不是降级词。早先一律写
   > 「降级词「X」」会让人以为走了降级（用户直接指出过）。
 
-#### B 站视频列表相关（本轮新增）
+####某站视频列表相关（本轮新增）
 
 | 导出 | 作用 |
 | :--- | :--- |
@@ -286,7 +286,7 @@ return { info, songs, total, page, limit, source, id }
 | `song_videos` | **候选关系**：哪首歌的候选里有它 / 排第几 / 收藏没有；PK `(search_key, bvid)`；另有 `title_hl` 存带 `<em>` 的标题 |
 | `videos` | **视频实体 + 播放地址**，PK `bvid`，全局一份（同一个 bvid 被两首歌引用也只存一份 dash） |
 | `song_meta` | 每首歌的 `selected_bvid` + `search_login_state`，PK `search_key` |
-| `videolists` | **B 站视频列表**（`bv_fav_123` / `bv_season_789`）：kind / source_id / mid / name / item_count / last_index |
+| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789`）：kind / source_id / mid / name / item_count / **sync_mode + sync_interval_ms**（和歌单同一套三档策略：手动 / 启动时 / 定时）/ last_index |
 | `videolist_items` | 列表成员 + 顺序，PK `(list_id, ord)` |
 | `song_videos_view` | **视图**：把 `song_videos` ⨯ `videos` 还原成**旧 `videos` 的 15 列形状**（旧读路径一行不用改） |
 | `videos_meta` | **视图**：`song_videos_view` 去掉全部地址列的只读投影（列表类读取走它，省 27 KB/行） |
@@ -297,7 +297,7 @@ return { info, songs, total, page, limit, source, id }
 > **`videos` 为什么从 `(search_key, bvid)` 复合主键改成 `bvid` 单主键**：
 > `ord` / `favorites` / 高亮标题是**每首歌独立**的，而地址只跟 bvid 有关。
 > 混在一行里 → 同一个 bvid 在两首歌的候选里各存一份约 27 KB 的 dash、过期还要刷两遍。
-> 新增的 B 站视频列表让这种重复从「很少见」变成常态（列表条目经常同时出现在音乐候选里），
+> 新增的某站视频列表让这种重复从「很少见」变成常态（列表条目经常同时出现在音乐候选里），
 > 所以必须拆。代价用 `song_videos_view` 抵掉 —— 列名与顺序和旧表**逐字一致**。
 >
 > **老库不会丢数据**：`migrateVideosSplit()` 先 checkpoint + 备份 → `RENAME TO videos_old`
@@ -542,7 +542,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   | **那首歌被删了** | 保留原下标并夹进范围 → 效果是「下一首顶上来」（播放器的标准行为） |
   | 旧列表本来就是空的 | `0` |
 
-### `utils/videolist.ts` —— B 站视频列表服务（新）
+### `utils/videolist.ts` ——某站视频列表服务（新）
 
 **职责**：`videolists` / `videolist_items` 的 CRUD + 导入 + 同步 + 播放进度。
 **它不碰搜索、不碰打分** —— 条目本来就是视频。
@@ -606,10 +606,10 @@ FROM videolist_items)`）。
 ④ 其余                     → none
 ```
 
-**「歌单还是单曲」不在这里判**：三个平台的单曲页形态完全不同（网易云 `/song?id=`、
-QQ `songDetail/<mid>`、酷我 `/play_detail/<id>`），这套知识必须和解析待在同一个模块
+**「歌单还是单曲」不在这里判**：三个平台的单曲页形态完全不同（wy `/song?id=`、
+QQ `songDetail/<mid>`、kw `/play_detail/<id>`），这套知识必须和解析待在同一个模块
 （`music/index.ts` 调各音源的 `isSongUrl`），否则会出现「识别说单曲、解析当歌单」的漂移。
-未接入的平台（酷狗）一律归 `music`，让导入那一步去报「尚未接入」。
+未接入的平台（kg）一律归 `music`，让导入那一步去报「尚未接入」。
 
 **为什么不在渲染层写正则**：这三套规则本来就都在主进程（`music/utils.detectSource`、
 `biliApi.parseListInput`、`parseVideoInput` 的短链跟随）。抄一份出去，迟早出现
@@ -639,8 +639,8 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 | 重新定位**不改 bvid** | 列表位置 / 收藏 / 续播指针全引着 bvid；迁移主键要逐个改引用，漏一处就是孤儿数据 |
 | `missing` 只在 IPC 层异步算、不落库 | 同步 `stat` 掉线网络盘会冻住主进程；文件可能只是暂时不在（拔了硬盘），状态不该写进数据 |
 
-**`markLocalItemsMissing` 只 stat `lf_` 条目**：一个 500 条的列表里绝大多数是 B 站视频，
-逐个摸盘既无意义又慢。B 站条目的 `durl_url` 是带签名、几分钟过期的直链，
+**`markLocalItemsMissing` 只 stat `lf_` 条目**：一个 500 条的列表里绝大多数是某站视频，
+逐个摸盘既无意义又慢。某站条目的 `durl_url` 是带签名、几分钟过期的直链，
 所以在 `getVideoListItems` 里也只给本地条目带 `localPath`。
 
 ### `utils/playlistImport.ts` —— 拖入音乐 → 导入/追加（新）
@@ -827,10 +827,10 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 | `index.ts` | 按音源分发 + **按链接 host 自动识别音源** |
 | `http.ts` | 请求层（`node:http`/`https`，跟随重定向 / 超时 / 解压） |
 | `utils.ts` | 时长格式化、HTML 实体解码、歌手名拼接、音源识别、重试 |
-| `sources/tx.ts` | QQ音乐（`musicu.fcg` 优先，旧接口兜底） |
-| `sources/wy.ts` | 网易云（weapi 优先，linuxapi 兜底，`trackIds` 补全） |
-| `sources/wyCrypto.ts` | 网易云 weapi / linuxapi 加密 |
-| `sources/kw.ts` | 酷我（`pl.svc`） |
+| `sources/tx.ts` | tx（`musicu.fcg` 优先，旧接口兜底） |
+| `sources/wy.ts` | wy（weapi 优先，linuxapi 兜底，`trackIds` 补全） |
+| `sources/wyCrypto.ts` | wy weapi / linuxapi 加密 |
+| `sources/kw.ts` | kw（`pl.svc`） |
 
 **关键设计**：
 
@@ -849,14 +849,14 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
   额外好处：Node 的 http/https **默认不跟随重定向**，响应里能直接读到 `location` 头 ——
   之前用 `fetch`/`net.request` 时拿不到 `Location`，**正是这个坑导致 QQ 接口被误判失败**。
 
-- **`detectSource` 为什么不能只看 `id=` 参数**：网易云和酷我的链接都带 `id=`，
+- **`detectSource` 为什么不能只看 `id=` 参数**：wy 和 kw 的链接都带 `id=`，
   QQ 的移动端分享链接也带 —— 所以**必须以 host 为准**。
-  还要**特判 `digest-<n>__<id>`**（酷我的压缩形式），否则那条分支永远走不到。
+  还要**特判 `digest-<n>__<id>`**（kw 的压缩形式），否则那条分支永远走不到。
 
 - **`decodeName` 为什么手写**：LX 用的是渲染进程的 `DOMParser`，
   **主进程没有 DOM**，所以改用一份手写的 HTML 实体解码，不引入第三方依赖。
 
-- **网易云为什么有两条通道**：新版 `/weapi/v6/playlist/detail` 返回**全量** `tracks`，
+- **wy 为什么有两条通道**：新版 `/weapi/v6/playlist/detail` 返回**全量** `tracks`，
   而 **linuxapi 的 `/api/v3/playlist/detail` 在未登录时经常只给 10 首**，
   会把 200 首的歌单静默截断成 10 首 —— 所以数量对不上时按 `trackIds` 补全，
   且**只有更完整时才采用**（避免接口异常反而把数据变少）。
@@ -910,7 +910,7 @@ channel → `{params, result}` 的契约集中在这里，
   （直链约 2 小时、元数据永不过期），用一个值同时管两者，
   结果就是「地址还没过期、元数据先被删了」。
 
-- **`player.activeVideoListId`**（本轮新增）：当前在播的 B 站视频列表 id，
+- **`player.activeVideoListId`**（本轮新增）：当前在播的某站视频列表 id，
   空串 = 在播音乐歌单。存在的理由：播放层只有一个 `songs` 数组，
   「这次打开该从哪个来源续播」必须有落盘的地方；没有它，用户今天导入的收藏夹
   明天开机又回到音乐歌单。
@@ -992,7 +992,7 @@ channel → `{params, result}` 的契约集中在这里，
 **关键设计**：
 
 - **`duration.ts` 为什么存在**：同一件事（把各种形状的时长变成秒）
-  原来在**三处各写了一份**，而形状还不止一种（B站搜索给 `"4:03"`、
+  原来在**三处各写了一份**，而形状还不止一种（某站搜索给 `"4:03"`、
   view 接口和库里给秒数、音乐平台给 `"4:03"`/`"1:02:03"`）。
 - **`durationToSeconds` 用 `split(':')`，不用正则**：
   曾经用 `^(\d{1,2}):(\d{2})(?::(\d{2}))?$` 卡「分钟只能 1-2 位」，结果
@@ -1114,12 +1114,12 @@ isVideoItem(item)   // 'title' in item
 | **`system.ts`** | SMTC、任务栏进度、托盘状态同步、播放位置落盘、定时同步 | 14 |
 | **`session.ts`** | 登录态、用户信息、扫码登录、退出确认 | 5 |
 | **`sleep.ts`** | 定时暂停 / 定时关闭（含每秒推的状态快照） | 4 |
-| **`drop.ts`** | 拖入导入：分类 → 四路分派（歌单 / 单曲 / B 站列表 / 单条视频）→ 本地文件探针 | 12 |
+| **`drop.ts`** | 拖入导入：分类 → 四路分派（歌单 / 单曲 /某站列表 / 单条视频）→ 本地文件探针 | 12 |
 | **`bootstrap.ts`** | **不是 store**：`boot.attachVideo()` / `bootstrap()` / `teardown()` / `init()`，只做编排、不留状态 | 9 |
 | `constants.ts` | 缓冲 / 预热 / 卡顿 / 冷却的常量（playback 与 ui 共用） | — |
 | `setting.ts` | 配置的响应式副本（主进程那份是权威） | — |
 | `playlists.ts` | 歌单集合 + 同步编排 + 收藏 | — |
-| `videoLists.ts` | B 站视频列表副本（列表 / 条目 / 同步 / 收藏） | — |
+| `videoLists.ts` |某站视频列表副本（列表 / 条目 / 同步 / 收藏） | — |
 
 **为什么 `playAt` / `next` / `prev` 在 `playback` 而不是 `queue`**：它们要跟引擎令牌、
 降级链、续播点打交道，搬进 queue 就变成 queue → playback → queue 的双向流程调用。
@@ -1145,8 +1145,10 @@ queue 只回答「列表里有什么」。依赖方向因此是 `playback → qu
 | `VideoControls.vue` | 播放控制栏；`mode` 只影响文案（上一个视频 / 下一首）与「歌曲列表」按钮是否渲染；两个列表按钮的图标与名字**固定**，不随模式变；壁纸 / 锁定时整条 `wm-hidden` 也在这里判 |
 | `SettingsDialog.vue` | 设置弹窗（**左栏目录 + 右栏一页到底**） |
 | `SleepTimerPanel.vue` | 定时暂停弹窗（时长草稿 + 三个复选框，**只有确认才写回 store**） |
-| `PlaylistManager.vue` | 歌单管理（左列表 + 右「内联表单 / 曲目列表」）；表单内容**原样**交给主进程、不做字段转换（见下）；**表单按歌单类型分流**（平台歌单只给同步方式 + 「转成本地歌单」，本地歌单给改名 + 链接导入器）；本地歌单带「本地」标签、不同步；默认歌单带「默认」标签、删除按钮禁用；左下角第二行是「视频管理 →」（= 切模式） |
-| `VideoListManager.vue` | **视频管理**：左列表 + 右条目预览；**「新建列表」一张表单收口四种来源**（空列表 / 粘贴链接 / 收藏夹 / 订阅合集，后两者是**封面网格**选片、选中高亮）+ 添加视频 / 收藏（置顶）/ 移除 / 重命名；**本地文件丢失的条目置灰 + 「文件丢失」标 + 「定位」重选路径**；左下角第二行是「← 歌单管理」 |
+| `ManagerDialog.vue` | **两个管理器共用的弹窗**（960 宽 / 内容区 62vh）：标题栏、左列表（含「默认」「本地」「平台」标签、正在播放圆点、同步中转圈）、右侧三态（表单 / 详情 / 空态）、搜索、**条目行**、空态、底部「新建 / 全部同步 / 换个管理器」。它不知道歌和视频的区别 —— 只认 `src/types/manager.ts` 里归一化过的数据；表单、详情头按钮、行尾按钮通过 `#form` / `#actions` / `#row-actions` 三个 slot 交给调用方。**样式不 scoped**，类名统一 `mgr-` 前缀，这样父组件写 `<div class="mgr-field">` 就能直接复用字段样式 |
+| `PlaylistManager.vue` | 歌单管理：只提供数据（`shellLists` / `shellDetail` / `shellRows`）与表单 —— 表单内容**原样**交给主进程、不做字段转换（见下）；**按歌单类型分流**（平台歌单只给同步方式 + 「转成本地歌单」，本地歌单给改名 + 链接导入器）；详情头按钮 `同步 · 编辑 · 从这里播放 · 删除`；**本地歌单的曲目行尾有「×」可删单条**（平台歌单不渲染，删除会走 `store.removeSongAt`，按**下标**删，正在播则重载队列）。UI 全部由 `ManagerDialog` 渲染，**没有自己的样式块** |
+| `VideoListManager.vue` | **视频管理**：只提供数据与表单/按钮。**「新建列表」一张表单收口四种来源**（空列表 / 粘贴链接 / 收藏夹 / 订阅合集，后两者是**封面网格**选片、选中高亮）；详情头按钮 `同步（仅平台）· 编辑 · 添加视频（仅本地）· 从这里播放 · 删除`；**「添加视频」走 `VideoImportDialog` 先预览再落库**（单条是视频详情，合集/收藏夹是列表详情 + 每条视频）；行尾走 `#row-actions`：收藏（置顶）/ 定位 / 移除；**本地文件丢失的条目置灰 + 「文件丢失」标 + 「定位」重选路径**。样式只留视频独有的三块（行尾按钮、收藏夹/订阅封面网格、`<code>`） |
+| `VideoImportDialog.vue` | 「添加视频」确认框（贴链接 → 预览 → 确认落库）。预览只读，取消不留痕迹；确认后写的是**本地列表**（单条置顶、一批追加末尾），不涉及歌曲搜索 |
 | `SongVideoListDialog.vue` | 列表面板，两种形态按 `listType` 切换：`songList` 歌单（MV）/ `videoList` 视频列表（MV = 这首歌的备选，OV = 当前合集）；点一行 / 刷新 / 爱心 / 加号都直接调 store |
 | `DropOverlay.vue` | 拖入遮罩（整窗虚线框 + 「松手即可导入并播放」），`dropActive` / `dropBusy` 来自 store |
 | `AddVideoDialog.vue` | 「添加视频」弹窗（粘贴链接 → 解析 → 收藏） |
@@ -1260,7 +1262,7 @@ presetId = detail.id                                // 已经是 tx_8153225605
 | :--- | :--- |
 | `setting.ts` | 配置的**响应式副本**（持久化在主进程，见「配置的读写与广播」） |
 | `playlists.ts` | 歌单副本 + 同步编排；**默认歌单删不掉**（`removePlaylist` 返回 `false`）；`updatePlaylist` 按类型剔字段（平台只留 `sync`、本地不留链接与同步）；`convertToLocal` 换 id 并重映射 `currentId` |
-| `videoLists.ts` | **B 站视频列表副本**：列表 / 条目 / 同步 / 本地列表 / 收藏，以及 `activeId`（当前在播哪个列表，`''` = 音乐歌单） |
+| `videoLists.ts` | **某站视频列表副本**：列表 / 条目 / 同步 / 本地列表 / 收藏，以及 `activeId`（当前在播哪个列表，`''` = 音乐歌单） |
 
 **`videoLists.ts` 与 `playlists.ts` 是并列的**（不是一个 store 里加个 `kind` 字段）：
 两者的表、id、同步方式都不同，混在一起会让「当前是哪种来源」变成一堆
@@ -1312,6 +1314,8 @@ const addPlaylist = async (input: {
 | `title.ts` | 标题净化（只留 `<em>`） |
 | `mediaProbe.ts` | 本地视频探针（`<video preload="metadata">` 读时长 + 实测能否解码） |
 | `videoQuality.ts` | 按解码分辨率兜底清晰度标签 |
+| `errorText.ts` | 把 `catch` 到的任意东西转成一行文案（`errMsg`）。两个管理器 + 添加视频弹窗共用 —— 以前这个方法在三个文件里各抄一份 |
+| `datetime.ts` | 时间显示（`formatSyncTime`：时间戳 → `2026-11-01 15:20`，空值 → 「从未」）。两个管理器的「上次同步」共用 |
 
 **`sleepTimer.ts` 的关键设计**：
 
@@ -1472,7 +1476,7 @@ SOURCES[source].getListDetail(input, page)
 所以增加了**按分享链接 host 自动识别**，识别不出来才要求显式指定。
 识别不出且输入是纯数字时会明确报错「只填数字 ID 无法判断是哪个音乐平台」。
 
-**未接入的音源显式挡掉**：酷狗（`kg`）在类型里合法但尚未移植解析实现，
+**未接入的音源显式挡掉**：kg（`kg`）在类型里合法但尚未移植解析实现，
 `isSupported()` 会挡掉并报「尚未接入」，避免抛 `undefined is not a function` 这种莫名错误。
 
 > 注意区分：**音源识别**会挡掉 `kg`（没实现解析），
@@ -1513,7 +1517,7 @@ SOURCES[source].getListDetail(input, page)
 主进程拼出两个东西（拼装只在这里做一次）：
   cacheKey       = joinCacheKey(song, singer)          = "歌名-歌手"   ← 缓存主键（用**原始**歌名）
   primaryKeyword = buildPrimaryKeyword(
-                     splitSongName(song).name, singer) = "歌名 歌手"   ← 发给 B站（用**正名**）
+                     splitSongName(song).name, singer) = "歌名 歌手"   ← 发给 某站（用**正名**）
    ↓
   ※ `splitSongName(song).tail`（括号及其后的内容）留给第 4 轮
   ※ 过滤判据也走 `baseSongName`（= `.name`）—— 搜索与过滤必须同一个名字
@@ -1577,13 +1581,13 @@ SOURCES[source].getListDetail(input, page)
 | 2 | `歌名 歌曲 歌手` | **音乐区**（`3`） | **同一句话换个分区再搜一轮** |
 | 3 | `歌名 歌曲 歌手 MV` | 音乐区 | 加后缀 |
 | 4 | `歌名 歌曲 歌手 <括号内容>` | 音乐区 | 没括号时退回 `歌名 歌曲 歌手 可视化` |
-| 5 | `歌名 歌曲` | 音乐区 | **去掉歌手名**，救「B 站没有这个歌手的版本」 |
+| 5 | `歌名 歌曲` | 音乐区 | **去掉歌手名**，救「某站没有这个歌手的版本」 |
 
 **形态约定**：**不带引号、不带书名号**，纯空格分隔（用户明确要求）。
 用空格就是普通的「与」语义。歌名后面缀一个**独立词** `歌曲`；
 歌手名里的括号换成空格（`甲（乙）` → `甲 乙`）。
 
-> ⚠️ **不要用 `-`**：B站搜索把 `-` 当**排除语法**
+> ⚠️ **不要用 `-`**：某站搜索把 `-` 当**排除语法**
 > （"A -B" = 搜 A 并排除含 B 的结果），写成 `歌名 - 歌手` 会变成
 > 「搜歌、**排除**这个歌手」，正好和意图相反。
 
@@ -1609,7 +1613,7 @@ SOURCES[source].getListDetail(input, page)
 >
 > 去重是必要的：歌单里出现过「同一个后缀写两遍」的数据，不去重搜索词会变成
 > `… 回家 萨克斯版 萨克斯版`，重复词不增加信息量、却让搜索词变长变怪
-> （搜索词越长 B站越可能匹配不到）。
+> （搜索词越长 某站越可能匹配不到）。
 >
 > ⚠️ 早期版本只取**第一段**，于是 `(回家) (萨克斯版)` 的第 4 轮只搜 `回家`，
 > 丢掉了「萨克斯版」这个有效信息 —— 所以改成全拼。
@@ -1621,14 +1625,14 @@ SOURCES[source].getListDetail(input, page)
 **★ 每轮只搜第 1 页（**不再翻页**）**：
 
 ```
-每一轮：只搜第 1 页（B站一页 42 条）
+每一轮：只搜第 1 页（某站一页 42 条）
         → 过滤后 < minSearchResults（默认 30）→ 换下一轮
         （minResults = 0 时不降级，只搜第 1 轮）
 ```
 
 > **翻页为什么去掉**：一首歌要跑 4 轮，每轮再翻页就是最多 8 个请求；
 > 再加上原来渲染层的 3 次重试，最坏能打出二十多个请求 ——
-> 这正是 B站返回 **412 风控**的主因（见下面「风控」一节）。
+> 这正是 某站返回 **412 风控**的主因（见下面「风控」一节）。
 > 五轮降级本来就覆盖了「换词再找」的需求，翻页的边际收益不值得。
 >
 > 连带去掉的：`searchRounds` 原来那个「够不够、要不要翻第二页」的判断
@@ -1645,7 +1649,7 @@ SOURCES[source].getListDetail(input, page)
 
 **★★ 风控（412）—— 三层防护**
 
-B站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个请求）：一个正常返回
+某站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个请求）：一个正常返回
 `200`，下一个直接 `412`（响应体是一整页 HTML 拦截页，不是 JSON）。
 流量密度就是触发条件。
 
@@ -1655,7 +1659,7 @@ B站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个
      所以「第一轮 4 个请求」自然被拉开成 ~1.5 秒。
 
 ② 第 1 轮返回 0 条 → 认定**被风控**，立刻停手
-     判据很硬：**B站搜索不会对一首正常存在的歌返回「0 条」**。
+     判据很硬：**某站搜索不会对一首正常存在的歌返回「0 条」**。
      所以「第 1 轮就空」几乎只有被拦这一种解释 → 抛 `RateLimitError`，
      **不再往下跑第 2/3/4 轮**（风控状态下每轮都会被打回，连打只会更久）。
 
@@ -1667,7 +1671,7 @@ B站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个
      原来空结果会重试 3 次，每次又走完整 4 轮 —— 那是灾难性的叠加。
      现在没有重试，由主进程把 `RateLimitError` 抛上来，界面给一句
      「切歌太快太频繁，等一两分钟再试」。
-     （用户原话：「B站不会返回空结果的」—— 所以空就是风控，重试没意义。）
+     （用户原话：「某站不会返回空结果的」—— 所以空就是风控，重试没意义。）
 ```
 
 **`searchSong` 因此变成「单次尝试，失败就抛」**：没有 `retryCount` 参数、
@@ -1694,14 +1698,14 @@ B站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个
 >
 > **为什么要给提示**：拦截了却在界面上毫无反应，用户会以为按钮坏了。
 > 所以 `notifyNetBusy()` 弹一句 `$message`（「正在加载中，请稍候……」
-> + 一句「切太快会被 B 站限流」），**2 秒节流**（连点不刷屏）；
+> + 一句「切太快会被某站限流」），**2 秒节流**（连点不刷屏）；
 > 控制栏那两个按钮还带 `title`（悬停也能看到原因）。
 
 **「够不够」判的是过滤之后的条数**（`countPassing`），不是原始条数 ——
 用过滤前的数字判断的话，搜出来 80 条就一定「够」，哪怕过滤完只剩 25 条也不会降级，
 这个设置项就等于没有。
 
-> ⚠️ `countPassing` **必须先把 B站返回的 `favorites` 置 false**（见 `biliApi.ts` 那节）：
+> ⚠️ `countPassing` **必须先把 某站返回的 `favorites` 置 false**（见 `biliApi.ts` 那节）：
 > 否则「这条被多少人收藏了」这个数字会让条目全部豁免过滤，
 > 计数虚高 → 判定「够了」→ **降级永远不触发**。
 
@@ -1721,18 +1725,18 @@ B站对搜索请求的密度很敏感。**实测**（同一个 IP、前后两个
 原来空结果会重试 3 次（每次 `skipCache`、间隔 800ms）。现在**全部删掉**：
 
 - 用户原话：「别搞什么重试了，搜索结果为空就提醒用户不要切歌太频繁，
-  B站不会返回空结果的」—— 所以「空」本身就是**被限流**的信号，
+  某站不会返回空结果的」—— 所以「空」本身就是**被限流**的信号，
   重试只是在风控状态下继续打请求（每次重试又走完整 4 轮，最坏二十多个请求）；
 - 主进程会直接抛 `RateLimitError`，渲染层 `catch` 里按消息内容识别
   （IPC 会把 `Error` 序列化，丢掉 `name` / 原型，所以只能按文案判），
-  弹一句「切歌太快太频繁，B 站把请求拦下来了，过一两分钟再试」。
+  弹一句「切歌太快太频繁，某站把请求拦下来了，过一两分钟再试」。
 
 **两种「没结果」的提示是分开的**（解决办法完全不同）：
 
 | 情况 | 提示 | 用户该做什么 |
 | :--- | :--- | :--- |
 | `filtered: true` | 「结果都被过滤规则挡掉了」| 去设置放宽规则（过滤词 / 时长容差）|
-| 被限流 | 「被 B 站限流了，切歌太快」| **等一两分钟**，别连续切歌 |
+| 被限流 | 「被某站限流了，切歌太快」| **等一两分钟**，别连续切歌 |
 | 其它搜索失败 | 「搜索失败」+ 原始错误 | 检查网络 / 登录 |
 
 用 `$notify`（右上角浮层）而不是 `$message`：这些提示**带操作指引**，要留时间读。
@@ -1897,7 +1901,7 @@ Going Home (回家) (萨克斯版)  → { name: 'Going Home', tail: '回家 萨�
 这里再判一次「歌名命中」永远是 true，没有信息量。
 
 **④ 排序**：收藏整段置顶（相对顺序不变、不参与打分）→ 其余按总分降序 →
-同分保持 B 站原序（V8 的 `sort` 是稳定排序）。
+同分保持某站原序（V8 的 `sort` 是稳定排序）。
 
 **⑤ ⚠️ 过滤只作用于「非收藏项」**
 **⑤ ⚠️ 过滤只作用于「非收藏项」**
@@ -2016,7 +2020,7 @@ switchQuality(新档位)
 ```
 
 > ⚠️ 原来传的是 `skipCache: true`（「我改了清晰度，快重新取」）—— 那是**多余**的：
-> B站一条 dash 流里**本来就带全部候选档位**，我们库里存的 `playurl_result` 是
+> 某站一条 dash 流里**本来就带全部候选档位**，我们库里存的 `playurl_result` 是
 > **整个 playurl 响应**，所以换档位只需从同一份响应里重新挑一条流。
 > `skipCache` 会把「地址明明还没过期」这条快路径也一起废掉，白打一次请求 ——
 > 而每一次多余的请求都在推高被 412 的概率。
@@ -2080,7 +2084,7 @@ fetch + getReader + append
 症状是「控制台同一个关键词刷几十行、界面变卡」。
 因为心跳是 1 秒一次，光靠计数做不到「间隔 3 秒」，所以必须同时看 `_warmRetryAt` 时间戳。
 3 次后 `_warmFailed` 彻底停掉，**只在未登录时才弹通知**
-（已登录还搜不到多半是 B站真没有，提示「请登录」是误导）。
+（已登录还搜不到多半是 某站真没有，提示「请登录」是误导）。
 
 **`warmApi` 的挑选规则必须与 `resolveSongItem` 逐字一致**（也必须问 `getSelectedBvid`），
 否则预热好的地址切歌时会被换掉。
@@ -2369,7 +2373,7 @@ handlers.quit()   → electronApi.winQuit()    ← 勾了「关闭程序」
 
 | 表 | 键 | 值 | 为什么 |
 | :--- | :--- | :--- | :--- |
-| `videos` / `song_meta` | `search_key` | `歌名-歌手` | 这两张表要拿键**去搜 B站** —— 用 `tx_1828354` 那种 id 搜不出任何东西 |
+| `videos` / `song_meta` | `search_key` | `歌名-歌手` | 这两张表要拿键**去搜 某站** —— 用 `tx_1828354` 那种 id 搜不出任何东西 |
 | `songs` / `playlist_songs` | `id` / `song_id` | `平台_平台id` | 只用于「标识同一首歌」，让多歌单共用一行 |
 
 它们**没有关系**，各用各的键。渲染层传的 `songName`（`getSongName`）就是前者。
@@ -2477,7 +2481,7 @@ electron-builder（asar）→ 打包 out/
 │                        主进程（electron/main/）                         │
 │  index.ts（入口 + 窗口/壁纸/托盘状态机）                                 │
 │    ├── ipc/*            按领域拆分的 handler（依赖注入 IpcContext）      │
-│    ├── biliApi.ts       B站接口（WBI 签名 / dash 与 durl）              │
+│    ├── biliApi.ts       某站接口（WBI 签名 / dash 与 durl）              │
 │    ├── music/           多平台歌单解析（移植自 LX）                      │
 │    ├── utils/           db(SQLite) / cache / playlist / setting / store │
 │    ├── winWallpaper.ts  koffi 直调 Win32                                │
@@ -2503,18 +2507,18 @@ electron-builder（asar）→ 打包 out/
 它是 `song_videos` 复合主键的前半段、`song_meta` 的主键。
 **只有音乐有这个概念** —— 视频条目按 `bvid` 直接解析地址，不进这两张表。
 
-> ⚠️ **它跟上面两个 id 是两回事**：`song_videos` / `song_meta` 要拿键去**搜 B站**，
+> ⚠️ **它跟上面两个 id 是两回事**：`song_videos` / `song_meta` 要拿键去**搜 某站**，
 > 用 `tx_1828354` 那种 id 搜不出任何东西 —— 所以那两张表存的是**歌名**。
 > 渲染层、缓存、`findSongDuration` 共用同一个 `toCacheKey`，
 > 所以「这首歌是谁」的判定完全一致。
 >
-> ⚠️ 它**也不是搜索词**：真正发给 B站的是 `歌名 歌曲 歌手`（**剥过括号**、
+> ⚠️ 它**也不是搜索词**：真正发给 某站的是 `歌名 歌曲 歌手`（**剥过括号**、
 > 歌手名的括号已换成空格，见 `buildPrimaryKeyword`）。歌名带括号时两者会不一致 ——
 > 拿缓存键当搜索词看会完全误解。
 
 ---
 
-## 15. B 站视频列表（导入 → 播放 → 续播）
+## 15.某站视频列表（导入 → 播放 → 续播）
 
 音乐歌单是「歌名 → 搜索 → 候选」，视频列表是「条目本来就是视频」。
 这条链路的关键是**播放层只写一遍**：队列统一成 `PlayItem`，引擎按

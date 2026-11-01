@@ -125,7 +125,7 @@ export interface IpcChannelMap {
     }
     result: { data: unknown }
   }
-  /** 「添加视频」：解析 B 站链接 / BV 号，取回标题、封面、UP 主 */
+  /** 「添加视频」：解析某站链接 / BV 号，取回标题、封面、UP 主 */
   'api:parseVideo': { params: { input: string }; result: ParsedVideoInfo }
   /**
    * 收藏 / 取消收藏某个视频
@@ -148,7 +148,7 @@ export interface IpcChannelMap {
   /**
    * ★ 补一条视频的**时长**（只改 `videos.duration`，不动顺序与其它字段）
    *
-   * 为什么需要它：B 站搜索接口有些结果**不带 `duration`**，缓存里就是 NULL，
+   * 为什么需要它：某站搜索接口有些结果**不带 `duration`**，缓存里就是 NULL，
    * 视频列表那一行显示空秒数。而这条视频一旦真的开始播放，时长一定能拿到
    * （view 响应 / `<video>` 元素上都有），顺手补进库，下次打开就正常了。
    *
@@ -212,7 +212,7 @@ export interface IpcChannelMap {
        *
        * 渲染层不自己看 bvid 前缀（那是主进程的命名细节）：它只需要知道
        * 「这条播不了的时候该不该弹『重新定位文件』」。本地文件的失败面
-       * 和 B 站条目完全不同 —— 没有网络、没有风控、没有失效条目，只有
+       * 和某站条目完全不同 —— 没有网络、没有风控、没有失效条目，只有
        * 「文件不在了」和「解不出来」两种。
        */
       isLocal?: boolean
@@ -220,7 +220,7 @@ export interface IpcChannelMap {
        * 机器可读的错误码（给人看的那句话在 `error` 里）
        *
        * - `LOCAL_MISSING`：本地文件不存在（路径在 `detail` 里），值得弹修复入口；
-       * - `AUTH_FAILED`：B 站登录失效（历史原因这个码一直放在 `error` 里）。
+       * - `AUTH_FAILED`：某站登录失效（历史原因这个码一直放在 `error` 里）。
        */
       code?: 'LOCAL_MISSING' | 'AUTH_FAILED'
       /** 错误细节（目前只有 `LOCAL_MISSING` 用：文件原本的绝对路径） */
@@ -230,7 +230,7 @@ export interface IpcChannelMap {
   }
   // #endregion
 
-  // #region B 站视频列表（收藏夹 / 合集 / 系列）
+  // #region某站视频列表（收藏夹 / 合集 / 系列）
   /**
    * 识别用户粘贴的链接是哪种列表
    *
@@ -265,7 +265,7 @@ export interface IpcChannelMap {
     }>
   }
   /**
-   * 拖入窗口的内容是什么（音乐歌单 / B 站列表 / 单条视频 / 没认出来）
+   * 拖入窗口的内容是什么（音乐歌单 /某站列表 / 单条视频 / 没认出来）
    *
    * 纯识别、**不联网也不写库**：拖入时要先知道「该切到哪个工作区」，
    * 这一步必须快到用户松手就出结果。真正的导入由调用方接着调对应接口。
@@ -335,17 +335,67 @@ export interface IpcChannelMap {
     params: { name?: string }
     result: import('./playlist').VideoListRecord
   }
-  /** 给列表改名（本地列表常用；同步来的列表下次同步会被远端名覆盖） */
+  /** 给列表改名（**只有本地列表**能改：平台列表的名字是远端的投影） */
   'videolists:rename': { params: { id: string; name: string }; result: boolean }
   /**
-   * 「添加视频」：解析链接 / BV 号后**插到列表最前**
+   * 「添加视频」**第一步**：解析链接，返回预览数据（**不写库**）
    *
-   * 与音乐歌单那边的 `api:parseVideo` + `api:setFavorite` 是同一套思路：
-   * 收藏 / 手动添加都进置顶区，区别只是 `origin`。
+   * 单条视频返回视频详情；合集 / 收藏夹 / 系列链接返回「列表详情 + 每条视频」。
+   * 界面拿它画确认框，用户点确定后再走 `videolists:addItem` / `videolists:addItems`。
+   *
+   * 为什么不让落库接口自己解析：合集要几十个分页请求、几秒钟，
+   * 确认之后再拉一遍既慢又容易撞 412。
+   */
+  'videolists:previewImport': {
+    params: { input: string }
+    result: import('./playlist').VideoImportPreview
+  }
+  /**
+   * 「添加视频」**第二步**（单条）：把确认过的那一条放进本地列表（置顶）
+   *
+   * 只对**本地列表**开放；平台列表的条目由远端决定。
    */
   'videolists:addItem': {
-    params: { id: string; input: string }
-    result: import('./playlist').VideoListItem
+    params: { id: string; item: import('./playlist').VideoMetaInput }
+    result: {
+      listId: string
+      listName: string
+      added: number
+      existed: number
+    }
+  }
+  /**
+   * 「添加视频」**第二步**（批量）：把确认过的一批追加到本地列表**末尾**
+   *
+   * 只增不删；已在列表里的按 bvid 跳过。
+   */
+  'videolists:addItems': {
+    params: { id: string; items: import('./playlist').VideoMetaInput[] }
+    result: {
+      listId: string
+      listName: string
+      added: number
+      existed: number
+    }
+  }
+  /**
+   * 平台列表 → 本地列表（**换 id**，不是复制）
+   *
+   * 转换后这个列表与远端断开：可改名、可增删条目，不再参与同步。
+   */
+  'videolists:convertToLocal': {
+    params: { id: string }
+    result: { id: string; name: string }
+  }
+  /**
+   * 设置同步方式（与音乐歌单同一套语义）
+   *
+   * `off` 手动同步 / `startup` 每次启动时同步 / `interval` 定时自动同步。
+   * `intervalMs` 只在 `interval` 时有用。
+   */
+  'videolists:setSyncMode': {
+    params: { id: string; mode: import('./playlist').VideoListSyncMode; intervalMs?: number }
+    result: boolean
   }
   /** 从列表里删掉一条（只删关系，不动 `videos` 的地址缓存） */
   'videolists:removeItem': { params: { id: string; bvid: string }; result: boolean }
@@ -368,7 +418,7 @@ export interface IpcChannelMap {
    * 「拖入本地视频文件」：登记 + 挂进默认列表（整批置顶）
    *
    * 和 `addItemToDefault` 是同一件事的另一种入参 —— 落点、置顶规则、
-   * 续播全都一样，只有「地址从哪来」不同（那边是 B 站解析，这边是文件路径）。
+   * 续播全都一样，只有「地址从哪来」不同（那边是某站解析，这边是文件路径）。
    *
    * `url` 由主进程拼好（`blwe-media://local/<bvid>`）随条目一起给渲染层：
    * 渲染层拿它去**探针**（`<video preload="metadata">` 读时长、顺便实测能不能播），
@@ -398,7 +448,7 @@ export interface IpcChannelMap {
    * 取某个列表的条目（**已在库里，不联网**）
    *
    * 但对**本地文件**条目会顺手 `stat` 一次，回填 `missing` —— 打开视频管理时
-   * 就能看见哪几条文件已经不在，而不是等播到它才失败。B 站条目一次 IO 都不做。
+   * 就能看见哪几条文件已经不在，而不是等播到它才失败。某站条目一次 IO 都不做。
    */
   'videolists:getItems': {
     params: { id: string }

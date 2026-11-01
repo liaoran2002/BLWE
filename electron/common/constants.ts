@@ -81,6 +81,19 @@ export const GLASS_TRANSPARENCY_STEP = 5
  *
  * 默认 10 就是改造前写死的 `--ui-idle-opacity: 0.1`（老用户观感不变）。
  */
+/**
+ * 界面字号缩放的取值范围与步进（百分比）
+ *
+ * `0` = 原样；正数放大、负数缩小。落地成 CSS 变量 `--fs = 1 + 值/100`，
+ * 每处字号写成 `calc(13px * var(--fs))` —— 只放大**字**，不动间距和布局。
+ *
+ * ⚠️ 只作用于应用窗口内的界面。托盘菜单是主进程渲染的独立页面
+ * （`tray-menu.html` 自带一套样式），不受这个值影响。
+ */
+export const FONT_SCALE_MIN = -50
+export const FONT_SCALE_MAX = 50
+export const FONT_SCALE_STEP = 10
+
 export const DEFAULT_IDLE_OPACITY = 10
 export const IDLE_OPACITY_MIN = 0
 export const IDLE_OPACITY_MAX = 100
@@ -215,7 +228,7 @@ export const SYNC_INTERVAL_OPTIONS = [
  * 所以这里同时给出毫秒常量，换算在设置界面里只做一次。
  *
  * **0 = 永久**：表示永远不清理播放直链。它是有意义的选项而不是「关掉设置」——
- * B 站直链本身带签名时效，真的过期了 `isUrlUsable` 照样会重新解析，
+ * 某站直链本身带签名时效，真的过期了 `isUrlUsable` 照样会重新解析，
  * 所以「永久」只是不再由我们的定时清理去删，不会导致播放死链。
  *
  * 上限取 365 天：再长就等于永久了，而输入框给一个没有上限的数字反而危险
@@ -226,13 +239,6 @@ export const CACHE_EXPIRE_DAYS_MAX = 365
 export const CACHE_EXPIRE_DAYS_STEP = 1
 /** 一天的毫秒数：界面的「天」与存储的毫秒之间的换算系数 */
 export const MS_PER_DAY = 24 * 60 * 60 * 1000
-
-/** 默认音源显示名（与 musicSdk 的 MusicSource 对应，单独放一份避免循环依赖） */export const SOURCE_LABELS: Record<string, string> = {
-  wy: '网易云',
-  tx: 'QQ音乐',
-  kw: '酷我',
-  kg: '酷狗',
-}
 
 /**
  * 迁移用：v1.0.0 之前（旧版 App.vue 硬编码）的播放模式为数字 0/1/2
@@ -245,7 +251,7 @@ export const LEGACY_PLAY_MODE_MAP = {
 
 /** 可选清晰度 / 音质（设置界面与播放器菜单共用） */
 export interface QualityOption {
-  /** B 站档位代码：视频是 qn，音频是 dash 音频流 id */
+  /** 某站档位代码：视频是 qn，音频是 dash 音频流 id */
   id: number
   /** 短标签，用于角标 */
   label: string
@@ -277,7 +283,7 @@ export const VIDEO_QUALITY_OPTIONS: readonly QualityOption[] = [
 /**
  * 音质档位表（dash `audio[].id`）
  *
- * B 站的音频流 id 是固定的一组，带宽决定音质；
+ * 某站的音频流 id 是固定的一组，带宽决定音质；
  * 具体哪些可用同样由响应里的 `dash.audio` 决定。
  */
 export const AUDIO_QUALITY_OPTIONS: readonly QualityOption[] = [

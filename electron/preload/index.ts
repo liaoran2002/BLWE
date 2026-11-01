@@ -36,8 +36,11 @@ import type {
   ParsedListInput,
   VideoListKind,
   VideoListItem,
+  VideoListSyncMode,
   VideoListRecord,
   VideoListSyncResult,
+  VideoImportPreview,
+  VideoMetaInput,
 } from '@common/types/playlist'
 import type { CacheStats } from '@common/types/cache_stats'
 
@@ -100,11 +103,11 @@ const api = {
     rendererInvoke('window:setProgress', { progress, paused }),
   // #endregion
 
-  // #region B 站接口
+  // #region某站接口
   getUserInfo: (): Promise<UserInfo> => rendererInvoke('api:getUserInfo'),
   searchSong: (song: string, singer: string, skipCache = false): Promise<{ data: unknown }> =>
     rendererInvoke('api:searchSong', { song, singer, skipCache }),
-  /** 「添加视频」：解析 B 站链接 / BV 号 */
+  /** 「添加视频」：解析某站链接 / BV 号 */
   parseVideo: (input: string): Promise<ParsedVideoInfo> =>
     rendererInvoke('api:parseVideo', { input }),
   /** 收藏 / 取消收藏；返回值是收藏后的完整列表（顺带刷新界面顺序） */
@@ -128,7 +131,7 @@ const api = {
     audioId?: number,
   ): Promise<IpcChannelMap['api:resolveVideo']['result']> =>
     rendererInvoke('api:resolveVideo', { bvid, keyword, skipCache, noDash, qn, audioId }),
-  /** 解析各大音乐平台的歌单分享链接（网易云 / QQ音乐 / 酷我音乐） */
+  /** 解析各大音乐平台的歌单分享链接（wy / tx / kw） */
   getPlaylistDetail: (
     params: GetPlaylistDetailParams,
   ): Promise<IpcChannelMap['music:getPlaylistDetail']['result']> =>
@@ -156,10 +159,10 @@ const api = {
   pruneCache: (): Promise<CacheStats> => rendererInvoke('cache:prune'),
   // #endregion
 
-  // #region B 站视频列表（收藏夹 / 合集 / 系列）
+  // #region某站视频列表（收藏夹 / 合集 / 系列）
   parseListInput: (text: string): Promise<ParsedListInput | null> =>
     rendererInvoke('api:parseListInput', { text }),
-  /** 拖入识别：音乐歌单 / B 站列表 / 单条视频 / 没认出来（不联网、不写库） */
+  /** 拖入识别：音乐歌单 /某站列表 / 单条视频 / 没认出来（不联网、不写库） */
   classifyDrop: (text: string): Promise<DropInputTarget> =>
     rendererInvoke('api:classifyDrop', { text }),
   fetchMyFavFolders: (): Promise<
@@ -189,8 +192,31 @@ const api = {
     rendererInvoke('videolists:createLocal', { name }),
   renameVideoList: (id: string, name: string): Promise<boolean> =>
     rendererInvoke('videolists:rename', { id, name }),
-  addVideoListItem: (id: string, input: string): Promise<VideoListItem> =>
-    rendererInvoke('videolists:addItem', { id, input }),
+  /** 「添加视频」第一步：解析成预览数据（不写库），界面拿它做确认框 */
+  previewVideoImport: (input: string): Promise<VideoImportPreview> =>
+    rendererInvoke('videolists:previewImport', { input }),
+  /** 第二步（单条）：把确认过的那一条放进本地列表（置顶） */
+  addVideoListItem: (
+    id: string,
+    item: VideoMetaInput,
+  ): Promise<IpcChannelMap['videolists:addItem']['result']> =>
+    rendererInvoke('videolists:addItem', { id, item }),
+  /** 第二步（批量）：把确认过的一批追加到本地列表末尾 */
+  addVideoListItems: (
+    id: string,
+    items: VideoMetaInput[],
+  ): Promise<IpcChannelMap['videolists:addItems']['result']> =>
+    rendererInvoke('videolists:addItems', { id, items }),
+  /** 平台列表 → 本地列表（换 id；调用方要重映射正在播的那个 id） */
+  convertVideoListToLocal: (
+    id: string,
+  ): Promise<IpcChannelMap['videolists:convertToLocal']['result']> =>
+    rendererInvoke('videolists:convertToLocal', { id }),
+  setVideoListSyncMode: (
+    id: string,
+    mode: VideoListSyncMode,
+    intervalMs = 0,
+  ): Promise<boolean> => rendererInvoke('videolists:setSyncMode', { id, mode, intervalMs }),
   /** 拖入单条视频：放进默认列表（没有就现建），返回落点供播放 */
   addVideoItemToDefault: (
     input: string,

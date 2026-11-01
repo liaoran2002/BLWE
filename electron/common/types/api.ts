@@ -81,11 +81,11 @@ export interface RendererAPI {
   setProgress: (progress: number, paused: boolean) => Promise<void>
   // #endregion
 
-  // #region B 站接口
+  // #region某站接口
   getUserInfo: () => Promise<UserInfo>
   /** skipCache=true 用于视频列表的刷新按钮（真的重搜，同时保住已解析的播放地址） */
   searchSong: (song: string, singer: string, skipCache?: boolean) => Promise<{ data: unknown }>
-  /** 「添加视频」：解析 B 站链接 / BV 号 */
+  /** 「添加视频」：解析某站链接 / BV 号 */
   parseVideo: (input: string) => Promise<ParsedVideoInfo>
   /**
    * 收藏 / 取消收藏；返回收藏后的完整 bvid 列表（顺序由主进程的 ord 决定）
@@ -182,10 +182,10 @@ export interface RendererAPI {
   pruneCache: () => Promise<import('./cache_stats').CacheStats>
   // #endregion
 
-  // #region B 站视频列表（收藏夹 / 合集 / 系列）
+  // #region某站视频列表（收藏夹 / 合集 / 系列）
   /** 识别用户粘贴的链接是哪种列表（失败返回 null） */
   parseListInput: (text: string) => Promise<import('./playlist').ParsedListInput | null>
-  /** 拖入识别：音乐歌单 / B 站列表 / 单条视频 / 没认出来（不联网、不写库） */
+  /** 拖入识别：音乐歌单 /某站列表 / 单条视频 / 没认出来（不联网、不写库） */
   classifyDrop: (text: string) => Promise<import('./playlist').DropInputTarget>
   /** 「我创建的收藏夹」——导入弹窗里的选集入口（需要登录；`cover` 给封面网格用） */
   fetchMyFavFolders: () => Promise<
@@ -218,10 +218,35 @@ export interface RendererAPI {
   removeVideoList: (id: string) => Promise<boolean>
   /** 新建本地列表（名字为空时自动叫「本地列表」「本地列表2」…） */
   createLocalVideoList: (name?: string) => Promise<import('./playlist').VideoListRecord>
-  /** 给列表改名 */
+  /** 给列表改名（**只有本地列表**能改：平台列表的名字是远端的投影） */
   renameVideoList: (id: string, name: string) => Promise<boolean>
-  /** 「添加视频」：解析链接 / BV 号后插到列表最前（置顶区） */
-  addVideoListItem: (id: string, input: string) => Promise<import('./playlist').VideoListItem>
+  /**
+   * 「添加视频」第一步：解析成预览数据（**不写库**）
+   *
+   * 单条返回视频详情；合集 / 收藏夹 / 系列返回「列表详情 + 每条视频」。
+   */
+  previewVideoImport: (input: string) => Promise<import('./playlist').VideoImportPreview>
+  /** 第二步（单条）：把确认过的那一条放进本地列表（置顶） */
+  addVideoListItem: (
+    id: string,
+    item: import('./playlist').VideoMetaInput,
+  ) => Promise<import('./ipc').IpcChannelMap['videolists:addItem']['result']>
+  /** 第二步（批量）：把确认过的一批追加到本地列表末尾 */
+  addVideoListItems: (
+    id: string,
+    items: import('./playlist').VideoMetaInput[],
+  ) => Promise<import('./ipc').IpcChannelMap['videolists:addItems']['result']>
+  /** 平台列表 → 本地列表（换 id，不是复制） */
+  convertVideoListToLocal: (
+    id: string,
+  ) => Promise<import('./ipc').IpcChannelMap['videolists:convertToLocal']['result']>
+  /** 设置同步方式（`manual` = 参与「全部同步」，`off` = 只能手动点） */
+  /** 设置同步方式：`off` 手动 / `startup` 启动时 / `interval` 定时（带间隔） */
+  setVideoListSyncMode: (
+    id: string,
+    mode: import('./playlist').VideoListSyncMode,
+    intervalMs?: number,
+  ) => Promise<boolean>
   /** 拖入单条视频：放进**默认列表**（没有就现建），返回落点供播放 */
   addVideoItemToDefault: (
     input: string,

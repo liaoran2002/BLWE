@@ -216,6 +216,30 @@
           </div>
         </div>
         <!--
+          界面字号
+
+          只影响**弹窗里的界面**（管理 / 列表 / 设置 / 关于）的字号 ——
+          标题栏、控制栏、托盘菜单都不跟着变（托盘菜单是独立页面，
+          主进程用 `tray-menu.html` 自己渲染）。
+
+          存的是百分比，落地成 CSS 变量 `--fs = 1 + 值/100`（见 `utils/uiTheme.ts`），
+          每处字号写成 `calc(13px * var(--fs))` —— 放大的只是字，间距和布局不动。
+        -->
+        <div class="st-row st-row--slider">
+          <div class="st-name">界面字号</div>
+          <div class="st-slider-box">
+            <el-slider
+              class="st-slider"
+              :model-value="setting['ui.fontScale']"
+              :min="FONT_SCALE_MIN"
+              :max="FONT_SCALE_MAX"
+              :step="FONT_SCALE_STEP"
+              @update:model-value="(v: number | number[]) => setFontScale(v)"
+            />
+            <span class="st-value">{{ fontScaleLabel }}</span>
+          </div>
+        </div>
+        <!--
           窗口宽高比
 
           `allow-create` 让用户能直接输入一个比例（如 21:9、9:16），输入的值会被
@@ -570,6 +594,10 @@ import {
   /** 搜索排序：时长容差与降级阈值的取值范围 */
   DURATION_TOLERANCE_MAX,
   DURATION_TOLERANCE_MIN,
+  /** 界面字号：-50 ~ 50（百分比），十步一进 */
+  FONT_SCALE_MAX,
+  FONT_SCALE_MIN,
+  FONT_SCALE_STEP,
   GLASS_BLUR_PERCENT_PER_PX,
   GLASS_BLUR_PERCENT_STEP,
   GLASS_SHADOW_PERCENT_PER_PX,
@@ -645,6 +673,10 @@ export default defineComponent({
       GLASS_TRANSPARENCY_MIN,
       GLASS_TRANSPARENCY_MAX,
       GLASS_TRANSPARENCY_STEP,
+      /** 界面字号：-50 ~ 50（百分比），十步一进 */
+      FONT_SCALE_MIN,
+      FONT_SCALE_MAX,
+      FONT_SCALE_STEP,
       /** 控制栏闲置透明度：0-100，**五步一进** */
       IDLE_OPACITY_MIN,
       IDLE_OPACITY_MAX,
@@ -737,6 +769,11 @@ export default defineComponent({
     },
     setting(): AppSetting {
       return this.store.setting;
+    },
+    /** 「界面字号」的显示文案：0 显示 `0%`，正数带 `+` */
+    fontScaleLabel(): string {
+      const v = this.setting['ui.fontScale'] ?? 0;
+      return v > 0 ? `+${v}%` : `${v}%`;
     },
     /** 模糊强度界面上显示的百分比（0-20px -> 0-100%） */
     blurPercent(): number {
@@ -987,6 +1024,9 @@ export default defineComponent({
      * 滑块本身已经按 step 取整了，这里再吸附一次：旧实例 / 键盘 / 未来换控件
      * 都可能塞进 53 这种值，落盘前统一归到 5 的倍数。
      */
+    setFontScale(v: number | number[]): void {
+      this.set('ui.fontScale', snapSlider(v, FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP));
+    },
     setTransparency(v: number | number[]): void {
       this.set(
         'common.glassTransparency',
@@ -1447,7 +1487,7 @@ export default defineComponent({
 .st-nav-item {
   padding: 6px 8px;
   border-radius: 6px;
-  font-size: 13px;
+  font-size: calc(13px * var(--fs));
   cursor: pointer;
   /* 未选中时淡一点，选中项才突出 */
   opacity: 0.6;
@@ -1481,7 +1521,7 @@ export default defineComponent({
   margin-bottom: 18px;
 }
 .st-group-title {
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   font-weight: 600;
   opacity: 0.55;
   margin-bottom: 6px;
@@ -1498,7 +1538,7 @@ export default defineComponent({
   gap: 8px;
   margin: 14px 0 2px;
   padding-left: 2px;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   font-weight: 600;
   opacity: 0.8;
 }
@@ -1571,7 +1611,7 @@ export default defineComponent({
 /* 待确认删除时的提示文字「确认删除？」：只推右 + 字号，**不设颜色**（跟面板文字走） */
 .st-tier-del-ask {
   margin-left: auto;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   opacity: 0.9;
 }
 /*
@@ -1621,7 +1661,7 @@ export default defineComponent({
   border-bottom: none;
 }
 .st-name {
-  font-size: 13px;
+  font-size: calc(13px * var(--fs));
   flex: none;
 }
 /* 分值 + 删除按钮横排的那一列（已废弃：分值行和标签行已拆成两行） */
@@ -1638,7 +1678,7 @@ export default defineComponent({
 .st-score-input :deep(.el-input__inner) {
   text-align: center;
   font-variant-numeric: tabular-nums;
-  font-size: 13px;
+  font-size: calc(13px * var(--fs));
   font-weight: 600;
 }
 /* 正负色要作用到内层 input 上（scoped 下够不到子组件内部） */
@@ -1657,7 +1697,7 @@ export default defineComponent({
 .st-score-btn {
   padding: 0 2px !important;
   min-width: 16px !important;
-  font-size: 13px;
+  font-size: calc(13px * var(--fs));
   line-height: 1;
   opacity: 0.7;
 }
@@ -1679,7 +1719,7 @@ export default defineComponent({
  * （「秒（MV / Live 自动放宽）」这类文字一长就把行顶宽）。
  */
 .st-desc {
-  font-size: 11px;
+  font-size: calc(11px * var(--fs));
   opacity: 0.55;
 }
 .st-actions {
@@ -1712,7 +1752,7 @@ export default defineComponent({
 .st-add {
   width: 24px;
   padding: 0;
-  font-size: 14px;
+  font-size: calc(14px * var(--fs));
   line-height: 1;
 }
 /* 颜色行：前面是 16 进制输入框，后面是取色盘 */
@@ -1744,7 +1784,7 @@ export default defineComponent({
 .st-value {
   width: 42px;
   text-align: right;
-  font-size: 12px;
+  font-size: calc(12px * var(--fs));
   /* 数字等宽，拖动时不会左右跳 */
   font-variant-numeric: tabular-nums;
   opacity: 0.75;

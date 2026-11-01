@@ -118,7 +118,7 @@ export const queueGetters: ThisType<QueueContext> = {
     return titleOf(this.currentItem);
   },
 
-  /** 当前播放源是不是 B 站视频列表（决定「歌手」列叫 UP 主、刷新叫重新同步） */
+  /** 当前播放源是不是某站视频列表（决定「歌手」列叫 UP 主、刷新叫重新同步） */
   fromVideoList(): boolean {
     /**
      * 两个条件都算「在播视频」：
@@ -131,7 +131,7 @@ export const queueGetters: ThisType<QueueContext> = {
   },
 
   /**
-   * 当前工作区：`ov` = B 站视频列表、`mv` = 音乐歌单
+   * 当前工作区：`ov` =某站视频列表、`mv` = 音乐歌单
    *
    * ## 它是**播放源的投影**，不是可写的状态
    *
@@ -245,7 +245,7 @@ export const queueActions: ThisType<QueueContext> = {
   /**
    * 加载当前播放源的曲目
    *
-   * 多歌单之后，曲目来源是「当前歌单」或「当前 B 站视频列表」，
+   * 多歌单之后，曲目来源是「当前歌单」或「当前某站视频列表」，
    * 不再直接读旧版单歌单文件（那个文件已由主进程迁移进集合）。
    */
   async loadPlaylist(): Promise<void> {
@@ -521,7 +521,7 @@ export const queueActions: ThisType<QueueContext> = {
     /**
      * ② OV 的视频列表 = 当前这一列：**重新拉列表**（不是重新搜索）
      *
-     * 语义差别很大：这里一条请求打的是 B 站的收藏夹/合集接口，
+     * 语义差别很大：这里一条请求打的是某站的收藏夹/合集接口，
      * 回来的是「这个列表现在有哪些视频」。搜索结果那套过滤 / 打分
      * 对列表条目完全不适用（见方案 4.4）。
      *

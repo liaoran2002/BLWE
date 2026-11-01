@@ -47,6 +47,7 @@ const bootstrap = async (): Promise<void> => {
       settingStore.setting['common.glassBlur'],
       settingStore.setting['common.glassShadow'],
       settingStore.setting['common.idleOpacity'],
+      settingStore.setting['ui.fontScale'],
     ],
     () => applyUiThemeFromSetting(settingStore.setting),
     { immediate: true },

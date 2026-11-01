@@ -5,8 +5,8 @@
  * （`utils/cache.ts` 的 `toSeconds`、`main/utils/playlist.ts` 的隐式透传、
  * `components/showList.vue` 的 `formatSeconds`/`durationText`），而且形状还不止一种：
  *
- *  - B 站**搜索**接口给的是 `"4:03"` 字符串；
- *  - B 站 **view** 接口和本项目自己的库里（`videos.duration`、`playlist_songs.duration`）
+ *  - 某站**搜索**接口给的是 `"4:03"` 字符串；
+ *  - 某站 **view** 接口和本项目自己的库里（`videos.duration`、`playlist_songs.duration`）
  *    给的是**秒数**；
  *  - 音乐平台歌单给的是 `"4:03"` / `"1:02:03"` 字符串。
  *
@@ -77,7 +77,7 @@ export const durationToSeconds = (raw: unknown): number | null => {
  * 秒 -> `mm:ss`（**总分钟数**会超过 59，例如 `"75:00"`）
  *
  * 刻意不做 `h:mm:ss`：这是**单曲**时长，超过一小时的极少，
- * 而库里存的、B 站给的都是秒，统一按「总分钟:秒」展示最不容易看错
+ * 而库里存的、某站给的都是秒，统一按「总分钟:秒」展示最不容易看错
  * （和 `showList.vue` 原来的视频时长格式、以及音乐平台的写法一致）。
  *
  * 拿不到有效秒数时返回 `''`（调用方直接贴进模板就是空白，不用再判空）。

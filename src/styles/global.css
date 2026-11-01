@@ -14,12 +14,31 @@
  * ⚠️ 必须在 `element-plus/dist/index.css` **之后**引入，否则覆盖不生效。
  */
 
+/*
+ * 整个窗口不允许选中文字
+ *
+ * 用 `*` 而不是只写 `#app`：所有 el-dialog 都是 teleport 到 body 的，
+ * 不在 `#app` 下面 —— 只挂在 `#app` 上时，弹窗里的标题、条目、提示照样能被拖选，
+ * 鼠标一划就是一片蓝色，点得快一点还会触发浏览器原生的文字拖拽。
+ *
+ * 例外只有「真的要用文字的地方」：输入框、文本域、可编辑区。
+ * 不给它们开例外，输入框里就没法拖选、没法全选替换，等于残了。
+ */
+* {
+  user-select: none;
+}
+
+input,
+textarea,
+[contenteditable='true'] {
+  user-select: text;
+}
+
 #app {
   height: 100vh;
   margin: 0;
   padding: 0;
   overflow: hidden;
-  user-select: none;
 }
 
 /* 视频铺满窗口：宽高交给元素本身，dash/durl 两条路都靠 attach() 设 src，这里只管定位 */
@@ -50,6 +69,22 @@
   -webkit-backdrop-filter: blur(var(--glass-blur));
   color: var(--panel-text);
   text-shadow: var(--glass-shadow);
+  /**
+   * Element Plus 的基础字号也跟着「界面字号」走
+   *
+   * 它内部的字号全由 `--el-font-size-*` 派生（按钮、输入框、下拉、对话框…），
+   * 只改我们自己的 font-size 会出现「列表字变大了、旁边按钮没变」的错位。
+   *
+   * 只写在 `.el-dialog` 上而不是 `:root`：字号目前只控制**弹窗里的界面**
+   * （管理 / 列表 / 设置 / 关于），弹窗外的标题栏、控制栏不该跟着动。
+   * 以后要扩大范围，把变量提到 `:root`，再把那些组件的 font-size 也换成
+   * `calc(Npx * var(--fs))` 即可。
+   */
+  --el-font-size-base: calc(14px * var(--fs));
+  --el-font-size-small: calc(13px * var(--fs));
+  --el-font-size-extra-small: calc(12px * var(--fs));
+  --el-font-size-large: calc(18px * var(--fs));
+  --el-font-size-medium: calc(16px * var(--fs));
 }
 .el-dialog .el-dialog__title,
 .el-dialog .el-dialog__header,
