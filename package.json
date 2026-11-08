@@ -17,8 +17,8 @@
     "protect": "node scripts/protect.mjs",
     "fingerprint": "node scripts/fingerprint.mjs",
     "build:protected": "npm run build:only && npm run protect",
-    "pack": "npm run build:protected && electron-builder --dir",
-    "dist": "npm run build:protected && electron-builder && npm run fingerprint"
+    "pack": "npm run build:protected && electron-builder --dir --publish never",
+    "dist": "npm run build:protected && electron-builder --publish never && npm run fingerprint"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
