@@ -15,9 +15,10 @@
     "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "protect": "node scripts/protect.mjs",
+    "fingerprint": "node scripts/fingerprint.mjs",
     "build:protected": "npm run build:only && npm run protect",
     "pack": "npm run build:protected && electron-builder --dir",
-    "dist": "npm run build:protected && electron-builder"
+    "dist": "npm run build:protected && electron-builder && npm run fingerprint"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

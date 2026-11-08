@@ -3643,6 +3643,82 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
 
 ---
 
+## 检查更新（指纹比对，不自动安装）
+
+**目标**：用户下次打开就能知道「发布页上那份和我手上这份不一样」，然后自己去下。
+**不做**：自动下载、静默安装、后台升级。理由见下。
+
+### 为什么不比版本号
+
+`package.json` 的 `version` 常年停在 `1.0.0`，而代码天天改 —— 版本号在这里是假的。
+比的是 **`app.asar` 的 sha256**：打出来的包内容一换，指纹就变，天然对应「有没有新版」。
+
+**为什么不比 exe 的哈希**：安装版用户跑的是安装目录里的 `BLWE.exe`，
+发布出来的是 NSIS 安装包（`BLWE Setup 1.0.0.exe`），两者根本不是同一个文件，哈希永远对不上。
+`app.asar` 在安装版 / 便携版里是同一份，才有可比性。
+
+### 一次检查长什么样
+
+```
+启动 12s 后 ─→ 距上次成功检查 ≥ 6h？ ──否──→ 什么都不做
+                      │是
+                      ↓
+        本地：sha256(resources/app.asar)
+        远端：GET api.github.com/repos/<owner>/<repo>/releases/latest
+              └→ assets 里找 fingerprint.json → 读里面的 sha256
+                      ↓
+        两个一样？ ──是──→ 静默结束
+                      │否
+                      ↓
+        界面可见 → 广播 update:available →「去下载 / 以后再说」
+        壁纸模式 / 关到托盘 → 系统通知（点一下打开发布页）
+```
+
+`fingerprint.json` 由 `scripts/fingerprint.mjs` 生成（`dist` 跑完自动执行），
+发布时作为**附件**上传、名字不能改 —— 主进程靠这个名字在 release assets 里找它。
+把它和 release 绑定而不是放仓库里，是为了保证「指纹」和「安装包」**是同一次发布**的，
+否则会出现「提示有新版，下下来还是旧的」。
+
+### 为什么连不上就一声不吭
+
+GitHub 在国内经常不通（DNS 污染 / 超时）。失败也弹一句「检查更新失败」的话，
+用户每次开机被打扰一次，而他什么也做不了。所以：
+
+- **自动检查**：超时 / DNS / 404（还没有 release）/ 发布里没有附件 / JSON 不合法 ——
+  任何一步失败都直接返回，只留一行 `console.log`，不弹窗、不写 `lastCheckAt`（下次启动会再试）；
+- **手动检查**（「关于」里的按钮）：必须把原因说出来，否则用户以为按钮坏了。
+
+### 为什么不直接上 `electron-updater`
+
+| 约束 | 后果 |
+| :--- | :--- |
+| 产物是 `nsis` + `portable` 两种 | 便携版是运行时解压到临时目录的单文件 exe，**自己替换不了自己**，自动更新对它无效 |
+| 没有代码签名 | 下载的安装包会吃 SmartScreen 警告，部分杀软直接删；静默安装更容易被拦 |
+| 国内访问 GitHub | 增量下载几十 MB 经常断在中途，失败重试的体验比手动下载更差 |
+| `dist` 前要跑 `protect` | 更新包必须是同一套保护产物，`.blockmap` 也要跟着发布，流程更脆 |
+
+所以这一版只做「检查 + 提示」，成本是一个 `fetch`；要做成全自动，得先解决签名和便携版。
+
+### 边界与已知未做
+
+- **开发模式完全不检查**（`app.isPackaged` 为 false）：dev 没有 `app.asar`，指纹无从谈起。
+  「关于」里的按钮会明确说「开发模式不检查更新」。
+- **读 asar 本体要临时关 asar 补丁**：Electron 把 `fs` 换成了能读 asar 内部的版本，
+  `fs.readFileSync('…/app.asar')` 会被当成包内路径而报 `ENOENT, not found in …app.asar`。
+  读之前 `process.noAsar = true`、读完还原（实测与 `scripts/fingerprint.mjs` 结果一致）。
+- **「以后再说」按指纹记**（`update.dismissedSha`）：同一份指纹不再主动弹，下次发布才重新提示。
+- 未做：自动下载、断点续传、自定义更新源。真要加，优先做「手动下载页 + 国内镜像地址」而不是自动安装。
+
+### 发布怎么对上（CI）
+
+`.github/workflows/release.yml`：push 到 `main` → `windows-latest` 上 `npm ci` → `npm run typecheck`
+→ `npm run dist` → 删掉旧的 `latest` 发布（连 tag）再用当前 commit 重建，把两个 exe 和
+`fingerprint.json` 一起传上去。
+
+应用端只认 `releases/latest`，所以「覆盖同一个发布」就够了，不必一 commit 一个 tag。
+代价是**指纹每次都变** —— 任何代码改动都会让在用的人收到一次提示（同一指纹只提示一次）；
+改文档不触发构建（`paths-ignore`），所以不会产生这种噪音。
+
 ## 一次代码审查修掉的东西
 
 给自己留个记录：下面这些不是「设计」，是**真的漏掉 / 写错**的地方，改动都带了注释说明原因。

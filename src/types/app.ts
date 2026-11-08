@@ -202,6 +202,8 @@ export interface AppData {
   removeWallpaperState: RemoveListener | null
   /** 壁纸模式不可用时提示用户原因（原生层加载失败 / 找不到桌面壁纸层） */
   removeWallpaperUnavailable: RemoveListener | null
+  /** 主进程自动检查到新版本时的监听摘除函数（只提示，不自动下载） */
+  removeUpdateAvailable: RemoveListener | null
   /** 托盘菜单（迷你控制台）：进度条 / 音量 / 静音 */
   removeTraySeek: RemoveListener | null
   removeTrayVolume: RemoveListener | null

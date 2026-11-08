@@ -322,4 +322,22 @@ export interface RendererAPI {
   /** 壁纸模式不可用时收到原因（原生层加载失败 / 找不到桌面壁纸层等），用于给用户提示 */
   onWallpaperUnavailable: (cb: (reason: string) => void) => RemoveListener
   // #endregion
+
+  // #region 检查更新
+  /**
+   * 手动检查更新（「关于」里的按钮）
+   *
+   * 比的是**构建指纹**（`app.asar` 的 sha256），不是版本号 —— 见 `types/update.ts`。
+   * 失败时 `error` 有值（自动检查则完全静默，不会弹任何东西）。
+   */
+  checkUpdate: () => Promise<import('./update').UpdateCheckResult>
+  /** 本机信息：版本号 + 构建指纹前 12 位 */
+  getUpdateInfo: () => Promise<import('./update').UpdateInfo>
+  /** 「以后再说」：同一份指纹不再主动弹 */
+  dismissUpdate: (sha256: string) => Promise<void>
+  /** 主进程自动检查到新版本时通知界面 */
+  onUpdateAvailable: (
+    cb: (info: import('./update').UpdateAvailablePayload) => void,
+  ) => RemoveListener
+  // #endregion
 }

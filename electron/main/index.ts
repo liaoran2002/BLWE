@@ -24,6 +24,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { registerIpcHandlers } from './ipcHandlers'
 import { setupUserDataPath, isPortable } from './portable'
+import { startUpdateWatcher } from './updater'
 import {
   initSetting,
   flushSetting,
@@ -2293,6 +2294,17 @@ void app.whenReady().then(async () => {
 
   // 第 5 步：显示器变化（拔屏 / 改分辨率）时重算全屏与壁纸的几何
   watchDisplayChanges()
+
+  /**
+   * 第 6 步：检查更新（只查 + 提示，不自动安装）
+   *
+   * 启动后延迟一段时间才发请求，壁纸模式 / 关到托盘时改用系统通知；
+   * 连不上 GitHub 就静默放弃（国内常态，见 `updater.ts` 文件头）。
+   */
+  startUpdateWatcher({
+    isWallpaperMode: () => wallpaperEnabled,
+    getMainWindow: () => mainWindow,
+  })
 
   void grabCookiesSilently()
 

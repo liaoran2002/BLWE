@@ -112,6 +112,21 @@ export interface IpcChannelMap {
   'app:openExternal': { params: { url: string }; result: boolean }
   // #endregion
 
+  // #region 检查更新
+  /**
+   * 手动检查更新（「关于」里那个按钮）
+   *
+   * 和自动检查走同一套逻辑，区别只有一处：**失败要说出来**。
+   * 自动检查连不上 GitHub 时是完全静默的（国内网络常见），
+   * 而用户主动点了按钮还什么都不显示，他会以为按钮坏了。
+   */
+  'update:check': { params: void; result: import('./update').UpdateCheckResult }
+  /** 本机信息：版本号 + 构建指纹（「关于」里显示） */
+  'update:info': { params: void; result: import('./update').UpdateInfo }
+  /** 用户点了「以后再说」：同一份指纹不再主动弹（下次发新版才再提示） */
+  'update:dismiss': { params: { sha256: string }; result: void }
+  // #endregion
+
   // #region bilibili api
   'api:getUserInfo': { params: void; result: UserInfo }
   'api:searchSong': {
@@ -652,6 +667,12 @@ export interface IpcEventMap {
   'trayMenu:visibility': boolean
   /** 主进程把最新状态推给托盘菜单窗口 */
   'trayMenu:state': TrayMenuState
+  /**
+   * 发现新版本（只在窗口看得见时广播；壁纸模式/收到托盘里改用系统通知）
+   *
+   * 判据是**构建指纹不同**（app.asar 的 sha256），不是版本号 —— 见 `types/update.ts`。
+   */
+  'update:available': import('./update').UpdateAvailablePayload
 }
 
 export type IpcEvent = keyof IpcEventMap

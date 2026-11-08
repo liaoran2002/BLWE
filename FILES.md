@@ -155,6 +155,7 @@
 | `biliApiHandlers.ts` | ★ **搜索 / 解析视频 / 收藏**，见下面单独一节 |
 | `playlist.ts` | 歌单三条：`get` / `save` / `sync` |
 | `videolists.ts` | ★ **某站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ **loadMore**/ getItems/ setIndex/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
+| `update.ts` | 检查更新三条：`update:check`（手动查，失败带原因）/ `update:info`（版本 + 指纹）/ `update:dismiss`（同一指纹不再弹），见 `updater.ts` |
 | `music.ts` | `music:getPlaylistDetail` + `music:importPlaylist` —— ★ 前者是**唯一的加工点**：归一化曲目字段 + 拼好歌单主键，见下 |
 | `cache.ts` | 缓存三条：`clearAll` / `getStats` / `prune` |
 
@@ -824,6 +825,40 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 - **两个 `setPath` 都要改**（`appData` + `userData`）：只改 userData 的话，
   Electron 内部仍可能往 Roaming 里写东西。
 
+### `updater.ts` —— 在线更新（只检查 + 提示）
+
+**职责**：算本地构建指纹、问 GitHub 要发布页上的指纹、比出「有没有新版」，然后**只提示**。
+不做自动下载、不做静默安装 —— 国内从 GitHub 拉 100MB 断在半路比手动下载更糟。
+
+| 导出 | 作用 |
+| :--- | :--- |
+| `localFingerprint()` | `resources/app.asar` 的 sha256；开发模式返回 `null` |
+| `checkForUpdate()` | 拉 `releases/latest` → 找 `fingerprint.json` 附件 → 比对；**失败不弹任何东西** |
+| `getUpdateInfo()` | 「关于」里显示的版本号 + 指纹前 12 位 |
+| `dismissUpdate(sha)` | 记下「以后再说」的指纹，同一份不再主动弹 |
+| `startUpdateWatcher(deps)` | 启动后 12 秒查一次，之后每小时心跳、**6 小时内不重复查** |
+
+**比指纹而不是版本号**：这个项目的 `version` 常年不动，代码却天天改。
+`app.asar` 的 sha256 一改就变，等于「发布出来的东西换没换」的天然指纹。
+**不能比 exe**：安装版跑的是安装目录里的 `BLWE.exe`，发布的是 NSIS 安装包，
+两者不是同一个文件，哈希永远对不上；`app.asar` 在安装版 / 便携版里才是同一份。
+
+**读 asar 本体必须临时关掉 asar 补丁**（踩过）：Electron 把 `fs` 换成能读 asar 内部的版本，
+`fs.readFileSync('…/app.asar')` 会被当成「包内路径」，直接报 `ENOENT, not found in …app.asar`。
+所以读之前 `process.noAsar = true`、读完立刻还原。实测两种写法（`noAsar` / `original-fs`）
+得到的哈希与 `scripts/fingerprint.mjs` 一致。
+
+**三处提示策略**（都收在 `announce()` 里）：
+
+| 场景 | 做法 |
+| :--- | :--- |
+| 界面看得见 | 广播 `update:available` → 渲染层弹「去下载 / 以后再说」 |
+| 壁纸模式 / 关到托盘 | 系统通知（Windows 通知中心），点一下打开发布页 |
+| 自动检查失败（超时 / DNS / 404 / 没有附件） | **完全静默**，只留一行 `console.log` |
+| 手动检查失败（「关于」里点的） | `ElMessage.error` 把原因说出来，否则用户以为按钮坏了 |
+
+> `fingerprint.json` 由 `scripts/fingerprint.mjs` 生成（`npm run fingerprint`，已挂到 `dist` 末尾），
+> 发布时必须作为**附件**上传、文件名不能改 —— 主进程靠这个名字在 assets 里找它。
 ### `protection.ts` + `bundleKey.ts` —— 资源解密
 
 **职责**：注册 `blwe://` 协议，页面请求哪个文件就解密哪个，**只解密到内存、不落盘**。
@@ -1419,6 +1454,8 @@ IPC 出口（只做一层透传，把 `window.electronAPI` 收成有类型的模
 | :--- | :--- |
 | `electron.vite.config.ts` | 三个构建目标（main / preload / renderer）；renderer 两个入口（`index.html` + `tray-menu.html`） |
 | `scripts/protect.mjs` | 打包保护流水线：字节码 + 混淆 + 资源加密 |
+| `scripts/fingerprint.mjs` | 算 `app.asar` 的 sha256 → `release/fingerprint.json`（检查更新的比对基准） |
+| `.github/workflows/release.yml` | push 到 `main` 自动打包并**覆盖** `latest` 发布（含 `fingerprint.json`） |
 | `tsconfig.*.json` | 三份配置（base / node / web）+ 路径别名 |
 | `package.json` | 脚本与 electron-builder 配置（`dependencies` 里 **`opencc-js`** 是运行期依赖） |
 
@@ -2545,6 +2582,25 @@ electron-builder（asar）→ 打包 out/
 > 拿缓存键当搜索词看会完全误解。
 
 ---
+
+**自动发布（GitHub Actions）**
+
+```
+push 到 main（改 md / screenshot 不触发）
+   ↓ windows-latest
+npm ci → npm run typecheck → npm run dist（构建 + protect + 打包 + 指纹）
+   ↓
+gh release delete latest --cleanup-tag  →  gh release create latest <两个 exe> fingerprint.json
+```
+
+**为什么覆盖同一个 `latest` 发布**：版本号常年是 `1.0.0`，tag 没法按版本区分；
+一 commit 一个 release 会很快把 Releases 页面堆满，而应用只认 `releases/latest`。
+
+**副作用**（必须知道）：`protect` + asar 每次都会打出不同的字节 → **指纹每次都变** →
+任何代码改动都会让已经在用的用户看到一次「有新版本」提示（同一份指纹只提示一次，
+点「以后再说」不再弹）。只改文档不会触发构建，所以不会造成这种提示。
+
+**没有做的事**：没有代码签名，CI 产物同样会吃 SmartScreen 警告；也没有自动安装。
 
 ## 15.某站视频列表（导入 → 播放 → 续播）
 

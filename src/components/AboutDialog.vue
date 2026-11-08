@@ -34,6 +34,20 @@
         https://github.com/liaoran2002/BLWE
       </div>
 
+      <!--
+        版本与构建指纹
+
+        指纹 = app.asar 的 sha256 前 12 位，比版本号更真实：代码一改指纹就变。
+        「检查更新」是唯一的手动入口（自动检查在启动后静默跑一次，连不上就什么都不说）。
+      -->
+      <div class="ab-meta">
+        <span>版本 {{ appVersion || "—" }}</span>
+        <span v-if="fingerprint">· 指纹 {{ fingerprint }}</span>
+        <span class="ab-check" :class="{ busy: checking }" @click="checkUpdate">
+          {{ checking ? "检查中…" : "检查更新" }}
+        </span>
+      </div>
+
       <div class="ab-thanks">大肥鱼，没有你我写不出来啊！<br>虽然花了我40块钱加6元鲸圆券！但是你不是吃白饭的大肥鱼！</div>
     </div>
   </el-dialog>
@@ -41,7 +55,7 @@
 
 <script lang="ts">
 import { defineComponent } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import api from '../api/electron';
 import { useUiStore } from '../stores/ui';
 
@@ -78,9 +92,69 @@ export default defineComponent({
     return {
       devAvatar: new URL('../assets/avatar.jpg', import.meta.url).href,
       aiAvatar: new URL('../assets/avatar-fish.jpg', import.meta.url).href,
+      /** 打包版本号（只展示用，不参与新旧判断） */
+      appVersion: '',
+      /** 本地构建指纹前 12 位 */
+      fingerprint: '',
+      checking: false,
     };
   },
+  watch: {
+    /** 每次打开读一次（指纹要算 app.asar 的哈希，没必要常驻） */
+    visible(v: boolean) {
+      if (v) void this.loadInfo();
+    },
+  },
   methods: {
+    async loadInfo(): Promise<void> {
+      try {
+        const info = await api.getUpdateInfo();
+        this.appVersion = info.version;
+        this.fingerprint = info.fingerprint || '';
+      } catch {
+        /* 读不到就显示「—」，不影响其它功能 */
+      }
+    },
+    /**
+     * 手动检查更新
+     *
+     * 和自动检查的区别只有一处：**失败要说出来**。自动检查连不上 GitHub 时是完全静默的。
+     */
+    async checkUpdate(): Promise<void> {
+      if (this.checking) return;
+      this.checking = true;
+      try {
+        const res = await api.checkUpdate();
+        if (res.skipped) {
+          ElMessage.info(res.skipped);
+          return;
+        }
+        if (!res.ok) {
+          ElMessage.error(`检查失败：${res.error || '连接失败'}`);
+          return;
+        }
+        if (!res.different) {
+          ElMessage.success('已经是最新构建');
+          return;
+        }
+        try {
+          await ElMessageBox.confirm(
+            '发布页上的构建和当前这份不一样，说明有新版本。\n去下载后需要手动安装。',
+            '发现新版本',
+            { confirmButtonText: '去下载', cancelButtonText: '以后再说', type: 'info' },
+          );
+          if (res.url) await api.openExternal(res.url);
+        } catch {
+          /** 点「以后再说」：记下这份指纹，自动检查不再主动弹它 */
+          if (res.remote) await api.dismissUpdate(res.remote);
+        }
+      } catch (err) {
+        ElMessage.error(`检查失败：${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        this.checking = false;
+      }
+    },
+
     /** 交给系统浏览器打开（主进程只放行 http/https） */
     async openRepo(): Promise<void> {
       try {
@@ -154,6 +228,31 @@ export default defineComponent({
 }
 .ab-link:hover {
   color: rgb(var(--text-rgb));
+}
+.ab-meta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: calc(11px * var(--fs));
+  opacity: 0.65;
+}
+.ab-check {
+  margin-left: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  color: var(--accent);
+  cursor: pointer;
+  opacity: 1;
+}
+.ab-check:hover {
+  background: var(--panel-hover);
+}
+.ab-check.busy {
+  cursor: default;
+  opacity: 0.6;
 }
 .ab-thanks {
   margin-top: 16px;

@@ -26,7 +26,7 @@ import { useUiStore } from './ui';
 import { useVideoListStore } from './videoLists';
 import { useWindowStore } from './window';
 import { watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import type { AppSetting } from '@common/types/app_setting';
 import defaultSetting from '@common/defaultSetting';
 import electronApi from '../api/electron';
@@ -310,6 +310,25 @@ export const boot = {
       },
     );
     boot.initWallpaperState();
+
+    /**
+     * 主进程自动检查到新版本（构建指纹和发布页上的不一样）
+     *
+     * 只提示、不自动下载：国内连 GitHub 下载经常半截失败，自动更新反而更容易出事。
+     * 主进程只在**界面看得见**时广播这个事件，壁纸模式 / 关到托盘那边走系统通知，
+     * 所以这里不用再判断窗口可见性。
+     *
+     * 「以后再说」要把指纹记下来（`update.dismissedSha`），否则每次启动都弹同一个版本。
+     */
+    system.removeUpdateAvailable = electronApi.onUpdateAvailable((info) => {
+      void ElMessageBox.confirm(
+        '发布页上的构建和当前这份不一样，说明有新版本。\n去下载后需要手动安装。',
+        '发现新版本',
+        { confirmButtonText: '去下载', cancelButtonText: '以后再说', type: 'info' },
+      )
+        .then(() => electronApi.openExternal(info.url))
+        .catch(() => electronApi.dismissUpdate(info.remote));
+    });
     windowStore.removeMaximizedListener = electronApi.onMaximized((val) => {
       windowStore.isMaximized = val;
     });
@@ -490,6 +509,7 @@ export const boot = {
     if (system.removeTrayShowSleepTimer) system.removeTrayShowSleepTimer();
     if (system.removeTrayShowLogoutConfirm) system.removeTrayShowLogoutConfirm();
     if (system.removeTrayUnlock) system.removeTrayUnlock();
+    if (system.removeUpdateAvailable) system.removeUpdateAvailable();
     if (windowStore.removeWallpaperState) windowStore.removeWallpaperState();
     if (windowStore.removeWallpaperUnavailable) windowStore.removeWallpaperUnavailable();
     if (windowStore.removeMaximizedListener) windowStore.removeMaximizedListener();

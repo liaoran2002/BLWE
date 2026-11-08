@@ -17,6 +17,7 @@ import { registerCacheHandlers } from './ipc/cache'
 import { registerMusicHandlers } from './ipc/music'
 import { registerWallpaperHandlers } from './ipc/wallpaper'
 import { registerTrayHandlers } from './ipc/tray'
+import { registerUpdateHandlers } from './ipc/update'
 import type { TrayMenuAction, TrayMenuState, TrayState } from '@common/types/ipc'
 
 export interface IpcContext {
@@ -91,4 +92,7 @@ export const registerIpcHandlers = (context: IpcContext): void => {
 
   // 托盘状态
   registerTrayHandlers(context)
+
+  // 检查更新（只查 + 提示，不自动安装）
+  registerUpdateHandlers()
 }

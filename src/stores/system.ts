@@ -24,7 +24,7 @@ import { useVideoListStore } from './videoLists';
 /** ===== state ===== */
 export type SystemState = Pick<
   AppData,
-  'removeTrayPlayControl' | 'removeTrayPrev' | 'removeTrayNext' | 'removeTrayToggleMode' | 'removeTrayShowPlaylist' | 'removeTrayShowSleepTimer' | 'removeTrayShowLogoutConfirm' | 'removeTrayUnlock' | 'removeTraySeek' | 'removeTrayVolume' | 'removeTrayToggleMute' | 'removeTrayMenuListener' | '_lastPersistAt' | '_lastMediaPosAt' | '_lastTaskbarKey' | '_lastTraySyncAt' | '_syncTimer' | '_syncKey'
+  'removeTrayPlayControl' | 'removeTrayPrev' | 'removeTrayNext' | 'removeTrayToggleMode' | 'removeTrayShowPlaylist' | 'removeTrayShowSleepTimer' | 'removeTrayShowLogoutConfirm' | 'removeTrayUnlock' | 'removeTraySeek' | 'removeTrayVolume' | 'removeTrayToggleMute' | 'removeTrayMenuListener' | 'removeUpdateAvailable' | '_lastPersistAt' | '_lastMediaPosAt' | '_lastTaskbarKey' | '_lastTraySyncAt' | '_syncTimer' | '_syncKey'
 >;
 
 export const systemState = (): SystemState => ({
@@ -52,6 +52,9 @@ export const systemState = (): SystemState => ({
   removeTrayToggleMute: null,
 
   removeTrayMenuListener: null,
+
+  /** 主进程自动检查到新版本时的监听 */
+  removeUpdateAvailable: null,
 
   /** 上次写入播放进度的时间戳（节流用） */
   _lastPersistAt: 0,

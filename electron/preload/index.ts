@@ -43,6 +43,11 @@ import type {
   VideoMetaInput,
 } from '@common/types/playlist'
 import type { CacheStats } from '@common/types/cache_stats'
+import type {
+  UpdateAvailablePayload,
+  UpdateCheckResult,
+  UpdateInfo,
+} from '@common/types/update'
 
 /** 暴露给渲染进程的 api：每个方法都从 IpcChannelMap 推导出入参与返回值 */
 const api = {
@@ -304,6 +309,19 @@ const api = {
     rendererOn('wallpaper:state', cb),
   onWallpaperUnavailable: (cb: (reason: string) => void): RemoveListener =>
     rendererOn('wallpaper:unavailable', cb),
+  // #endregion
+
+  // #region 检查更新
+  /** 手动检查更新（「关于」里的按钮）：失败会把原因带回来 */
+  checkUpdate: (): Promise<UpdateCheckResult> => rendererInvoke('update:check'),
+  /** 本机信息：版本号 + 构建指纹 */
+  getUpdateInfo: (): Promise<UpdateInfo> => rendererInvoke('update:info'),
+  /** 「以后再说」：同一份构建指纹不再主动提示 */
+  dismissUpdate: (sha256: string): Promise<void> =>
+    rendererInvoke('update:dismiss', { sha256 }),
+  /** 主进程自动检查到新版本时通知界面（壁纸模式下走系统通知，不会到这里） */
+  onUpdateAvailable: (cb: (info: UpdateAvailablePayload) => void): RemoveListener =>
+    rendererOn('update:available', cb),
   // #endregion
 } as const satisfies RendererAPI
 
