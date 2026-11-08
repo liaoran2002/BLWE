@@ -154,7 +154,6 @@ export interface AppSetting {
   /** 记住播放进度：启动时回到上次的歌单 / 歌曲 / 播放位置 */
   'player.resumeOnStart': boolean
   /** 上次播放到的秒数（用于续播） */
-  'player.resumeTime': number
   /**
    * 当前在播的 **某站视频列表** id（`bv_fav_123456` 这种）
    *
@@ -165,7 +164,6 @@ export interface AppSetting {
    * 而「到底是哪个列表」就靠这个键。没有它，重启后会回到上次的音乐歌单，
    * 用户刚导入的收藏夹等于每次都要重新点一遍。
    */
-  'player.activeVideoListId': string
   /**
    * 默认列表的 id（拖入单条视频时往这里放）
    *

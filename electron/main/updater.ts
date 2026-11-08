@@ -16,9 +16,16 @@
  *
  * ## 发布侧要做什么
  *
- * 每次 `npm run dist` 之后跑 `npm run fingerprint`，把生成的
- * `release/fingerprint.json`（内容 `{ "sha256": "…" }`）作为**发布附件**上传，
- * 文件名必须是 `fingerprint.json` —— 这里靠这个名字在 assets 里找它。
+ * 每次 `npm run dist` 之后跑 `npm run fingerprint` 算出 `release/fingerprint.json`
+ * （`{ sha256, size, builtAt }`），工作流把它**压成一行写进发布说明正文**：
+ *
+ * ```
+ * 20e320887805c6f33c714eb1418d83f0196f13d8b837e3b463ad5d4efc1fb0d6/11843413/1794118330860
+ * ```
+ *
+ * 就是 `sha256/字节数/构建时间戳`。应用按 `/` 切开取第一段比对，后两段给人对账。
+ * 不上传附件 —— 正文和安装包属于同一次发布，够用了，还省掉一次下载请求。
+ * 本地打出来的包想手算也一样：`npm run fingerprint` 后看那个 json。
  */
 import { app, Notification, shell } from 'electron'
 import crypto from 'node:crypto'
@@ -36,8 +43,6 @@ import { getSetting, updateSetting } from './utils/setting'
 const REPO = 'liaoran2002/BLWE'
 const RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`
 const RELEASES_PAGE = `https://github.com/${REPO}/releases`
-/** 发布时附带的指纹文件名（改了这里就得同步改 `scripts/fingerprint.mjs`） */
-const ASSET_NAME = 'fingerprint.json'
 /** 单次请求超时：国内连 GitHub 经常是一直挂着不回，等 8 秒就够了 */
 const TIMEOUT_MS = 8000
 /** 自动检查的间隔：6 小时内不重复查 */
@@ -47,15 +52,11 @@ const START_DELAY_MS = 12_000
 /** 心跳间隔：睡一觉回来也能补上一次检查 */
 const HEARTBEAT_MS = 60 * 60 * 1000
 
-interface ReleaseAsset {
-  name?: string
-  browser_download_url?: string
-}
-
 interface ReleaseInfo {
   tag_name?: string
   html_url?: string
-  assets?: ReleaseAsset[]
+  /** 发布说明正文，指纹就写在里面 */
+  body?: string
 }
 
 /** app.asar 的绝对路径（打包后才有） */
@@ -71,7 +72,8 @@ const asarPath = (): string => path.join(process.resourcesPath, 'app.asar')
  * `ENOENT, not found in …app.asar`（实测过，不是猜的）。
  * 所以读之前把 `process.noAsar` 打开、读完立刻还原 —— 这是 Electron 官方给的口子。
  *
- * 直接 `readFileSync`：这个文件十几 MB，只在检查更新 / 打开「关于」时算一次。
+ * 直接 `readFileSync`：这个文件十几 MB，只在**检查更新**时算一次（「关于」里不显示指纹了，
+ * 不再为看个版本号白读一遍它）。
  */
 export const localFingerprint = (): string | null => {
   if (!app.isPackaged) return null
@@ -89,33 +91,61 @@ export const localFingerprint = (): string | null => {
   }
 }
 
+/** 发布说明里那一行：`<sha256>/<字节数>/<构建时间戳（毫秒）>` */
+interface RemoteBuild {
+  sha256: string
+  size: number
+  builtAt: number
+}
+
 /**
- * 取远端最新发布里的指纹
+ * 从发布说明正文里抠出构建信息
  *
- * 两步：① 问 GitHub 最新 release 有哪些附件；② 下载 `fingerprint.json` 读 `sha256`。
- * 分两步是刻意跟 release 绑定的 —— 指纹和安装包必须是**同一次发布**的，
- * 否则会出现「提示有新版本、下到的却还是旧的」。
+ * 工作流写的就是一行三段、斜杠分隔：
+ *
+ * ```
+ * 20e320887805c6f33c714eb1418d83f0196f13d8b837e3b463ad5d4efc1fb0d6/11843413/1794118330860
+ * ```
+ *
+ * 只认 sha256（比它就能判断新旧），`size` / `builtAt` 是给人对账用的 ——
+ * 比如怀疑「提示有新版但下下来还是旧的」时，拿这两个和本地 `app.asar` 比一眼就看出来。
+ *
+ * 兜底：老格式是 `sha256: <hash>` 单独一行，手写说明也可能只留一串哈希，
+ * 所以找不到斜杠格式时退一步按标签 / 首个 64 位十六进制认。
  */
-const fetchRemoteFingerprint = async (): Promise<{ sha256: string; url: string }> => {
-  const releaseRes = await fetch(RELEASE_API, {
+const parseRemoteBuild = (body: string): RemoteBuild | null => {
+  const spec = /([0-9a-f]{64})\/(\d+)\/(\d+)/i.exec(body)
+  if (spec) {
+    return { sha256: spec[1].toLowerCase(), size: Number(spec[2]), builtAt: Number(spec[3]) }
+  }
+  const labelled = /sha256[ \t]*[:：=]?[ \t]*([0-9a-f]{64})/i.exec(body)
+  const bare = labelled ?? /\b([0-9a-f]{64})\b/i.exec(body)
+  if (!bare) return null
+  return { sha256: bare[1].toLowerCase(), size: 0, builtAt: 0 }
+}
+
+/**
+ * 取远端最新发布里的构建信息
+ *
+ * **一次请求就够**：那一行写在发布说明正文（`body`）里，不再另传附件。
+ * 早先把 `{ sha256, size, builtAt }` 传成 `fingerprint.json` 附件，那是多此一举 ——
+ * 应用为了三个字段要额外发一次下载请求，用户还会在资源列表里看到个不知用途的 json。
+ *
+ * 跟 release 绑定这件事没变（正文也是这次发布的一部分），所以不会出现
+ * 「提示有新版本、下到的却还是旧的」。可信度上也一样：能改正文的人同样能换附件。
+ */
+const fetchRemoteBuild = async (): Promise<RemoteBuild & { url: string }> => {
+  const res = await fetch(RELEASE_API, {
     headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'BLWE' },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   })
-  if (!releaseRes.ok) throw new Error(`GitHub 返回 ${releaseRes.status}`)
-  const release = (await releaseRes.json()) as ReleaseInfo
+  if (!res.ok) throw new Error(`GitHub 返回 ${res.status}`)
+  const release = (await res.json()) as ReleaseInfo
 
-  const asset = (release.assets ?? []).find((item) => item.name === ASSET_NAME)
-  if (!asset?.browser_download_url) throw new Error(`这次发布没有 ${ASSET_NAME}`)
+  const build = parseRemoteBuild(release.body ?? '')
+  if (!build) throw new Error('发布说明里没有构建信息')
 
-  const fingerRes = await fetch(asset.browser_download_url, {
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  })
-  if (!fingerRes.ok) throw new Error(`下载指纹失败（${fingerRes.status}）`)
-  const payload = (await fingerRes.json()) as { sha256?: unknown }
-  const sha256 = typeof payload.sha256 === 'string' ? payload.sha256.trim().toLowerCase() : ''
-  if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error(`${ASSET_NAME} 里的 sha256 不合法`)
-
-  return { sha256, url: release.html_url || RELEASES_PAGE }
+  return { ...build, url: release.html_url || RELEASES_PAGE }
 }
 
 /**
@@ -138,7 +168,7 @@ export const checkForUpdate = async (): Promise<UpdateCheckResult> => {
   if (!local) return { ...empty, error: '读不到本地构建指纹' }
 
   try {
-    const remote = await fetchRemoteFingerprint()
+    const remote = await fetchRemoteBuild()
     /** 只记成功的检查时间：失败不写，下次启动还会再试 */
     updateSetting({ 'update.lastCheckAt': Date.now() })
     return {
@@ -158,12 +188,15 @@ export const checkForUpdate = async (): Promise<UpdateCheckResult> => {
   }
 }
 
-/** 本机信息（「关于」里显示） */
+/**
+ * 本机信息（「关于」里显示）
+ *
+ * 只回版本号：指纹不往界面上摆，算它还要把十几 MB 的 `app.asar` 整个读一遍，
+ * 每次打开「关于」白花这个钱不值。
+ */
 export const getUpdateInfo = (): UpdateInfo => {
-  const fingerprint = localFingerprint()
   return {
     version: app.getVersion(),
-    fingerprint: fingerprint ? fingerprint.slice(0, 12) : null,
     packaged: app.isPackaged,
   }
 }

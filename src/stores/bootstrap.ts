@@ -27,7 +27,6 @@ import { useVideoListStore } from './videoLists';
 import { useWindowStore } from './window';
 import { watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import type { AppSetting } from '@common/types/app_setting';
 import defaultSetting from '@common/defaultSetting';
 import electronApi from '../api/electron';
 import type { VideoElement } from '../types/app';
@@ -78,18 +77,16 @@ export const boot = {
      *
      * 同时恢复「上次在播的是哪个视频列表」：没有这一步，用户今天导入的收藏夹
      * 明天开机又会回到音乐歌单，等于每次都要重新点一遍。
-     * 列表已经被删掉时必须把设置里的 id 清掉 —— 否则 `fromVideoList`
-     * 永远为真，界面会按视频列表的文案渲染一个空来源。
+     *
+     * 来源是库里的 `playback_state`（不是设置项）。指向的列表已经被删掉时
+     * **不需要在这里清什么** —— 主进程删列表时会顺手把那条记录改掉
+     * （`remapPlaybackSource`），这里只管它还在不在。
      */
     try {
       await videoLists.load();
-      const savedVideoListId = setting.setting['player.activeVideoListId'] || '';
-      if (savedVideoListId) {
-        if (videoLists.find(savedVideoListId)) {
-          videoLists.setActive(savedVideoListId);
-        } else {
-          void setting.update({ 'player.activeVideoListId': '' });
-        }
+      const source = await electronApi.getPlaybackSource();
+      if (source.kind === 'ov' && source.id && videoLists.find(source.id)) {
+        videoLists.setActive(source.id);
       }
     } catch (err) {
       console.warn('[videolist] 加载视频列表失败', err);
@@ -100,8 +97,8 @@ export const boot = {
      *
      * 纯读库、**不参与播放**：`loadBrowseList` 优先停「正在播的那个列表」，
      * 没有就退回第一个。以前这里还会顺手把第一个列表设成「当前播放源」，
-     * 等于开机替用户决定了播什么 —— 现在播放源只由 `tryResume` 按
-     * `player.activeVideoListId` 恢复，两边不再互相污染。
+     * 等于开机替用户决定了播什么 —— 现在播放源只认库里的 `playback_state`，
+     * 两边不再互相污染。
      */
     await ui.loadBrowseList();
   
@@ -146,14 +143,16 @@ export const boot = {
    * 主进程侧有 300ms 防抖并在 before-quit 里 flush，能保证落盘。
    */
   onBeforeUnload(): void {
-    const playback = usePlaybackStore();
-    const setting = useSettingStore();
     const system = useSystemStore();
-    const patch: Partial<AppSetting> = {
-      'player.resumeTime': Math.floor(playback.currentTime || 0),
-    };
-    setting.update(patch);
-    system.recordPlayPosition();
+    /**
+     * 退出前最后落一次进度
+     *
+     * 两个都要：秒数进小文件（`last_position`），「第几条」进库。
+     * 都是 fire-and-forget 的 IPC —— 主进程收到就是一次写文件 / 两行 UPDATE，
+     * 不再是以前那样往 setting 里写全局秒数（那条路要防抖 + flush 才敢说落盘了）。
+     */
+    system.savePosition();
+    system.saveProgress();
     /**
      * 退出时**不需要**再写 `selectedBvid`
      *

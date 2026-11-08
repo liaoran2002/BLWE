@@ -256,10 +256,11 @@ export const queueActions: ThisType<QueueContext> = {
       /** 回到上次播放的位置（下标由主进程在同步时重算，这里夹进范围） */
       this.currentIndex = Math.min(Math.max(0, source.lastIndex), this.songs.length - 1);
       // 兼顾「播放进度」：走这条兜底路径时（没有已缓存的视频可精确还原）
-      // 也要把上次的秒数带上，否则换歌单/首启场景会丢掉进度
-      const cfg = this.settingStore.setting;
-      const resumeTime =
-        cfg['player.resumeOnStart'] ? Number(cfg['player.resumeTime']) || 0 : 0;
+      // 也要把上次的秒数带上，否则换歌单/首启场景会丢掉进度。
+      // 秒数来自 userData/last_position 那个小文件（全局的当前播放位置）。
+      const resumeTime = this.settingStore.setting['player.resumeOnStart']
+        ? source.lastPosition || 0
+        : 0;
       void this.playbackStore.playCurrent(resumeTime > 3 ? resumeTime : 0);
       return;
     }
@@ -332,9 +333,6 @@ export const queueActions: ThisType<QueueContext> = {
     this.playbackStore.currentTime = 0;
     this.playbackStore.seekAfterLoad = 0;
     this.playbackStore.seekAfterLoadFor = '';
-    await this.settingStore.update({
-      'player.resumeTime': 0,
-    });
   
     if (this.songs.length === 0) {
       ElMessage.warning(`《${record.name}》还没有曲目，可以先「同步」一下`);
@@ -358,8 +356,16 @@ export const queueActions: ThisType<QueueContext> = {
      * 而工作区现在是 `activeId` 的投影 —— 所以这里推一次，别等别的动作顺手推。
      */
     this.systemStore.syncTrayState();
+    /**
+     * 落库的是 `playback_state`（库里的单行表），不是设置项
+     *
+     * 只在切到某个视频列表时写；切回歌单（id 为空）**不写** —— 接下来的
+     * `playCurrent` 会用 `saveProgress` 写成 `mv:<歌单id>`。这里先清空的话，
+     * 万一中间没播成功（空歌单），下次启动就什么也恢复不了。
+     */
+    if (!id) return;
     try {
-      await this.settingStore.update({ 'player.activeVideoListId': id });
+      await electronApi.setPlaybackSource('ov', id);
     } catch (err) {
       console.warn('[videolist] 记录当前视频列表失败', err);
     }
@@ -422,8 +428,12 @@ export const queueActions: ThisType<QueueContext> = {
     this.playbackStore.seekAfterLoadFor = '';
     this.playbackStore.resetRandomList();
     this.playbackStore.clearAllWarm();
-    // 换列表等于换一首「新歌」，上一份进度（秒数）不能带过来
-    await this.settingStore.update({ 'player.resumeTime': 0 });
+    /**
+     * 不用再手动清零「上次播到第几秒」了
+     *
+     * 秒数现在在 `userData/last_position` 那个小文件里，每秒被播放进度覆盖，
+     * 所以切列表不用再手动清 —— 下一个 `timeupdate` 就会写成新的位置。
+     */
     ElMessage.success(`正在播放《${record.name}》第 ${this.currentIndex + 1} 个视频`);
     await this.playbackStore.playCurrent();
   },

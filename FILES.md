@@ -154,8 +154,8 @@
 | `tray.ts` | 托盘状态上报 + 自绘菜单四条 + 任务栏进度 |
 | `biliApiHandlers.ts` | ★ **搜索 / 解析视频 / 收藏**，见下面单独一节 |
 | `playlist.ts` | 歌单三条：`get` / `save` / `sync` |
-| `videolists.ts` | ★ **某站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ **loadMore**/ getItems/ setIndex/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
-| `update.ts` | 检查更新三条：`update:check`（手动查，失败带原因）/ `update:info`（版本 + 指纹）/ `update:dismiss`（同一指纹不再弹），见 `updater.ts` |
+| `videolists.ts` | ★ **某站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ **loadMore**/ getItems/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
+| `update.ts` | 检查更新三条：`update:check`（手动查，失败带原因）/ `update:info`（只回版本号，指纹不上界面）/ `update:dismiss`（同一指纹不再弹），见 `updater.ts` |
 | `music.ts` | `music:getPlaylistDetail` + `music:importPlaylist` —— ★ 前者是**唯一的加工点**：归一化曲目字段 + 拼好歌单主键，见下 |
 | `cache.ts` | 缓存三条：`clearAll` / `getStats` / `prune` |
 
@@ -284,13 +284,14 @@ return { info, songs, total, page, limit, source, id }
 
 | 表 / 视图 | 内容 |
 | :--- | :--- |
-| `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at / last_index） |
+| `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at / **last_index**） |
 | `songs` | **歌曲实体，全局唯一**（id / name / singer / album / cover / duration）；**duration 存秒** |
 | `playlist_songs` | 歌单 ⨯ 歌曲的**成员关系 + 顺序**，PK `(playlist_id, ord)`，只有 `song_id` |
 | `song_videos` | **候选关系**：哪首歌的候选里有它 / 排第几 / 收藏没有；PK `(search_key, bvid)`；另有 `title_hl` 存带 `<em>` 的标题 |
 | `videos` | **视频实体 + 播放地址**，PK `bvid`，全局一份（同一个 bvid 被两首歌引用也只存一份 dash） |
 | `song_meta` | 每首歌的 `selected_bvid` + `search_login_state`，PK `search_key` |
-| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）/ last_index |
+| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）/ **last_index** |
+| `playback_state` | **单行表**（`id` 恒为 1）：`source_kind`（`ov` / `mv`）+ `source_id`，回答「上次在播哪条线的哪个列表」。**不回答「播到哪」** —— 那是上面两张表的 `last_index`（第几条）+ `userData/last_position` 文件（第几秒） |
 | `videolist_items` | 列表成员 + 顺序，PK `(list_id, ord)` |
 | `song_videos_view` | **视图**：把 `song_videos` ⨯ `videos` 还原成**旧 `videos` 的 15 列形状**（旧读路径一行不用改） |
 | `videos_meta` | **视图**：`song_videos_view` 去掉全部地址列的只读投影（列表类读取走它，省 27 KB/行） |
@@ -373,12 +374,19 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 - **不做迁移**：本项目只有一个用户、数据层从未发布过。指纹不匹配就
   **把库里所有表 / 视图都 DROP 掉再重建**（数据清空，**从不写迁移代码**）。
 
-  > 唯一的例外是**「只加列」**（`patchAdditiveColumns`）：加列不搬数据、风险最低，
-  > 但代价是清空用户手里的列表和播放位置 —— 为两列不值。所以指纹对不上时先试着把
-  > `ADDITIVE_COLUMNS` 里缺的列 `ALTER TABLE` 上去，补成功就把指纹推到新值、**保留数据**。
-  > 补完还会按「本地条数 ≥ 远端总数」把已经加载完的列表标成 `has_more = 0`，
+  > 例外是**「只加列 / 只加表」**（`patchAdditiveColumns` + `patchAdditiveTables`）：
+  > 加列加表都不搬数据、风险最低，而代价是清空用户手里的列表和播放位置 —— 不值。
+  > 所以指纹对不上时先把 `ADDITIVE_COLUMNS` 里缺的列 `ALTER TABLE` 上去、
+  > 把 `ADDITIVE_TABLES` 里缺的表 `CREATE TABLE` 出来，补成功就把指纹推到新值、**保留数据**。
+  >
+  > ⚠️ **两个补丁必须都跑，不能短路**：一次升级可能同时是「一张新表 + 两列」
+  > （`playback_state` + 一个 `last_position`），只补到一样就推指纹，另一处结构会永远缺。
+  > 和它对称的还有 `patchDroppedColumns`：**删列**（SQLite 3.35+ 的 `DROP COLUMN`）也能就地做，
+  > 不为一个自己加的列去清空 800 条条目。
+  >
+  > 补列完还会按「本地条数 ≥ 远端总数」把已经加载完的列表标成 `has_more = 0`，
   > 顺手把差额记进 `skipped_total`，否则升级后那些列表会白挂一行「继续加载」。
-  > 其余结构变化（改类型 / 删列）仍然丢弃重建，那张名单也必须跟着清空。
+  > 其余结构变化（改类型 / 删列）仍然丢弃重建，那两张名单也必须跟着清空。
 
   > ⚠️ **DROP 清单是动态取的，不是手写的**：早先手写一份
   > 「`DROP VIEW videos_meta; DROP TABLE videos; DROP TABLE song_meta; …`」，
@@ -617,6 +625,32 @@ FROM videolist_items)`）。
 重复导入必然命中同一行（走的是同步那套合并规则），
 这个布尔只用于提示语「已导入」还是「已同步」。
 
+### `utils/playback.ts` —— 播放状态（谁在播 + 播到哪）
+
+**它不是设置。**「上次播的是哪条线、哪个列表、第几条」在库里，
+「播到第几秒」在 `userData/last_position` 一个几字节的文件里，
+`setting.json` 里一个字都不留（`player.resumeTime` / `player.activeVideoListId` 已删）。
+
+| 导出 | 作用 | 什么时候写 |
+| :--- | :--- | :--- |
+| `getPlaybackSource()` | `playback_state` + 秒数文件 → `{ kind, id, seconds }` | 启动时读一次 |
+| `setPlaybackSource(kind, id)` | 只回答「谁」 | 切源 |
+| `saveProgress({ kind, id, index })` | 事务写两处：`playback_state` + 对应表 `last_index` | **切歌**（一首歌全程只写一次） |
+| `saveLastPosition(seconds)` | 写 `userData/last_position`（**无后缀**，内容就是一行数字） | **每秒** |
+| `remapPlaybackSource(kind, oldId, newId)` | 转本地（换 id）/ 删列表（清空）时跟过去 | 极少 |
+
+**为什么秒数不进库**：它是一条**全局的当前播放位置** —— 换列表、换来源，下一次播放
+就把它覆盖了，按列表各存一份只是把同一个值切成 N 份互相打架的副本（这事我做过，
+`last_position` 列加了一天就撤，删列记录还留在 `db.ts` 的 `DROP_COLUMNS` 里）。
+而且进库意味着每秒一次事务 + WAL 增长，为「丢了最多少续 1 秒」的值不值。
+
+**为什么「谁」必须进库**：它要跟列表的存在性绑定 —— 删列表、转本地换 id 时得跟着改
+（`remapPlaybackSource`），散文件做不到这一点。
+
+**为什么不靠 id 前缀猜类型**：视频列表 id 是 `bv_xxx`，歌单 id 可能是 `pl_xxx`（本地手动建）
+或 `tx_8153225605`（平台导入）。猜前缀等于把「有哪些来源」写死在字符串判断里，
+以后加一个来源就得回来改判据 —— 所以 `source_kind` 显式存一列。
+
 ### `utils/dropInput.ts` —— 拖入识别（新）
 
 **职责**：一段文本 → `DropInputTarget`（`music` / `song` / `list` / `video` / `none`）。
@@ -833,8 +867,8 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 | 导出 | 作用 |
 | :--- | :--- |
 | `localFingerprint()` | `resources/app.asar` 的 sha256；开发模式返回 `null` |
-| `checkForUpdate()` | 拉 `releases/latest` → 找 `fingerprint.json` 附件 → 比对；**失败不弹任何东西** |
-| `getUpdateInfo()` | 「关于」里显示的版本号 + 指纹前 12 位 |
+| `checkForUpdate()` | 拉 `releases/latest` → 从**发布说明正文**里正则取 `sha256` → 比对；**失败不弹任何东西** |
+| `getUpdateInfo()` | 「关于」里显示的版本号（**不含指纹** —— 指纹只做内部比对，算它要读一遍十几 MB 的 `app.asar`） |
 | `dismissUpdate(sha)` | 记下「以后再说」的指纹，同一份不再主动弹 |
 | `startUpdateWatcher(deps)` | 启动后 12 秒查一次，之后每小时心跳、**6 小时内不重复查** |
 
@@ -854,11 +888,23 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 | :--- | :--- |
 | 界面看得见 | 广播 `update:available` → 渲染层弹「去下载 / 以后再说」 |
 | 壁纸模式 / 关到托盘 | 系统通知（Windows 通知中心），点一下打开发布页 |
-| 自动检查失败（超时 / DNS / 404 / 没有附件） | **完全静默**，只留一行 `console.log` |
+| 自动检查失败（超时 / DNS / 404 / 正文里没有那行构建信息） | **完全静默**，只留一行 `console.log` |
 | 手动检查失败（「关于」里点的） | `ElMessage.error` 把原因说出来，否则用户以为按钮坏了 |
 
-> `fingerprint.json` 由 `scripts/fingerprint.mjs` 生成（`npm run fingerprint`，已挂到 `dist` 末尾），
-> 发布时必须作为**附件**上传、文件名不能改 —— 主进程靠这个名字在 assets 里找它。
+> 构建信息**写在发布说明正文第一行**，不传附件 —— 三个字段压成一行、斜杠分隔：
+> ```
+> 20e320887805c6f33c714eb1418d83f0196f13d8b837e3b463ad5d4efc1fb0d6/11843413/1794118330860
+> ```
+> 即 `sha256 / 字节数 / 构建时间戳（毫秒）`。应用发一次请求（`releases/latest`）
+> 就同时拿到发布页链接和这行字，`parseRemoteBuild()` 切开取第一段比对，
+> 后两段留着给人对账。早先那个 `fingerprint.json` 附件是多余的 —— 为三个字段
+> 多下载一次，用户还得在资源列表里看着一个不知用途的 json。
+>
+> 兜底：切不出三段时退回认 `sha256: <64hex>` 标签、再退一步认正文里第一个
+> 64 位十六进制（手写说明只留一串哈希也能对上）。
+
+---
+
 ### `protection.ts` + `bundleKey.ts` —— 资源解密
 
 **职责**：注册 `blwe://` 协议，页面请求哪个文件就解密哪个，**只解密到内存、不落盘**。
@@ -967,10 +1013,13 @@ channel → `{params, result}` 的契约集中在这里，
   （直链约 2 小时、元数据永不过期），用一个值同时管两者，
   结果就是「地址还没过期、元数据先被删了」。
 
-- **`player.activeVideoListId`**（本轮新增）：当前在播的某站视频列表 id，
-  空串 = 在播音乐歌单。存在的理由：播放层只有一个 `songs` 数组，
-  「这次打开该从哪个来源续播」必须有落盘的地方；没有它，用户今天导入的收藏夹
-  明天开机又回到音乐歌单。
+- **`player.activeVideoListId` / `player.resumeTime`：都已删除。**
+  它们是**运行时状态**（当前在播谁、播到第几秒），却被塞进了「用户偏好」的文件里。
+  后果是不对称：视频列表 id 落了盘，而「当前歌单」只存主进程内存，于是视频能续播、
+  歌单永远回到第一个；秒数还因为全局只有一个值，换来源就串。
+  现在拆成：`playback_state` + 各表 `last_index`（谁、第几条，在库里），
+  `userData/last_position`（第几秒，一个小文件 —— 它每秒都变，不值得写库）。
+  `player.resumeOnStart` 留着 —— 它才是偏好（要不要接着上次的位置）。
 
 - **`player.defaultVideoListId`**（本轮新增）：默认列表的 id（拖入单条视频的落点）。
   存在这里而不是靠「名字叫默认列表」：改名之后它还是默认列表，而且**禁止删除**
@@ -1209,7 +1258,7 @@ queue 只回答「列表里有什么」。依赖方向因此是 `playback → qu
 | `SongVideoListDialog.vue` | 列表面板，两种形态按 `listType` 切换：`songList` 歌单（MV）/ `videoList` 视频列表（MV = 这首歌的备选，OV = 当前合集）；点一行 / 刷新 / 爱心 / 加号都直接调 store |
 | `DropOverlay.vue` | 拖入遮罩（整窗虚线框 + 「松手即可导入并播放」），`dropActive` / `dropBusy` 来自 store |
 | `AddVideoDialog.vue` | 「添加视频」弹窗（粘贴链接 → 解析 → 收藏） |
-| `AboutDialog.vue` | 关于弹窗 |
+| `AboutDialog.vue` | 关于弹窗：标题 / 描述 / 仓库链接 / **版本号 + 「检查更新」**（不显示指纹）/ 致谢 |
 | `PlaylistPanel.vue` | 左上角歌单入口 |
 
 **`SleepTimerPanel.vue` 的关键设计**：
@@ -1330,9 +1379,10 @@ presetId = detail.id                                // 已经是 tx_8153225605
 两者的表、id、同步方式都不同，混在一起会让「当前是哪种来源」变成一堆
 `if (kind === 'video')`。播放层只认 `songs`，来源差异在 `loadPlaybackSource()` 里抹平。
 
-**`activeId` 自己不持久化**：落盘的是设置项 `player.activeVideoListId`，
-由 `player/actions/library.ts` 的 `setActiveVideoList()` 读写 ——
-store 保持「只做数据」，不碰设置。
+**`activeId` 自己不持久化**：落盘的是库里的 `playback_state`（`kind` + `id`），
+由 `queue` store 的 `setActiveVideoList()` 写、`bootstrap` 启动时读回来再 `setActive` ——
+store 保持「只做数据」，不碰持久化。两条来源共用这一张表，所以不会出现
+「视频落盘、歌单只存内存」那种一半能续播的状态。
 
 **`add(kind, sourceId, mid)` 返回 `existed`**：主键重复即「这次走的其实是同步」，
 调用方据此说「已导入」还是「已同步」。
@@ -1455,7 +1505,7 @@ IPC 出口（只做一层透传，把 `window.electronAPI` 收成有类型的模
 | `electron.vite.config.ts` | 三个构建目标（main / preload / renderer）；renderer 两个入口（`index.html` + `tray-menu.html`） |
 | `scripts/protect.mjs` | 打包保护流水线：字节码 + 混淆 + 资源加密 |
 | `scripts/fingerprint.mjs` | 算 `app.asar` 的 sha256 → `release/fingerprint.json`（检查更新的比对基准） |
-| `.github/workflows/release.yml` | push 到 `main` 自动打包并**覆盖** `latest` 发布（含 `fingerprint.json`） |
+| `.github/workflows/release.yml` | push 到 `main` 自动打包并**覆盖** `latest` 发布（sha256 写进发布说明） |
 | `tsconfig.*.json` | 三份配置（base / node / web）+ 路径别名 |
 | `package.json` | 脚本与 electron-builder 配置（`dependencies` 里 **`opencc-js`** 是运行期依赖） |
 
@@ -2189,8 +2239,9 @@ fetch + getReader + append
 
 ```
 tryResume()
-  读 setting: player.resumeOnStart / player.resumeTime
-  读歌单的 lastIndex
+  读 playback_state: kind（ov / mv）+ id   ← 哪条线、哪个列表
+  读那个列表的 last_index    + userData/last_position（秒数）
+  seekTo = resumeOnStart ? 文件的秒数 : 0   ← 开关只管「从第几秒」，不管「播哪首」
   ↓
 restoreSongVideo(songName, resumeTime)
   ① getSelectedBvid(songName)     ← 主进程 song_meta
@@ -2590,7 +2641,10 @@ push 到 main（改 md / screenshot 不触发）
    ↓ windows-latest
 npm ci → npm run typecheck → npm run dist（构建 + protect + 打包 + 指纹）
    ↓
-gh release delete latest --cleanup-tag  →  gh release create latest <两个 exe> fingerprint.json
+gh release delete latest --cleanup-tag
+   ↓ 两个 exe 作附件；fingerprint.json 压成一行写进发布说明正文
+   ↓ 格式：<sha256>/<字节数>/<构建时间戳>
+gh release create latest <两个 exe>
 ```
 
 **为什么覆盖同一个 `latest` 发布**：版本号常年是 `1.0.0`，tag 没法按版本区分；
@@ -2633,7 +2687,7 @@ gh release delete latest --cleanup-tag  →  gh release create latest <两个 ex
 ```
 列表里点第 N 条
   → library.onVideoListPlay(id, N)
-       setActiveVideoList(id)                 // store + 设置 player.activeVideoListId
+       setActiveVideoList(id)                 // store + 库里 playback_state（kind='ov'）
        videoListsStore.items(id)              // VideoListItem[]（本来就带 bvid）
        this.songs = 它们；this.currentIndex = N
   → playCurrent() → playAt(N) → engine.playItem()
@@ -2683,20 +2737,28 @@ openManager = 打开该页管理器          // 不碰工作区，不换播放�
 ```
 启动 init()
   → videoListsStore.load()
-  → 读 player.activeVideoListId
-       有且列表还在 → setActive(id)
-       有但列表已被删 → 把设置清回 ''（否则 fromVideoList 永远为真）
+  → 读 playback_state（库里的单行表）
+       kind='ov' 且列表还在 → setActive(id)（界面靠它知道在播哪个列表）
+       kind='mv'             → 主进程 initPlaylists 已经用它定了 `currentId`
+       指向的列表已被删       → 主进程删列表时就改掉了（remapPlaybackSource），这里不用管
   → tryResume()
-       loadPlaybackSource()  // 视频列表 → videolists.last_index；音乐歌单 → playlists.last_index
+       loadPlaybackSource()  // 按 kind 取：videolists 或 playlists 的 last_index + 秒数文件
        songs = 该来源的条目；index = lastIndex
-       restoreSongVideo(index, resumeTime)   // 只有歌走这里（视频没有「上次播哪个」这个概念）
-  → 续播失败 / 视频来源 → loadPlaylist()
-       playCurrent(resumeTime) → playAt(currentIndex)
+       seekTo = resumeOnStart ? lastPosition : 0   // 关掉开关 = 还是这首，但从 00:00 起
+       restoreSongVideo(index, seekTo)              // 只有歌走这里（视频没有「上次播哪个」这个概念）
+  → 续播失败 / 没有记录 → loadPlaylist()
+       playCurrent(resumeTime) → playAt(currentIndex)   // resumeTime 也来自 last_position 文件
        ↑ 视频条目到这一步就够了：bvid 在条目里，直接解析地址即可
 ```
 
-`recordPlayPosition()` 是唯一的写入口：按来源分别写 `videolists.last_index` /
-`playlists.last_index`。写错表不会报错，只会「重启后回到第一条」。
+`system.saveProgress()` 是**唯一的写入口**（视频列表和歌单共用一条 IPC
+`playback:progress`）：一次事务写两处 —— `playback_state` 记「谁」，
+对应表记 `last_index`（**只在 `源 + 下标` 变了时才写**，一首歌全程一次）。
+秒数是另一条路：`savePosition()` → `playback:position` → 那个文本文件，每秒一次。
+
+写错表不会报错，只会「重启后回到第一条」，所以这件事收在一处，
+不能让两条来源各写各的。以前歌单走 `playlists:save` 全量覆盖
+（`DELETE FROM playlists` + 重建 221 行关系表），每 5 秒一次 —— 现在连这个也没了。
 
 ### 重新同步（左上角刷新 / 列表弹窗里的同步）
 

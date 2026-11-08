@@ -258,8 +258,15 @@ export interface AppData {
   bufferSeconds: number
   /** 缓冲百分比的定时刷新句柄 */
   _bufferTimer: ReturnType<typeof setInterval> | null
-  /** 上次写入播放进度的时间戳（节流用） */
+  /** 上次上报「播到第几秒」的时间戳（节流用，1 秒一次） */
   _lastPersistAt: number
+  /**
+   * 上次写库的「源 + 下标」组合（`ov:bvid:10`）
+   *
+   * 秒数走小文件、每秒都在写；库里只记「切到哪一条」，所以拿它挡住重复写 ——
+   * 一首歌从头播到尾，库那边只会被写一次。
+   */
+  _lastProgressKey: string
   /** 上次同步 SMTC 进度的时间戳（节流用） */
   _lastMediaPosAt: number
   /** 上次发给任务栏的进度指纹（百分比 + 暂停态） */

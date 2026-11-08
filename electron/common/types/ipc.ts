@@ -480,7 +480,20 @@ export interface IpcChannelMap {
     result: import('./playlist').VideoListItem[]
   }
   /** 记录播到第几条 */
-  'videolists:setIndex': { params: { id: string; index: number }; result: void }
+  // #endregion
+
+  // #region 播放状态（**不是设置**：它在库里，不在 setting.json）
+  /** 读「上次在播哪条线的哪个列表」（位置去各自表的 last_index 取） */
+  'playback:get': { params: void; result: import('./playback').PlaybackSource }
+  /** 切源（只在切换播放源时用，播放过程中由 `playback:progress` 顺带写） */
+  'playback:setSource': {
+    params: { kind: import('./playback').PlaybackSourceKind | ''; id: string }
+    result: void
+  }
+  /** 上报「切到哪一条」：写自己那条的 last_index + 更新「当前在播谁」（只在切歌时调） */
+  'playback:progress': { params: import('./playback').PlaybackProgress; result: void }
+  /** 上报「播到第几秒」：只写 userData/last_position 小文件（每秒一次） */
+  'playback:position': { params: { seconds: number }; result: void }
   // #endregion
 
   // #region 本地视频文件（丢了之后怎么救）

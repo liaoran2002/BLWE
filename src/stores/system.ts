@@ -9,7 +9,6 @@ import type { SyncResult } from '@common/types/playlist';
 import type { AppData } from '../types/app';
 import { ElMessage } from 'element-plus';
 import electronApi from '../api/electron';
-import type { AppSetting } from '@common/types/app_setting';
 import { PLAY_LOOP_MODES } from '@common/constants';
 import { titleOf, subtitleOf, isSongItem } from '../types/playItem';
 
@@ -24,7 +23,7 @@ import { useVideoListStore } from './videoLists';
 /** ===== state ===== */
 export type SystemState = Pick<
   AppData,
-  'removeTrayPlayControl' | 'removeTrayPrev' | 'removeTrayNext' | 'removeTrayToggleMode' | 'removeTrayShowPlaylist' | 'removeTrayShowSleepTimer' | 'removeTrayShowLogoutConfirm' | 'removeTrayUnlock' | 'removeTraySeek' | 'removeTrayVolume' | 'removeTrayToggleMute' | 'removeTrayMenuListener' | 'removeUpdateAvailable' | '_lastPersistAt' | '_lastMediaPosAt' | '_lastTaskbarKey' | '_lastTraySyncAt' | '_syncTimer' | '_syncKey'
+  'removeTrayPlayControl' | 'removeTrayPrev' | 'removeTrayNext' | 'removeTrayToggleMode' | 'removeTrayShowPlaylist' | 'removeTrayShowSleepTimer' | 'removeTrayShowLogoutConfirm' | 'removeTrayUnlock' | 'removeTraySeek' | 'removeTrayVolume' | 'removeTrayToggleMute' | 'removeTrayMenuListener' | 'removeUpdateAvailable' | '_lastPersistAt' | '_lastProgressKey' | '_lastMediaPosAt' | '_lastTaskbarKey' | '_lastTraySyncAt' | '_syncTimer' | '_syncKey'
 >;
 
 export const systemState = (): SystemState => ({
@@ -58,6 +57,9 @@ export const systemState = (): SystemState => ({
 
   /** 上次写入播放进度的时间戳（节流用） */
   _lastPersistAt: 0,
+
+  /** 上次写库的「源 + 下标」组合；没变就不写（秒数走另一个小文件） */
+  _lastProgressKey: '',
 
   /** 上次同步 SMTC 进度的时间戳（节流用） */
   _lastMediaPosAt: 0,
@@ -110,8 +112,8 @@ export interface SystemActions {
   updateMediaSession(): void;
   updateMediaPosition(): void;
   setupMediaSessionActions(): void;
-  persistPlaybackState(): Promise<void>;
-  recordPlayPosition(): void;
+  saveProgress(): void;
+  savePosition(): void;
   persistPlaybackStateThrottled(): void;
   updateMediaPositionThrottled(): void;
   updateTaskbarProgress(): void;
@@ -335,48 +337,65 @@ export const systemActions: ThisType<SystemContext> = {
   },
 
   /**
-   * 记录当前播放信息（歌单 / 歌曲下标 / 视频 / 进度）
+   * 记一次播放进度（视频列表 / 歌单**共用的唯一写入口**）
    *
-   * 触发点：切歌、切视频、视频加载完成、时间更新（节流）。
+   * 两样东西一起写进库：
+   *  - `playback_state`：现在在播哪条线的哪个列表；
+   *  - 那个列表自己的 `last_index`：播到第几条（秒数不在这里，见 `savePosition`）。
+   *
+   * **不写 setting**。「上次播到哪」是运行时状态，不是用户偏好 —— 以前秒数存
+   * `player.resumeTime`（全局一个值，换来源就串）、视频列表 id 存
+   * `player.activeVideoListId`（会落盘），而当前歌单只存在主进程内存里，
+   * 于是视频能续播、歌单永远回到第一个歌单。现在统一成这一条。
    */
-  async persistPlaybackState(): Promise<void> {
-    const hasVideoList = !!this.videoListsStore.activeId;
-    if (!hasVideoList && !this.playlistsStore.current) return;
-    const patch: Partial<AppSetting> = {
-      'player.resumeTime': Math.floor(this.playbackStore.currentTime || 0),
-    };
-    void this.settingStore.update(patch);
-    // 当前播放源播到第几首（切歌单 / 切列表时用于回到各自的位置）
-    this.recordPlayPosition();
+  saveProgress(): void {
+    const kind = this.queueStore.mode;
+    const id =
+      kind === 'ov' ? this.videoListsStore.activeId : (this.playlistsStore.currentId ?? '');
+    /**
+     * 没有可写目标就跳过
+     *
+     * 典型场景：视频列表被删了、视频还在放（`activeId` 已清空）。这时候强行写一条
+     * 空记录，下次启动反而什么都恢复不了；保留上一次的有效记录更接近用户预期。
+     */
+    if (!id) return;
+    /**
+     * **只在「切到哪一条」变了时才写库**
+     *
+     * 秒数不进库（那是每秒都在变的当前播放位置，走 `savePosition` 的小文件），
+     * 所以这里只剩「源 + 下标」——它在一首歌的时间里是不变的，
+     * 换句话说：一次播放全程只写一次。
+     */
+    const index = this.queueStore.currentIndex;
+    const key = `${kind}:${id}:${index}`;
+    if (key === this._lastProgressKey) return;
+    this._lastProgressKey = key;
+    void electronApi.savePlaybackProgress({ kind, id, index });
   },
 
   /**
-   * 记录「当前播放源播到第几条」
+   * 记「播到第几秒」（每秒一次）
    *
-   * 两个来源各记各的表：音乐歌单 → `playlists.last_index`，
-   * 视频列表 → `videolists.last_index`（那张表在同步时按 bvid 重定位）。
-   * 写错表不会报错，只会表现成「重启后位置回到第一条」，所以集中在这里一处。
+   * 写的是 `userData/last_position` 那个几字节的文件，**不碰数据库** ——
+   * 它是一条全局的当前播放位置，换列表就该被覆盖，没必要按列表各存一份。
    */
-  recordPlayPosition(): void {
-    const videoListId = this.videoListsStore.activeId;
-    if (videoListId) {
-      void this.videoListsStore.setIndex(videoListId, this.queueStore.currentIndex);
-      return;
-    }
-    /**
-     * 视频列表被删了但视频还在播：**不能**写 `playlists.last_index` ——
-     * 那是音乐歌单的下标，写进去只会让下次从歌单续播时跳到一个莫名其妙的第 N 首。
-     */
-    if (this.queueStore.songs[this.queueStore.currentIndex]?.bvid) return;
-    void this.playlistsStore.setLastIndex(this.queueStore.currentIndex);
+  savePosition(): void {
+    void electronApi.savePlaybackPosition(Math.floor(this.playbackStore.currentTime || 0));
   },
 
-  /** 节流记录进度，避免 timeupdate 每秒写多次 */
+  /**
+   * timeupdate 里的周期上报（1 秒一次）
+   *
+   * 两件事频率完全不同，所以拆开：
+   *  - `savePosition()`：写小文件，每秒一次，最坏丢 1 秒进度；
+   *  - `saveProgress()`：写库，内部自己判断「源 + 下标」有没有变，没变就什么都不做。
+   */
   persistPlaybackStateThrottled: function (): void {
     const now = Date.now();
-    if (now - this._lastPersistAt < 5000) return;
+    if (now - this._lastPersistAt < 1000) return;
     this._lastPersistAt = now;
-    void this.persistPlaybackState();
+    this.savePosition();
+    this.saveProgress();
   },
 
   /** 节流同步系统媒体控件的进度（每秒调用太频繁） */
@@ -434,7 +453,7 @@ export const systemActions: ThisType<SystemContext> = {
        * 工作区（在播视频列表 / 在播歌单）一起带上
        *
        * 托盘菜单那一项按它显示「歌单管理」还是「视频管理」。主进程算不出来 ——
-       * 它只看得到 `player.activeVideoListId`，而「当前这条本身是不是视频」
+       * `playback_state` 只记「上次播的是谁」，而「当前这条本身是不是视频」
        * （列表被删后视频还在放的那种情况）只有渲染层知道。
        */
       mode: this.queueStore.mode,

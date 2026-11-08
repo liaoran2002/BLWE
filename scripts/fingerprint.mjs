@@ -13,8 +13,9 @@
  *   npm run fingerprint            # 自动找 release/win-unpacked
  *   node scripts/fingerprint.mjs <app.asar 路径>
  *
- * ⚠️ 发布时要把 `release/fingerprint.json` 作为**发布附件**上传，文件名不能改
- * （应用靠 `fingerprint.json` 这个名字在 release assets 里找它）。
+ * 这个文件**只是中间产物**：工作流读它、把 `sha256` 写进发布说明正文，然后随
+ * `release/` 一起被忽略掉。发布说明里那行才是真正的「对外指纹」——
+ * 应用只发一次请求就能拿到，不用再下载附件。
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'

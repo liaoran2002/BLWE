@@ -126,9 +126,7 @@ const defaultSetting = {
    */
   'player.resumeOnStart': true,
   /** 上次播放到的秒数 */
-  'player.resumeTime': 0,
   /** 当前在播的某站视频列表 id；空 = 在播音乐歌单 */
-  'player.activeVideoListId': '',
   /**
    * 默认列表的 id（拖入单条视频的落点）
    *

@@ -128,6 +128,22 @@ const loadSqlite = (): SqliteConstructor => {
  * 关于「过期」：只有播放地址相关的列会过期（约 2 小时），
  * 标题 / 封面 / 收藏 / 顺序**永不过期**，所以清理只把这些列置 NULL、绝不删行。
  */
+/**
+ * 播放状态的单行表（`id` 恒为 1）
+ *
+ * 回答的是「上次在播哪条线的哪个列表」，**它不是设置** —— 所以放库里，不放 setting.json。
+ * 两条来源各自播到第几条第几秒记在自己的表上（`playlists` / `videolists` 的
+ * `last_index` + `last_position`），这张表只回答「谁」。
+ *
+ * `source_kind` 必须显式存：视频列表 id 是 'bv_xxx'，歌单 id 可能是 'pl_xxx' 或
+ * 'tx_8153225605'，靠前缀猜类型是脆的（以后加一个来源就得改判据）。
+ */
+const CREATE_PLAYBACK_STATE_SQL = `CREATE TABLE IF NOT EXISTS playback_state (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  source_kind TEXT,          -- 'ov'（视频列表）| 'mv'（音乐歌单）；空 = 没有在播的源
+  source_id   TEXT,          -- videolists.id 或 playlists.id
+  updated_at  INTEGER NOT NULL DEFAULT 0
+);`
 const CREATE_TABLES_SQL = `
 -- 歌单
 --
@@ -143,8 +159,11 @@ CREATE TABLE IF NOT EXISTS playlists (
   last_sync_at     INTEGER,
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
+  -- 播到第几条（下标）
   last_index       INTEGER NOT NULL DEFAULT 0
 );
+
+${CREATE_PLAYBACK_STATE_SQL}
 
 -- 歌曲实体（**全局唯一**，与歌单无关）
 --
@@ -620,6 +639,66 @@ const ADDITIVE_COLUMNS: Array<{ table: string; column: string; ddl: string }> = 
 ]
 
 /**
+ * 「删列」的 schema 变更：能就地 DROP 就不重建
+ *
+ * 和加列对称。SQLite 3.35+ 支持 `ALTER TABLE ... DROP COLUMN`，这套环境是 3.53，
+ * 所以删一个我们自己加的列不需要清库 —— 而清库会带走 800 条视频条目和整个歌单。
+ *
+ * ⚠️ 只放**确定没被索引 / 视图 / 生成列引用**的列。被引用的列 SQLite 会直接报错，
+ * 那时就只能走重建，别硬来。
+ */
+const DROP_COLUMNS: Array<{ table: string; column: string }> = [
+  /**
+   * `last_position` 是**短命的**：加进来一天就撤了 ——
+   * 「播到第几秒」两条来源其实是同一个概念（当前播放位置），
+   * 按列表各存一份属于过度设计，而且每 5 秒写一次库完全没必要。
+   * 现在它是 `userData/last_position` 一个小文件，每秒一次。
+   * 已经加过这两列的库在这里被就地删掉，不重建。
+   */
+  { table: 'playlists', column: 'last_position' },
+  { table: 'videolists', column: 'last_position' },
+]
+
+const patchDroppedColumns = (database: SqliteDatabase): boolean => {
+  let patched = false
+  for (const item of DROP_COLUMNS) {
+    const columns = (database.pragma(`table_info("${item.table}")`) as Array<{ name: string }>).map(
+      (column) => column.name,
+    )
+    if (!columns.includes(item.column)) continue
+    database.exec(`ALTER TABLE "${item.table}" DROP COLUMN "${item.column}"`)
+    console.log(`[db] 已删列 ${item.table}.${item.column}`)
+    patched = true
+  }
+  return patched
+}
+
+/**
+ * 「只加表」的 schema 变更：表不存在就建，存在就跳过
+ *
+ * 和补列分开两个函数，是因为它们**必须都跑一遍**（不能短路）——
+ * 一次升级里可能既多了一张表、又多了两列，任一漏掉都会让「结构 = 新 schema」这个判断落空。
+ *
+ * 建表语句和 `CREATE_TABLES_SQL` 共用同一个常量，避免两处漂移。
+ */
+const ADDITIVE_TABLES: Array<{ table: string; ddl: string }> = [
+  { table: 'playback_state', ddl: CREATE_PLAYBACK_STATE_SQL },
+]
+
+const patchAdditiveTables = (database: SqliteDatabase): boolean => {
+  let patched = false
+  for (const item of ADDITIVE_TABLES) {
+    const exists = database
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get(item.table)
+    if (exists) continue
+    database.exec(item.ddl)
+    console.log(`[db] 已补表 ${item.table}（保留原有数据）`)
+    patched = true
+  }
+  return patched
+}
+/**
  * 补上 `ADDITIVE_COLUMNS` 里缺的列
  *
  * @returns 是否**真的补了**（没补就不用改指纹，让调用方走原来的重建流程）；
@@ -696,7 +775,14 @@ const migrateSchema = (database: SqliteDatabase): void => {
    * 先试「只加列」：补完列结构就等于新 schema，直接把指纹推上去、**保留数据**。
    * 补不了（表不存在 / 不是加列这类变化）才走下面的丢弃重建。
    */
-  if (patchAdditiveColumns(database)) {
+  /**
+   * 三个补丁**都跑**：不能短路 —— 一次升级可能同时有「新增一张表 + 加一列 + 删一列」，
+   * 只补到一样就推指纹会导致另一处结构永远缺（或者多留一个僵尸列）。
+   */
+  const tablesPatched = patchAdditiveTables(database)
+  const columnsPatched = patchAdditiveColumns(database)
+  const droppedPatched = patchDroppedColumns(database)
+  if (tablesPatched || columnsPatched || droppedPatched) {
     database.pragma(`user_version = ${wanted}`)
     console.log('[db] schema 已就地升级（未清空数据）')
     return

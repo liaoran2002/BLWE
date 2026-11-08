@@ -21,6 +21,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { PLAYLIST_DATA_VERSION } from '@common/constants'
+import { getPlaybackSource } from './playback'
 import type {
   PlaylistRecord,
   PlaylistSaveParams,
@@ -403,13 +404,15 @@ const readPlaylistsFromDb = (): PlaylistRecord[] => {
 }
 
 /**
- * 「哪个歌单是当前」**不落库**
+ * 「哪个歌单是当前」在 `playlists` 表里**没有列**
  *
- * 它每切一次歌单就变一次，而且真正的来源是渲染层（`playlists:save` 带的
- * `currentId`）。落库只会制造「渲染层说 null、库里还留着上次的 id」
- * 这种两边打架的状态。真值就放在内存里的 `data.currentId`，
- * 启动时先取列表第一条（与旧的 `initPlaylists` 行为一致），
- * 渲染层加载完会立刻写回真实值。
+ * 它每切一次就变一次，落库会制造「渲染层说 null、库里还留着上次的 id」
+ * 这种两边打架的状态。运行期的真值放在内存里的 `data.currentId`，
+ * 渲染层 `playlists:save` 每次都会带回来。
+ *
+ * 但**重启后总得知道上次在听哪个**，所以启动时从 `playback_state` 取
+ * （`kind = 'mv'` 那条的 `source_id`）—— 那是「上次播到哪」的权威记录，
+ * 和视频列表共用同一张表。指向不到（歌单被删）就退回第一个。
  */
 
 // #endregion
@@ -579,7 +582,23 @@ export const initPlaylists = (): void => {
     console.warn(`[playlist] 有 ${dropped} 条歌单记录结构不合法已丢弃（库里的原始行未改动）`)
   }
 
-  data = { version: PLAYLIST_DATA_VERSION, currentId: records[0]?.id ?? null, playlists: records }
+  /**
+   * 「当前歌单」优先跟着 `playback_state` 走
+   *
+   * 以前这里固定取 `records[0]`（列表第一条）。后果是：用户听的是第二个歌单，
+   * 重启后当前歌单变回第一条 —— 如果第一条恰好是空的默认歌单，续播会直接在
+   * 「没有歌」上失败，表现出来的就是「歌单永远续不上、视频却正常」。
+   */
+  const playback = getPlaybackSource()
+  const remembered =
+    playback.kind === 'mv' && records.some((record) => record.id === playback.id)
+      ? playback.id
+      : null
+  data = {
+    version: PLAYLIST_DATA_VERSION,
+    currentId: remembered ?? records[0]?.id ?? null,
+    playlists: records,
+  }
   /**
    * 只有真丢了东西才回写
    *

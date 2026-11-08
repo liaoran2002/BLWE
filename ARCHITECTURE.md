@@ -3665,7 +3665,7 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
                       ↓
         本地：sha256(resources/app.asar)
         远端：GET api.github.com/repos/<owner>/<repo>/releases/latest
-              └→ assets 里找 fingerprint.json → 读里面的 sha256
+              └→ 从发布说明正文（body）里正则取 sha256
                       ↓
         两个一样？ ──是──→ 静默结束
                       │否
@@ -3674,10 +3674,22 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
         壁纸模式 / 关到托盘 → 系统通知（点一下打开发布页）
 ```
 
-`fingerprint.json` 由 `scripts/fingerprint.mjs` 生成（`dist` 跑完自动执行），
-发布时作为**附件**上传、名字不能改 —— 主进程靠这个名字在 release assets 里找它。
-把它和 release 绑定而不是放仓库里，是为了保证「指纹」和「安装包」**是同一次发布**的，
-否则会出现「提示有新版，下下来还是旧的」。
+指纹写在**发布说明正文第一行**（工作流从 `release/fingerprint.json` 读出来拼进去）：
+
+```
+20e320887805c6f33c714eb1418d83f0196f13d8b837e3b463ad5d4efc1fb0d6/11843413/1794118330860
+```
+
+`sha256 / 字节数 / 构建时间戳`，一行说完。一次请求就同时拿到发布页链接和这行字，
+`parseRemoteBuild()` 用 `([0-9a-f]{64})\/(\d+)\/(\d+)` 切开 —— 只比第一段，
+后两段是给人对账的（怀疑「提示有新版但下下来还是旧的」时，拿 size 比一下就知道）。
+
+早先传的是 `fingerprint.json` 附件，那是白折腾：为三个字段多下载一次，资源列表里
+还多一个用户看不懂的东西。可信度上没有区别 —— 能改正文的人同样能换附件，
+两者属于同一次发布。
+
+`scripts/fingerprint.mjs` 仍然有用（`dist` 末尾自动跑），但产出的
+`release/fingerprint.json` 只是**中间产物**，CI 读完就丢，不进发布。
 
 ### 为什么连不上就一声不吭
 
@@ -3712,12 +3724,94 @@ GitHub 在国内经常不通（DNS 污染 / 超时）。失败也弹一句「检
 ### 发布怎么对上（CI）
 
 `.github/workflows/release.yml`：push 到 `main` → `windows-latest` 上 `npm ci` → `npm run typecheck`
-→ `npm run dist` → 删掉旧的 `latest` 发布（连 tag）再用当前 commit 重建，把两个 exe 和
-`fingerprint.json` 一起传上去。
+→ `npm run dist`（末尾 `npm run fingerprint` 产出 `release/fingerprint.json`）
+→ 删掉旧的 `latest` 发布（连 tag）再用当前 commit 重建：两个 exe 作附件，
+sha256 拼进发布说明正文。
 
 应用端只认 `releases/latest`，所以「覆盖同一个发布」就够了，不必一 commit 一个 tag。
 代价是**指纹每次都变** —— 任何代码改动都会让在用的人收到一次提示（同一指纹只提示一次）；
 改文档不触发构建（`paths-ignore`），所以不会产生这种噪音。
+
+## 播放状态该放哪：状态不是设置
+
+**问题**：「上次播到哪」被拆成了两套完全不同的存法 ——
+
+```
+视频列表：player.activeVideoListId（设置项，落盘）→ 重启能恢复
+音乐歌单：playlistsStore.currentId（主进程内存）  → 重启重置成第一个歌单
+```
+
+于是用户遇到的是「播视频下次能续上、播歌每次从头开始」。这不是续播算法的问题，
+而是**同一个概念有两个载体**：一个进了 `setting.json`，一个只在内存里。
+
+更隐蔽的是它还会连环：`initPlaylists` 启动时把 `currentId` 定成 `records[0]`
+（列表第一条）。如果第一条恰好是空的默认歌单，`tryResume` 会拿到 0 首歌 →
+直接判失败 → 退回 `loadPlaylist()` 播空歌单。表现出来就是「歌单永远续不上」，
+而代码里一句报错都没有。
+
+### 切法：库里记「谁 + 第几条」，文件记「第几秒」
+
+```
+playback_state (id = 1, source_kind, source_id)   -- 只有一个在播的源
+playlists.last_index / videolists.last_index      -- 各自播到第几条
+
+userData/last_position                            -- 一行数字：播到第几秒
+```
+
+- **「谁」全局唯一**（同一时刻只可能有一条线的一个列表在播）→ 单行表；
+- **「第几条」属于列表**（换列表就该是另一个下标）→ 跟各自那张表；
+- **「第几秒」是全局的当前播放位置** → 一个几字节的文件，每秒覆盖。
+
+我一开始把秒数也按列表存了两列（`playlists.last_position` / `videolists.last_position`），
+一天就撤了：换列表、换来源，下一次播放就把它覆盖，分表存只是把同一个值切成 N 份
+互相打架的副本。删列用 `DROP COLUMN` 就地做（SQLite 3.35+），不为两列清空 800 条条目。
+
+### 秒数为什么宁可写文件
+
+- 每秒一次 SQLite 事务 + WAL 增长，为「丢了最多少续 1 秒」的值不值；
+- 文件写是「写 `.tmp` + rename」，进程半路被杀也只留下完整内容；
+- 它**不需要**和列表的存在性绑定（删列表时不用跟着改），所以散文件没有副作用。
+
+### `source_kind` 为什么不能省
+
+视频列表 id 是 `bv_local_xxx`，歌单 id 可能是 `pl_default`（本地建）或
+`tx_8153225605`（平台导入）。看着能靠前缀猜，但那等于把「目前有哪些来源」
+写死在字符串判断里 —— 加一种来源就要回来改所有判据，而且漏一处不会报错，
+只会在某个来源上「偶尔不续播」。存一列 `'ov' / 'mv'` 是一次性的成本。
+
+### 写入口：两种频率，两条通道
+
+```
+每秒   system.savePosition() → playback:position → userData/last_position（文件）
+切歌   system.saveProgress() → playback:progress → 事务写库（playback_state + last_index）
+```
+
+`saveProgress` 里还挡了一层「源 + 下标」的 key：没变就什么都不做 ——
+所以一首歌从头播到尾，**库那边只被写一次**。
+
+以前是两条完全不同的路：视频走 `videolists:setIndex`（一行 UPDATE），
+歌单走 `playlists:save`（**全量覆盖**：`DELETE FROM playlists` + 重建 221 行
+`playlist_songs` 关系表），而 `timeupdate` 每 5 秒触发一次。写放大是次要的，
+真正的问题是「歌单那条路忘了写 last_index」这种 bug 只会在一条线上出现 ——
+两条路各写各的，就没有一处能保证对称。
+
+### 开关只管「从第几秒」，不管「播哪首」
+
+`player.resumeOnStart` 留在设置里（它确实是偏好），但语义收紧成：
+
+- **开**：恢复上次的列表 + 那一条 + 那个秒数；
+- **关**：**还是那一条**，但从 `00:00` 起。
+
+以前它挡在整个 `tryResume()` 前面，关掉就完全跳过恢复 —— 等于「关掉记住进度」
+变成了「关掉记住播到哪首」，两件事被一个开关绑死了。
+
+### 迁移
+
+- `playback_state` 是新表 → `patchAdditiveTables` 建；`last_position` 列加过又撤，
+  `patchDroppedColumns` 负责 `DROP` 掉老库里残留的那两列。**三个补丁都跑，不清库**
+  （老库里有 800 条视频条目、221 首歌，为结构变化丢这些不值）。
+- 旧的 `player.activeVideoListId` **不迁移**（用户已确认）：第一次启动 `playback_state`
+  是空的，退回「当前歌单 + 不续播」，之后每次切歌自动补上。
 
 ## 一次代码审查修掉的东西
 

@@ -33,16 +33,17 @@ jobs:
     # 打包的是 Windows 产物（nsis + portable），必须在 Windows 上打
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # v5 起跑在 node24 运行时上；v4 是 node20（GitHub 已弃用并强推到 node24，会打警告）
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
 
       # Electron 的二进制（~100MB）和 NSIS 工具每次重新下会很慢，缓存住
       - name: 缓存 Electron / electron-builder 的下载产物
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~\AppData\Local\electron\Cache
@@ -70,11 +71,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host '还没有 latest 发布，直接新建' }
 
           $files = @(Get-ChildItem -Path release -Filter *.exe | ForEach-Object { $_.FullName })
-          $files += (Resolve-Path release/fingerprint.json).Path
+
+          # 版本号从 package.json 读，别写死：包名就是 `${productName} ${version}.exe`
+          # （便携版）和 `${productName} Setup ${version}.exe`（安装版）。
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          # 指纹就一行：sha256/大小/构建时间戳。应用端按 `/` 切开取第一段比对，
+          # 后两段留给人工核对。不再另传 fingerprint.json 附件。
+          $fp = Get-Content release/fingerprint.json -Raw | ConvertFrom-Json
+          $notes = "$($fp.sha256)/$($fp.size)/$($fp.builtAt)`n`n" +
+                   "BLWE $($version).exe 为便携版，BLWE Setup $($version).exe 为安装版；`n" +
+                   "按需求下载即可。"
 
           # 固定 tag：latest。没有它就先建，有就先删（上一步连 tag 一起删掉了），
           # 所以这个 tag 永远指向最新一次构建出来的 commit。
           gh release create latest $files `
             --target "${{ github.sha }}" `
             --title "latest build" `
-            --notes "自动构建：${{ github.sha }}`n`n下载任意一个安装包安装即可；指纹见 fingerprint.json。"
+            --notes $notes

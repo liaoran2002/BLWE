@@ -37,7 +37,6 @@ import {
   removeVideoListItem,
   renameVideoList,
   setItemFavorite,
-  setVideoListIndex,
   setVideoListSyncMode,
   syncVideoList,
 } from '../utils/videolist'
@@ -128,8 +127,6 @@ export const registerVideoListHandlers = (): void => {
   mainHandle('videolists:getItems', async ({ id }) =>
     markLocalItemsMissing(getVideoListItems(id)),
   )
-
-  mainHandle('videolists:setIndex', ({ id, index }) => setVideoListIndex(id, index))
 
   /**
    * 重新定位：让用户挑一个视频文件，把某条本地视频重新指过去

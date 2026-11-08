@@ -274,8 +274,20 @@ export interface RendererAPI {
   syncVideoList: (id: string) => Promise<import('./playlist').VideoListSyncResult>
   /** 取列表条目（已在库里，不联网） */
   getVideoListItems: (id: string) => Promise<import('./playlist').VideoListItem[]>
-  /** 记录播到第几条 */
-  setVideoListIndex: (id: string, index: number) => Promise<void>
+  // #endregion
+
+  // #region 播放状态（**不是设置**：它存数据库，不存 setting.json）
+  /** 读「上次在播哪条线的哪个列表」 */
+  getPlaybackSource: () => Promise<import('./playback').PlaybackSource>
+  /** 切源（不带进度；播放过程中由 `savePlaybackProgress` 顺带写） */
+  setPlaybackSource: (
+    kind: import('./playback').PlaybackSourceKind | '',
+    id: string,
+  ) => Promise<void>
+  /** 上报「切到哪一条」（视频列表 / 歌单共用的唯一写入口，只在切歌时调） */
+  savePlaybackProgress: (progress: import('./playback').PlaybackProgress) => Promise<void>
+  /** 上报「播到第几秒」（每秒一次，只写一个小文件，不进库） */
+  savePlaybackPosition: (seconds: number) => Promise<void>
   // #endregion
 
   // #region 本地视频文件（丢了之后怎么救）

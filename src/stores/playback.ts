@@ -7,7 +7,6 @@
 import { defineStore } from 'pinia';
 import { isVideoItem, keyOf, titleOf } from '../types/playItem';
 import type { PlayItem } from '../types/playItem';
-import type { PlaylistSong as StructuredSong } from '@common/types/playlist';
 import type { VideoElement, VideoControlAction, BiliVideo, AppData } from '../types/app';
 import { ElMessage, ElNotification, ElMessageBox } from 'element-plus';
 import defaultSetting from '@common/defaultSetting';
@@ -341,7 +340,14 @@ export interface PlaybackActions {
   videoEnded(): void;
   scheduleBufferOverlay(): void;
   clearBufferOverlayTimer(): void;
-  loadPlaybackSource(): Promise<{ name: string; songs: StructuredSong[]; lastIndex: number; } | null>;
+  loadPlaybackSource(): Promise<{
+    kind: 'ov' | 'mv';
+    id: string;
+    name: string;
+    songs: PlayItem[];
+    lastIndex: number;
+    lastPosition: number;
+  } | null>;
   tryResume(): Promise<boolean>;
   restoreSongVideo(index: number, seekTo?: number): Promise<boolean>;
   createEngine(): void;
@@ -1186,7 +1192,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
       this.syncVideoQuality();
       this.systemStore.syncTrayState();
       // 记录当前播放信息，供下次续播
-      void this.systemStore.persistPlaybackState();
+      this.systemStore.saveProgress();
       // 更新系统媒体控件（歌名/歌手/专辑/封面 + 播放状态）
       this.systemStore.updateMediaSession();
       this.systemStore.updateMediaPosition();
@@ -1398,35 +1404,83 @@ export const playbackActions: ThisType<PlaybackContext> = {
    * 这里一次抹平，续播和首启两条路就不用各写一遍分支 ——
    * 否则「视频列表忘了写 last_index」这种 bug 只会出现在其中一条路上。
    */
+  /**
+   * 读「上次在播哪条线的哪个列表」以及它的曲目与位置
+   *
+   * 两条来源在播放层长得一模一样，差别只有三点：`songs` 从哪来、`last_index`
+   * 记在哪张表、以及**类型是显式存的**（`playback_state.source_kind`）。
+   *
+   * 这里一次抹平，续播和首启两条路就不用各写一遍分支 ——
+   * 否则「歌单忘了写 last_index」这种 bug 只会出现在其中一条路上。
+   */
   async loadPlaybackSource(): Promise<{
+    kind: 'ov' | 'mv';
+    id: string;
     name: string;
     songs: PlayItem[];
     lastIndex: number;
+    lastPosition: number;
   } | null> {
-    const videoListId = this.videoListsStore.activeId;
-    if (videoListId) {
-      const record = this.videoListsStore.find(videoListId);
-      if (!record) return null;
-      const songs = await this.videoListsStore.items(videoListId);
-      return { name: record.name, songs, lastIndex: record.lastIndex };
+    const source = await electronApi.getPlaybackSource();
+    if (source.kind === 'ov' && source.id) {
+      const record = this.videoListsStore.find(source.id);
+      if (record) {
+        const songs = await this.videoListsStore.items(source.id);
+        return {
+          kind: 'ov',
+          id: record.id,
+          name: record.name,
+          songs,
+          lastIndex: record.lastIndex,
+          lastPosition: source.seconds,
+        };
+      }
     }
-    const record = this.playlistsStore.current;
-    if (!record) return null;
-    return { name: record.name, songs: [...record.songs], lastIndex: record.lastIndex };
+    if (source.kind === 'mv' && source.id) {
+      const record = this.playlistsStore.playlists.find((p) => p.id === source.id);
+      if (record) {
+        return {
+          kind: 'mv',
+          id: record.id,
+          name: record.name,
+          songs: [...record.songs],
+          lastIndex: record.lastIndex,
+          lastPosition: source.seconds,
+        };
+      }
+    }
+    /**
+     * 没有记录（首次启动 / 记录指向的列表已被删）→ 退回「当前歌单」
+     *
+     * 这条兜底让全新环境仍然能播东西，而不是一上来就提示「库是空的」。
+     */
+    const fallback = this.playlistsStore.current;
+    if (!fallback) return null;
+    return {
+      kind: 'mv',
+      id: fallback.id,
+      name: fallback.name,
+      songs: [...fallback.songs],
+      lastIndex: fallback.lastIndex,
+      lastPosition: source.seconds,
+    };
   },
 
   /**
-   * 续播：恢复上次的歌单 / 歌曲 / 视频 / 播放进度
+   * 续播：恢复上次的列表 / 那一条 / 播放进度
+   *
+   * `player.resumeOnStart` **只决定从第几秒开始，不决定播哪一首**：
+   * 关掉 = 还是上次那首，但从 00:00 起；打开 = 回到上次的秒数。
+   * （以前它挡在整个续播前面，关掉就完全跳过恢复，等于「列表也回到默认」。）
    *
    * @returns 是否成功恢复（false 表示调用方应走默认加载流程）
    */
   async tryResume(): Promise<boolean> {
-    if (!this.settingStore.setting['player.resumeOnStart']) return false;
     const source = await this.loadPlaybackSource();
     if (!source || source.songs.length === 0) return false;
-  
+
     /**
-     * 回到该歌单上次播放的位置
+     * 回到该列表上次播放的位置
      *
      * ⚠️ 下标本身会**被同步改变含义**（曲目增删后第 N 个位置可能是别的歌），
      * 所以主进程在 `syncPlaylist` / `syncVideoList` 里会把它**重算**成
@@ -1436,20 +1490,23 @@ export const playbackActions: ThisType<PlaybackContext> = {
     this.queueStore.songs = source.songs;
     this.queueStore.listName = source.name;
     this.queueStore.currentIndex = index;
-  
+    /** 视频线的「正在播哪个列表」是 store 状态，恢复时一起设上（顺带写 playback_state） */
+    if (source.kind === 'ov') await this.queueStore.setActiveVideoList(source.id);
+
     const songName = this.queueStore.getSongName(index);
     if (!songName) return false;
-  
-    const resumeTime = this.settingStore.setting['player.resumeTime'] || 0;
-  
+
+    const seekTo = this.settingStore.setting['player.resumeOnStart']
+      ? source.lastPosition || 0
+      : 0;
+
     try {
-      // 「记住播放进度」一个开关管到底：歌 + 进度一起回来
-      if (await this.restoreSongVideo(index, resumeTime)) {
+      if (await this.restoreSongVideo(index, seekTo)) {
         // 视频列表里说「首」很别扭（那是歌的量词），按来源换一个
         const unit = this.queueStore.fromVideoList ? '个视频' : '首';
         ElMessage.success(
           `已续播《${this.queueStore.listName}》第 ${index + 1} ${unit}` +
-            (resumeTime > 3 ? `（${this.formatTime(resumeTime)}）` : ''),
+            (seekTo > 3 ? `（${this.formatTime(seekTo)}）` : ''),
         );
         return true;
       }
@@ -1889,7 +1946,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
     void this.playAt(this.queueStore.currentIndex);
     this.resetRandomList();
     // 记录当前播放信息（歌单 / 下标 / 进度）
-    void this.systemStore.persistPlaybackState();
+    this.systemStore.saveProgress();
     nextTick(() => {
       const v = this.videoEl();
       if (v) {

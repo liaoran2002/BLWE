@@ -53,6 +53,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, tx } from './db'
 import { getSetting, updateSetting } from './setting'
+import { remapPlaybackSource } from './playback'
 import { isLocalBvid, isLocalVideoFile, localBvidOfPath, localTitleOfPath } from './localVideo'
 
 /** 一个列表最多拉多少条（500 条收藏夹 = 13 个请求，已经够用且不容易触发风控） */
@@ -381,7 +382,9 @@ export const addVideoList = async (
   /** 主键是「kind + 平台 id」，重复导入必然命中同一行 */
   const existing = db
     .prepare(`SELECT last_index, created_at FROM videolists WHERE id = ?`)
-    .get(id) as { last_index: number; created_at: number } | undefined
+    .get(id) as
+    | { last_index: number; created_at: number }
+    | undefined
 
   let added = 0
   tx(() => {
@@ -971,7 +974,15 @@ export const convertVideoListToLocal = (id: string): { id: string; name: string 
           has_more, skipped_total,
           sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
        VALUES (?, 'local', NULL, NULL, ?, ?, ?, 0, 0, 0, 'off', 0, NULL, ?, ?, ?)`,
-    ).run(newId, record.name, record.cover, record.itemCount, record.lastIndex, record.createdAt, now)
+    ).run(
+      newId,
+      record.name,
+      record.cover,
+      record.itemCount,
+      record.lastIndex,
+      record.createdAt,
+      now,
+    )
 
     /**
      * 条目整批搬过去，`origin` 一律改成 `local`
@@ -990,11 +1001,14 @@ export const convertVideoListToLocal = (id: string): { id: string; name: string 
     refreshCount(db, newId)
   })
 
-  /** 设置项重映射：正在播的那个 / 默认列表，都要跟着换成新 id */
+  /**
+   * 重映射：正在播的那个 / 默认列表，都要跟着换成新 id
+   *
+   * 「正在播哪个列表」现在记在库里的 `playback_state`（不是设置项），
+   * 所以走 `remapPlaybackSource`；默认列表仍然是个设置项。
+   */
   try {
-    if (String(getSetting()['player.activeVideoListId'] ?? '') === id) {
-      updateSetting({ 'player.activeVideoListId': newId })
-    }
+    remapPlaybackSource('ov', id, newId)
     if (String(getSetting()['player.defaultVideoListId'] ?? '') === id) {
       updateSetting({ 'player.defaultVideoListId': newId })
     }
@@ -1268,6 +1282,8 @@ export const removeVideoList = (id: string): boolean => {
       db.prepare(`DELETE FROM videolist_items WHERE list_id = ?`).run(id)
       db.prepare(`DELETE FROM videolists WHERE id = ?`).run(id)
     })
+    /** 正在播的列表被删了：播放源记录必须跟着清，否则它会一直指向一个不存在的 id */
+    remapPlaybackSource('ov', id, '')
     console.log(`[videolist] 已删除列表 ${id}`)
     return true
   } catch (err) {
@@ -1276,15 +1292,3 @@ export const removeVideoList = (id: string): boolean => {
   }
 }
 
-/** 记录「这个列表播到第几条」 */
-export const setVideoListIndex = (id: string, index: number): void => {
-  if (!id) return
-  const value = Number.isFinite(index) ? Math.max(0, Math.floor(index)) : 0
-  try {
-    getDb()
-      .prepare(`UPDATE videolists SET last_index = ?, updated_at = ? WHERE id = ?`)
-      .run(value, Date.now(), id)
-  } catch (err) {
-    console.error('[videolist] 记录播放位置失败:', err)
-  }
-}

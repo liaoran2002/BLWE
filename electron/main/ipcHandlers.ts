@@ -12,6 +12,7 @@ import { registerWindowHandlers } from './ipc/window'
 import { registerAuthHandlers } from './ipc/auth'
 import { registerApiHandlers } from './ipc/biliApiHandlers'
 import { registerPlaylistHandlers } from './ipc/playlist'
+import { registerPlaybackHandlers } from './ipc/playback'
 import { registerVideoListHandlers } from './ipc/videolists'
 import { registerCacheHandlers } from './ipc/cache'
 import { registerMusicHandlers } from './ipc/music'
@@ -80,6 +81,9 @@ export const registerIpcHandlers = (context: IpcContext): void => {
 
   // 某站视频列表（收藏夹 / 合集 / 系列）
   registerVideoListHandlers()
+
+  // 播放状态（哪条线的哪个列表 + 播到第几条第几秒）
+  registerPlaybackHandlers()
 
   // 音乐平台歌单解析（移植自 LX 的 musicSdk）
   registerMusicHandlers()

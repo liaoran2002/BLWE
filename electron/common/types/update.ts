@@ -37,8 +37,6 @@ export interface UpdateCheckResult {
 export interface UpdateInfo {
   /** 应用版本号（只用于展示，不参与新旧判断） */
   version: string
-  /** 构建指纹前 12 位；读不到时为 null */
-  fingerprint: string | null
   /** 是否打包版（开发模式不检查更新） */
   packaged: boolean
 }

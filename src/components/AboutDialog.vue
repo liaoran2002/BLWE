@@ -35,14 +35,13 @@
       </div>
 
       <!--
-        版本与构建指纹
+        版本号 + 检查更新
 
-        指纹 = app.asar 的 sha256 前 12 位，比版本号更真实：代码一改指纹就变。
         「检查更新」是唯一的手动入口（自动检查在启动后静默跑一次，连不上就什么都不说）。
+        指纹（app.asar 的 sha256）只用于内部比对**有没有新版**，不往界面上摆。
       -->
       <div class="ab-meta">
         <span>版本 {{ appVersion || "—" }}</span>
-        <span v-if="fingerprint">· 指纹 {{ fingerprint }}</span>
         <span class="ab-check" :class="{ busy: checking }" @click="checkUpdate">
           {{ checking ? "检查中…" : "检查更新" }}
         </span>
@@ -94,13 +93,11 @@ export default defineComponent({
       aiAvatar: new URL('../assets/avatar-fish.jpg', import.meta.url).href,
       /** 打包版本号（只展示用，不参与新旧判断） */
       appVersion: '',
-      /** 本地构建指纹前 12 位 */
-      fingerprint: '',
       checking: false,
     };
   },
   watch: {
-    /** 每次打开读一次（指纹要算 app.asar 的哈希，没必要常驻） */
+    /** 每次打开读一次版本号（不发请求，纯本地读） */
     visible(v: boolean) {
       if (v) void this.loadInfo();
     },
@@ -110,7 +107,6 @@ export default defineComponent({
       try {
         const info = await api.getUpdateInfo();
         this.appVersion = info.version;
-        this.fingerprint = info.fingerprint || '';
       } catch {
         /* 读不到就显示「—」，不影响其它功能 */
       }

@@ -506,6 +506,7 @@ export interface VideoListRecord {
   lastSyncAt: number | null
   /** 播到第几条（下标）；同步后由主进程按 bvid 重定位 */
   lastIndex: number
+
   createdAt: number
   updatedAt: number
   /**

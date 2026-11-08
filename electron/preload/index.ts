@@ -43,6 +43,7 @@ import type {
   VideoMetaInput,
 } from '@common/types/playlist'
 import type { CacheStats } from '@common/types/cache_stats'
+import type { PlaybackProgress, PlaybackSource, PlaybackSourceKind } from '@common/types/playback'
 import type {
   UpdateAvailablePayload,
   UpdateCheckResult,
@@ -260,8 +261,17 @@ const api = {
     rendererInvoke('videolists:sync', { id }),
   getVideoListItems: (id: string): Promise<VideoListItem[]> =>
     rendererInvoke('videolists:getItems', { id }),
-  setVideoListIndex: (id: string, index: number): Promise<void> =>
-    rendererInvoke('videolists:setIndex', { id, index }),
+
+  // #endregion
+
+  // #region 播放状态（不是设置：存数据库）
+  getPlaybackSource: (): Promise<PlaybackSource> => rendererInvoke('playback:get'),
+  setPlaybackSource: (kind: PlaybackSourceKind | '', id: string): Promise<void> =>
+    rendererInvoke('playback:setSource', { kind, id }),
+  savePlaybackProgress: (progress: PlaybackProgress): Promise<void> =>
+    rendererInvoke('playback:progress', progress),
+  savePlaybackPosition: (seconds: number): Promise<void> =>
+    rendererInvoke('playback:position', { seconds }),
   // #endregion
 
   // #region 本地视频文件（丢了之后怎么救）

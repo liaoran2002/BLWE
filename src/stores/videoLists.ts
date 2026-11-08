@@ -24,8 +24,11 @@
  * ## `activeId` 是「当前在播哪个视频列表」
  *
  * `''` 表示当前在播音乐歌单（此时由 `playlists` store 的 `currentId` 说话）。
- * 它需要跨重启保留 —— 落在设置项 `player.activeVideoListId` 里，
- * 由 `queue` store 读写（store 本身不碰设置，保持这一层只做数据）。
+ *
+ * 它**自己不需要跨重启保留** —— 「上次在播谁」的权威记录是库里的
+ * `playback_state` 单行表（`kind` + `id`），启动时由 `bootstrap` 读回来再
+ * `setActive`。这样视频列表和音乐歌单共用同一套记录，不会出现
+ * 「一个落盘、一个只存内存」那种一半能续播的状态。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
@@ -172,7 +175,7 @@ export const useVideoListStore = defineStore('videoLists', () => {
    *
    * 主进程会换一个 id（`bv_local_` 开头）并把条目整体搬过去。
    * 这里顺手把 `activeId` 重映射 —— 否则「正在播的列表」会指向一个已经不存在的 id，
-   * 下一次写播进度就写到空处了（`player.activeVideoListId` 主进程已经改好）。
+   * 下一次写播进度就写到空处了（库里的 `playback_state` 主进程已经改好）。
    */
   const convertToLocal = async (id: string): Promise<{ id: string; name: string }> => {
     const result = await api.convertVideoListToLocal(id)
@@ -324,9 +327,6 @@ export const useVideoListStore = defineStore('videoLists', () => {
    */
   const items = (id: string): Promise<VideoListItem[]> => api.getVideoListItems(id)
 
-  /** 记录播到第几条（等价于歌单的 `lastIndex`） */
-  const setIndex = (id: string, index: number): Promise<void> =>
-    api.setVideoListIndex(id, index)
 
   return {
     lists,
@@ -360,7 +360,6 @@ export const useVideoListStore = defineStore('videoLists', () => {
     removeItem,
     setFavorite,
     sync,
-    items,
-    setIndex,
+    items,
   }
 })
