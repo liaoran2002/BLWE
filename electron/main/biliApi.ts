@@ -1732,7 +1732,7 @@ export const parseVideoInput = async (input: string): Promise<ParsedVideoInfo> =
  * 与 `@common/types/playlist` 的 `VideoListKind` 保持一致 ——
  * 那边是主/渲染共用的类型，这里的接口实现不能引入渲染层依赖，所以各自声明一份。
  */
-export type BiliListKind = 'fav' | 'season' | 'series'
+export type BiliListKind = 'fav' | 'season' | 'series' | 'space'
 
 const FAV_RESOURCE_API = 'https://api.bilibili.com/x/v3/fav/resource/list'
 const FAV_CREATED_API = 'https://api.bilibili.com/x/v3/fav/folder/created/list-all'
@@ -1804,9 +1804,10 @@ const USER_CARD_API = 'https://api.bilibili.com/x/web-interface/card'
  * 作者留空，界面显示「未知 UP 主」，其他一切照常。
  * 先走 wbi 签名接口，不行再退老接口（两个入口的 `data` 形状不一样，见下）。
  */
-const fetchUserName = async (mid: string): Promise<string> => {
+/** UP 主昵称 + 头像（头像给「投稿列表」当封面用） */
+const fetchUserProfile = async (mid: string): Promise<{ name: string; face: string | null }> => {
   const id = String(mid ?? '').trim()
-  if (!id) return ''
+  if (!id) return { name: '', face: null }
 
   const urls: string[] = []
   const mixinKey = await getMixinKeyCached()
@@ -1819,17 +1820,24 @@ const fetchUserName = async (mid: string): Promise<string> => {
       const res = await biliGet(url)
       if (res.code !== 0) continue
       const data = res.data as
-        | { name?: unknown; card?: { name?: unknown } }
+        | { name?: unknown; face?: unknown; card?: { name?: unknown; face?: unknown } }
         | undefined
       /** `acc/info` 把名字放在 `data.name`，老接口放在 `data.card.name` */
       const name = data?.name ?? data?.card?.name
-      if (typeof name === 'string' && name.trim()) return name.trim()
+      const face = data?.face ?? data?.card?.face
+      if (typeof name === 'string' && name.trim()) {
+        return { name: name.trim(), face: typeof face === 'string' && face ? face : null }
+      }
     } catch {
       /* 这个入口不通就试下一个 */
     }
   }
-  return ''
+  return { name: '', face: null }
 }
+
+/** 只要名字的场合（合集 / 系列回填作者） */
+const fetchUserName = async (mid: string): Promise<string> =>
+  (await fetchUserProfile(mid)).name
 
 const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -1864,6 +1872,275 @@ const listErrorMessage = (code: number, fallback: string): string => {
  * 一个收藏夹可能有几千条。`max` 默认 500（够用且不至于打十几个请求触发风控）；
  * 想全量就显式传更大的值。
  */
+/** 每页拉多少条：沿用接口各自的约定值（凑大了容易被当成爬虫） */
+export const listPageSize = (kind: BiliListKind): number =>
+  kind === 'fav' || kind === 'space' ? 40 : 30
+
+/** 一页列表内容（懒加载的最小单位） */
+export interface BiliListPage {
+  items: BiliListItem[]
+  /** 远端总数；接口没给时为 null */
+  total: number | null
+  hasMore: boolean
+  /** 列表名 / 封面只有第 1 页会带回来（meta 只在首页给） */
+  name: string
+  cover: string | null
+  skipped: number
+}
+
+const SPACE_ARC_API = 'https://api.bilibili.com/x/space/wbi/arc/search'
+
+/**
+ * 指纹噪声参数
+ *
+ * `space/wbi/arc/search` 会拿这几个字段判断「像不像浏览器」，缺了大概率 -352。
+ * 值本身不参与业务（Bili23 里也是硬编码的），但不能不传。
+ */
+const DM_PARAMS: Record<string, string> = {
+  dm_img_list: '[]',
+  dm_img_str: 'V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ',
+  dm_cover_img_str:
+    'QU5HTEUgKE5WSURJQSwgTlZJRElBIEdlRm9yY2UgR1RYIDE2NTAgKE5WSURJQSksIERpcmVjdDNEMTEgdnNfNV8wIHBzXzVfMCwgRDNEMTEpR29vZ2xlIEluYy4gKE5WSURJQS',
+  dm_img_inter: '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}',
+}
+
+/** 一条原始条目 → 统一形状；不支持的条目（合集占位 / 番剧）返回 null，由调用方计数跳过 */
+const buildListItem = (raw: {
+  bvid?: unknown
+  title?: unknown
+  cover?: unknown
+  author?: unknown
+  duration?: unknown
+  type?: unknown
+}): BiliListItem | null => {
+  const bvid = typeof raw.bvid === 'string' ? raw.bvid.trim() : ''
+  if (!bvid) return null
+  /**
+   * `type === 21` 是**合集条目**：它的 bvid 是指向合集的占位，直接拿去播会失败。
+   * 跳过并计数（提示用户），不静默忽略。
+   */
+  if (Number(raw.type) === 21) return null
+  return {
+    bvid,
+    title: typeof raw.title === 'string' ? raw.title : '',
+    cover: typeof raw.cover === 'string' && raw.cover ? raw.cover : null,
+    author: typeof raw.author === 'string' && raw.author ? raw.author : null,
+    duration: readDuration(raw.duration),
+  }
+}
+
+/**
+ * 拉**一页**列表
+ *
+ * 和原来那个 `fetchBiliList`（循环拉到底）的区别只有一个：不循环。
+ * 上层（`utils/videolist.ts`）要靠它做懒加载：先拉第 1 页就看到内容，
+ * 剩下的一页一页补，界面上永远知道「还有多少条没加载」。
+ *
+ * 四种来源写在一个函数里，理由和原来一样：返回形状必须一致，
+ * 差异只有「打哪个接口、字段叫什么、每页几条」。
+ */
+export const fetchBiliListPage = async (
+  kind: BiliListKind,
+  id: string,
+  options: { mid?: string; page?: number } = {},
+): Promise<BiliListPage> => {
+  const page = Math.max(1, Math.floor(options.page ?? 1))
+  const pageSize = listPageSize(kind)
+  const items: BiliListItem[] = []
+  let skipped = 0
+  let name = ''
+  let cover: string | null = null
+  let total: number | null = null
+  let hasMore = false
+
+  if (kind === 'fav') {
+    const res = await biliGet(
+      `${FAV_RESOURCE_API}?media_id=${encodeURIComponent(id)}&pn=${page}` +
+        `&ps=${pageSize}&order=mtime&type=0&tid=0&platform=web&web_location=333.1387`,
+    )
+    if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+    const data = res.data as
+      | {
+          info?: { title?: unknown; cover?: unknown; media_count?: unknown }
+          medias?: unknown
+          has_more?: unknown
+        }
+      | undefined
+    if (page === 1) {
+      name = typeof data?.info?.title === 'string' ? data.info.title : ''
+      cover = typeof data?.info?.cover === 'string' ? data.info.cover : null
+      total = typeof data?.info?.media_count === 'number' ? data.info.media_count : null
+    }
+    const medias = Array.isArray(data?.medias)
+      ? (data.medias as Array<Record<string, unknown>>)
+      : []
+    for (const media of medias) {
+      const upper = media['upper'] as { name?: unknown } | undefined
+      const item = buildListItem({
+        bvid: media['bvid'],
+        title: media['title'],
+        cover: media['cover'],
+        author: typeof upper?.name === 'string' ? upper.name : undefined,
+        duration: media['duration'],
+        type: media['type'],
+      })
+      if (item) items.push(item)
+      else skipped += 1
+    }
+    hasMore = data?.has_more === true && medias.length > 0
+    if (total === null) total = hasMore ? null : (page - 1) * pageSize + medias.length
+  } else if (kind === 'season') {
+    if (!options.mid) throw new Error('合集链接里缺少 UP 主 id，请换一条完整链接')
+    const res = await biliGet(
+      `${SEASON_ARCHIVES_API}?mid=${encodeURIComponent(options.mid)}` +
+        `&season_id=${encodeURIComponent(id)}&sort_reverse=false` +
+        `&page_size=${pageSize}&page_num=${page}`,
+    )
+    if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+    const data = res.data as
+      | {
+          archives?: unknown
+          meta?: { name?: unknown; cover?: unknown; total?: unknown }
+          page?: { total?: unknown }
+        }
+      | undefined
+    if (page === 1) {
+      name = typeof data?.meta?.name === 'string' ? data.meta.name : ''
+      cover = typeof data?.meta?.cover === 'string' ? data.meta.cover : null
+      total =
+        typeof data?.meta?.total === 'number'
+          ? data.meta.total
+          : typeof data?.page?.total === 'number'
+            ? (data.page.total as number)
+            : null
+    }
+    const archives = Array.isArray(data?.archives)
+      ? (data.archives as Array<Record<string, unknown>>)
+      : []
+    for (const arc of archives) {
+      const item = buildListItem({
+        bvid: arc['bvid'],
+        title: arc['title'],
+        cover: arc['pic'],
+        duration: arc['duration'],
+      })
+      if (item) items.push(item)
+      else skipped += 1
+    }
+    hasMore = archives.length >= pageSize && (total === null || (page - 1) * pageSize + archives.length < total)
+  } else if (kind === 'series') {
+    if (!options.mid) throw new Error('系列链接里缺少 UP 主 id，请换一条完整链接')
+    /** 系列内容接口**不返回标题**，元信息要单独打一次（Bili23 也是这么做的） */
+    if (page === 1) {
+      const meta = await biliGet(
+        `${SERIES_META_API}?series_id=${encodeURIComponent(id)}&web_location=333.1387`,
+      )
+      if (meta.code === 0) {
+        const m = meta.data?.['meta'] as { name?: unknown; total?: unknown } | undefined
+        name = typeof m?.name === 'string' ? m.name : ''
+        total = typeof m?.total === 'number' ? m.total : null
+      }
+    }
+    const res = await biliGet(
+      `${SERIES_ARCHIVES_API}?mid=${encodeURIComponent(options.mid)}&current_mid=0` +
+        `&series_id=${encodeURIComponent(id)}&only_normal=true&sort=desc` +
+        `&ps=${pageSize}&pn=${page}`,
+    )
+    if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+    const data = res.data as { archives?: unknown } | undefined
+    const archives = Array.isArray(data?.archives)
+      ? (data.archives as Array<Record<string, unknown>>)
+      : []
+    for (const arc of archives) {
+      const item = buildListItem({
+        bvid: arc['bvid'],
+        title: arc['title'],
+        cover: arc['pic'],
+        duration: arc['duration'],
+      })
+      if (item) items.push(item)
+      else skipped += 1
+    }
+    hasMore = archives.length >= pageSize && (total === null || (page - 1) * pageSize + archives.length < total)
+  } else {
+    /** UP 主投稿：`id` 就是 mid */
+    const mid = String(options.mid ?? id).trim()
+    if (!mid) throw new Error('空间链接里缺少 UP 主 id')
+    const params: Record<string, string> = {
+      mid,
+      pn: String(page),
+      ps: String(pageSize),
+      tid: '0',
+      order: 'pubdate',
+      keyword: '',
+      special_type: '',
+      index: '0',
+      order_avoided: 'true',
+      platform: 'web',
+      web_location: '333.1387',
+      ...DM_PARAMS,
+    }
+    const mixinKey = await getMixinKeyCached()
+    const query = mixinKey
+      ? encWbi(params, mixinKey)
+      : Object.entries(params)
+          .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+          .join('&')
+    const res = await biliGet(`${SPACE_ARC_API}?${query}`)
+    if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
+    const data = res.data as
+      | { list?: { vlist?: unknown }; page?: { count?: unknown } }
+      | undefined
+    const vlist = Array.isArray(data?.list?.vlist)
+      ? (data.list!.vlist as Array<Record<string, unknown>>)
+      : []
+    for (const video of vlist) {
+      const item = buildListItem({
+        bvid: video['bvid'],
+        title: video['title'],
+        cover: video['pic'],
+        author: video['author'],
+        /** 投稿接口给的是 "04:03" 字符串 */
+        duration: video['length'],
+      })
+      if (item) items.push(item)
+      else skipped += 1
+    }
+    if (page === 1) {
+      total = typeof data?.page?.count === 'number' ? data.page.count : null
+      const profile = await fetchUserProfile(mid)
+      name = profile.name || `${mid} 的投稿`
+      cover = profile.face
+    }
+    hasMore = vlist.length >= pageSize && (total === null || page * pageSize < total)
+  }
+
+  /**
+   * 合集 / 系列 / 投稿：逐条没有作者（投稿有 `author`，合集系列没有），
+   * 但整个列表只有一个作者 —— 第 1 页查一次回填。
+   * 收藏夹不走这里（每条都带 `upper.name`，而且可能混着多个 UP 主）。
+   */
+  if (kind !== 'fav' && page === 1) {
+    const mid = String(options.mid ?? (kind === 'space' ? id : '')).trim()
+    if (mid && items.some((item) => !item.author)) {
+      const author = await fetchUserName(mid)
+      if (author) {
+        for (const item of items) {
+          if (!item.author) item.author = author
+        }
+      }
+    }
+  }
+
+  return { items, total, hasMore, name, cover, skipped }
+}
+
+/**
+ * 拉一个完整的列表（循环分页）
+ *
+ * 现在只有「本地文件列表」这类一次性场景还在用；平台列表都走 `fetchBiliListPage`
+ * 做懒加载（见 `utils/videolist.ts`）。
+ */
 export const fetchBiliList = async (
   kind: BiliListKind,
   id: string,
@@ -1874,170 +2151,19 @@ export const fetchBiliList = async (
   let skipped = 0
   let name = ''
   let cover: string | null = null
-  let itemCount: number | null = null
+  let total: number | null = null
 
-  /** 一条一条推进来（带「是否合集条目 / 番剧」的判断，统一在这里做） */
-  const push = (raw: {
-    bvid?: unknown
-    title?: unknown
-    cover?: unknown
-    author?: unknown
-    duration?: unknown
-    type?: unknown
-  }): void => {
-    const bvid = typeof raw.bvid === 'string' ? raw.bvid.trim() : ''
-    if (!bvid) {
-      skipped += 1
-      return
+  for (let page = 1; items.length < max; page += 1) {
+    const one = await fetchBiliListPage(kind, id, { mid: options.mid, page })
+    if (page === 1) {
+      name = one.name
+      cover = one.cover
+      total = one.total
     }
-    /**
-     * `type === 21` 是**合集条目**：它的 bvid 是指向合集的占位，直接拿去播会失败。
-     * 第一版跳过并计数（提示用户），不静默忽略。
-     */
-    if (Number(raw.type) === 21) {
-      skipped += 1
-      return
-    }
-    items.push({
-      bvid,
-      title: typeof raw.title === 'string' ? raw.title : '',
-      cover: typeof raw.cover === 'string' && raw.cover ? raw.cover : null,
-      author: typeof raw.author === 'string' && raw.author ? raw.author : null,
-      duration: readDuration(raw.duration),
-    })
-  }
-
-  if (kind === 'fav') {
-    const pageSize = 40
-    for (let page = 1; items.length < max; page += 1) {
-      const res = await biliGet(
-        `${FAV_RESOURCE_API}?media_id=${encodeURIComponent(id)}&pn=${page}` +
-          `&ps=${pageSize}&order=mtime&type=0&tid=0&platform=web&web_location=333.1387`,
-      )
-      if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
-      const data = res.data as
-        | {
-            info?: { title?: unknown; cover?: unknown; media_count?: unknown }
-            medias?: unknown
-            has_more?: unknown
-          }
-        | undefined
-      if (!name) {
-        name = typeof data?.info?.title === 'string' ? data.info.title : ''
-        cover = typeof data?.info?.cover === 'string' ? data.info.cover : null
-        itemCount =
-          typeof data?.info?.media_count === 'number' ? data.info.media_count : null
-      }
-      const medias = Array.isArray(data?.medias) ? (data.medias as Array<Record<string, unknown>>) : []
-      for (const media of medias) {
-        const upper = media['upper'] as { name?: unknown } | undefined
-        push({
-          bvid: media['bvid'],
-          title: media['title'],
-          cover: media['cover'],
-          author: typeof upper?.name === 'string' ? upper.name : undefined,
-          duration: media['duration'],
-          type: media['type'],
-        })
-        if (items.length >= max) break
-      }
-      if (data?.has_more !== true || medias.length === 0) break
-      await sleepMs(LIST_PAGE_DELAY_MS)
-    }
-  } else if (kind === 'season') {
-    if (!options.mid) throw new Error('合集链接里缺少 UP 主 id，请换一条完整链接')
-    const pageSize = 30
-    for (let page = 1; items.length < max; page += 1) {
-      const res = await biliGet(
-        `${SEASON_ARCHIVES_API}?mid=${encodeURIComponent(options.mid)}` +
-          `&season_id=${encodeURIComponent(id)}&sort_reverse=false` +
-          `&page_size=${pageSize}&page_num=${page}&web_location=333.1387`,
-      )
-      if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
-      const data = res.data as
-        | {
-            archives?: unknown
-            meta?: { name?: unknown; cover?: unknown; total?: unknown }
-            page?: { total?: unknown }
-          }
-        | undefined
-      if (!name) {
-        name = typeof data?.meta?.name === 'string' ? data.meta.name : ''
-        cover = typeof data?.meta?.cover === 'string' ? data.meta.cover : null
-        itemCount =
-          typeof data?.meta?.total === 'number'
-            ? data.meta.total
-            : typeof data?.page?.total === 'number'
-              ? (data.page.total as number)
-              : null
-      }
-      const archives = Array.isArray(data?.archives)
-        ? (data.archives as Array<Record<string, unknown>>)
-        : []
-      for (const arc of archives) {
-        push({
-          bvid: arc['bvid'],
-          title: arc['title'],
-          cover: arc['pic'],
-          duration: arc['duration'],
-        })
-        if (items.length >= max) break
-      }
-      if (archives.length === 0) break
-      await sleepMs(LIST_PAGE_DELAY_MS)
-    }
-  } else {
-    if (!options.mid) throw new Error('系列链接里缺少 UP 主 id，请换一条完整链接')
-    /** 系列内容接口**不返回标题**，元信息要单独打一次（Bili23 也是这么做的） */
-    const meta = await biliGet(
-      `${SERIES_META_API}?series_id=${encodeURIComponent(id)}&web_location=333.1387`,
-    )
-    if (meta.code === 0) {
-      const m = meta.data?.['meta'] as
-        | { name?: unknown; total?: unknown; mid?: unknown }
-        | undefined
-      name = typeof m?.name === 'string' ? m.name : ''
-      itemCount = typeof m?.total === 'number' ? m.total : null
-    }
-    const pageSize = 30
-    for (let page = 1; items.length < max; page += 1) {
-      const res = await biliGet(
-        `${SERIES_ARCHIVES_API}?mid=${encodeURIComponent(options.mid)}&current_mid=0` +
-          `&series_id=${encodeURIComponent(id)}&only_normal=true&sort=desc` +
-          `&ps=${pageSize}&pn=${page}`,
-      )
-      if (res.code !== 0) throw new Error(listErrorMessage(res.code, res.message ?? ''))
-      const data = res.data as { archives?: unknown } | undefined
-      const archives = Array.isArray(data?.archives)
-        ? (data.archives as Array<Record<string, unknown>>)
-        : []
-      for (const arc of archives) {
-        push({
-          bvid: arc['bvid'],
-          title: arc['title'],
-          cover: arc['pic'],
-          duration: arc['duration'],
-        })
-        if (items.length >= max) break
-      }
-      if (archives.length === 0) break
-      await sleepMs(LIST_PAGE_DELAY_MS)
-    }
-  }
-
-  /**
-   * 合集 / 系列：逐条没有作者，但整个列表只有一个作者 —— 查一次回填
-   *
-   * 收藏夹不走这里（它每条都带 `upper.name`，且收藏夹里本来就可能是不同 UP 主，
-   * 拿一个名字套全部是错的）。
-   */
-  if (kind !== 'fav' && options.mid && items.some((item) => !item.author)) {
-    const author = await fetchUserName(options.mid)
-    if (author) {
-      for (const item of items) {
-        if (!item.author) item.author = author
-      }
-    }
+    items.push(...one.items)
+    skipped += one.skipped
+    if (!one.hasMore) break
+    await sleepMs(LIST_PAGE_DELAY_MS)
   }
 
   return {
@@ -2046,8 +2172,8 @@ export const fetchBiliList = async (
     mid: options.mid,
     name: name || '未命名列表',
     cover,
-    itemCount: itemCount ?? items.length,
-    items,
+    itemCount: total ?? items.length,
+    items: items.slice(0, max),
     skipped,
   }
 }
@@ -2210,6 +2336,16 @@ export const parseListInput = (text: string): { kind: BiliListKind; id: string; 
   /** 系列详情页：space.bilibili.com/{mid}/channel/seriesdetail?sid={id} */
   m = /space\.bilibili\.com\/(\d+)\/channel\/seriesdetail\?(?:[^\s]*&)?sid=(\d+)/i.exec(raw)
   if (m) return { kind: 'series', id: m[2], mid: m[1] }
+
+  /**
+   * UP 主空间：space.bilibili.com/{mid} [/video | /upload/video | /dynamic | ?spm=…]
+   *
+   * 放在最后：`/lists/…`、`/favlist`、`/channel/…` 这些更具体的形态
+   * 已经先被上面几条吃掉了，到这里剩下的都是「整个投稿列表」。
+   * `id` 和 `mid` 都是那个 mid —— 投稿接口的列表 id 就是 UP 本人。
+   */
+  m = /space\.bilibili\.com\/(\d+)(?:[/?#]|$)/i.exec(raw)
+  if (m) return { kind: 'space', id: m[1], mid: m[1] }
 
   return null
 }

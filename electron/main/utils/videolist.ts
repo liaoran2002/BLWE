@@ -40,13 +40,14 @@
 import type {
   VideoImportPreview,
   VideoListItem,
+  VideoListPageResult,
   VideoListRecord,
   VideoListSyncMode,
   VideoListSyncResult,
   VideoMetaInput,
 } from '@common/types/playlist'
-import { fetchBiliList, parseVideoInput } from '../biliApi'
-import type { BiliListDetail, BiliListKind } from '../biliApi'
+import { fetchBiliList, fetchBiliListPage, listPageSize, parseVideoInput } from '../biliApi'
+import type { BiliListItem, BiliListKind } from '../biliApi'
 import { classifyDropInput } from './dropInput'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -69,21 +70,15 @@ interface VideoListDbRow {
   name: string
   cover: string | null
   item_count: number | null
+  loaded_page: number
+  has_more: number
+  skipped_total: number
   sync_mode: string
   sync_interval_ms: number
   last_sync_at: number | null
   last_index: number
   created_at: number
   updated_at: number
-}
-
-/** `videolist_items` 一行（判断「保留还是重建」只看 favorites / origin） */
-interface ItemRow {
-  bvid: string
-  ord: number
-  favorites: number
-  origin: string
-  added_at: number
 }
 
 const isLocalKind = (kind: string): boolean => kind === 'local'
@@ -114,12 +109,18 @@ export const toVideoSyncMode = (raw: unknown): VideoListSyncMode => {
  */
 const toRecord = (row: VideoListDbRow, defId: string = defaultListId()): VideoListRecord => ({
   id: row.id,
-  kind: (['season', 'series', 'local'].includes(row.kind) ? row.kind : 'fav') as VideoListRecord['kind'],
+  kind: (['season', 'series', 'space', 'local'].includes(row.kind)
+    ? row.kind
+    : 'fav') as VideoListRecord['kind'],
   sourceId: row.source_id,
   mid: row.mid,
   name: row.name,
   cover: row.cover,
   itemCount: row.item_count,
+  loadedPage: row.loaded_page ?? 0,
+  /** 老库里没有这两列时（就地补列的默认值）：当作「还有下一页、没跳过任何条目」 */
+  hasMore: (row.has_more ?? 1) !== 0,
+  skippedTotal: row.skipped_total ?? 0,
   syncMode: toVideoSyncMode(row.sync_mode),
   syncIntervalMs: row.sync_interval_ms ?? 0,
   lastSyncAt: row.last_sync_at,
@@ -140,7 +141,8 @@ export const getVideoLists = (): VideoListRecord[] => {
   try {
     const rows = getDb()
       .prepare(
-        `SELECT id, kind, source_id, mid, name, cover, item_count,
+        `SELECT id, kind, source_id, mid, name, cover, item_count, loaded_page,
+                has_more, skipped_total,
                 sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at
            FROM videolists
           ORDER BY CASE WHEN kind = 'local' THEN 0 ELSE 1 END, created_at ASC`,
@@ -165,7 +167,8 @@ export const findVideoList = (id: string): VideoListRecord | null => {
   try {
     const row = getDb()
       .prepare(
-        `SELECT id, kind, source_id, mid, name, cover, item_count,
+        `SELECT id, kind, source_id, mid, name, cover, item_count, loaded_page,
+                has_more, skipped_total,
                 sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at
            FROM videolists WHERE id = ?`,
       )
@@ -279,68 +282,73 @@ const refreshCount = (db: ReturnType<typeof getDb>, listId: string): void => {
  *
  * 顺序重排后 `last_index` 由调用方按 bvid 重定位 —— 它记的是下标，会漂。
  */
-const applyRemoteItems = (
+/**
+ * 把一批条目**并到列表头部**
+ *
+ * ## 三条规则
+ *
+ * 1. **只增不减**：远端删掉的条目留在原地 —— 用户可能在播，而且我们只知道
+ *    「总数少了」不知道少的是哪几条。真正的清理发生在播放到那一条、发现它没了的时候。
+ * 2. **已在库里的跳过**（按 bvid 判重），不移动位置 —— 否则同步一次，用户手动
+ *    调过的浏览位置全乱。
+ * 3. **新的插在收藏区之后**：收藏（`favorites = 1`）是用户显式置顶的，永远排在最前；
+ *    新投稿插在置顶区末尾之后，不会把置顶顶下去。
+ *
+ * @returns 真正新增了几条
+ */
+const mergeHeadInto = (
   db: ReturnType<typeof getDb>,
   listId: string,
-  detail: BiliListDetail,
-): { added: number; removed: number } => {
-  const old = db
-    .prepare(
-      `SELECT bvid, ord, favorites, origin, added_at
-         FROM videolist_items WHERE list_id = ? ORDER BY ord ASC`,
-    )
-    .all(listId) as ItemRow[]
+  items: BiliListItem[],
+): number => {
+  const known = new Set(
+    (
+      db.prepare(`SELECT bvid FROM videolist_items WHERE list_id = ?`).all(listId) as Array<{
+        bvid: string
+      }>
+    ).map((row) => row.bvid),
+  )
+  const fresh = items.filter((item) => !known.has(item.bvid))
+  if (fresh.length === 0) return 0
 
-  for (const item of detail.items) {
-    upsertVideoMeta(db, item)
-  }
+  for (const item of fresh) upsertVideoMeta(db, item)
 
-  const remoteBvids = new Set(detail.items.map((item) => item.bvid))
-  const oldBvids = new Set(old.map((row) => row.bvid))
-  const kept = old.filter((row) => row.favorites === 1 || row.origin === 'local')
-  const keptBvids = new Set(kept.map((row) => row.bvid))
+  /** 置顶区结束的位置：新条目从这里开始往后排 */
+  const maxFav =
+    (
+      db
+        .prepare(
+          `SELECT COALESCE(MAX(ord), -1) AS m FROM videolist_items WHERE list_id = ? AND favorites = 1`,
+        )
+        .get(listId) as { m: number }
+    ).m ?? -1
+  const base = maxFav + 1
 
-  /** 远端还在、但本地没保留的 → 新增（顺序跟着某站） */
-  const incoming = detail.items.filter((item) => !keptBvids.has(item.bvid))
-  const added = incoming.filter((item) => !oldBvids.has(item.bvid)).length
-  const removed = old.filter((row) => !remoteBvids.has(row.bvid)).length
+  /** 非置顶的整体后移，腾出 `fresh.length` 个位置（置顶项不参与，它们留在最前） */
+  db.prepare(
+    `UPDATE videolist_items SET ord = ord + ? WHERE list_id = ? AND favorites = 0 AND ord >= ?`,
+  ).run(fresh.length, listId, base)
 
-  db.prepare(`DELETE FROM videolist_items WHERE list_id = ?`).run(listId)
   const insert = db.prepare(
     `INSERT INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, 0, 'sync', ?)`,
   )
   const now = Date.now()
-  const rows = [
-    ...kept.map((row) => ({
-      bvid: row.bvid,
-      favorites: row.favorites,
-      origin: row.origin,
-      addedAt: row.added_at,
-    })),
-    ...incoming.map((item) => ({
-      bvid: item.bvid,
-      favorites: 0,
-      origin: 'sync',
-      addedAt: now,
-    })),
-  ]
-  rows.forEach((row, index) => {
-    insert.run(listId, row.bvid, index, row.favorites, row.origin, row.addedAt)
-  })
-  refreshCount(db, listId)
-
-  /*
-   * 这里原来还有两段：给每个条目补一行 `song_videos`（`search_key = 'bv:<bvid>'`），
-   * 以及把移出列表的条目的那行假关系删掉。
-   *
-   * 都随「视频借用音乐搜索链路」一起删了（见 `types/playlist.ts` 顶部那段说明）：
-   * 视频条目现在只活在 `videolist_items` + `videos` 两张表里，
-   * `song_videos` 重新只表示「歌的候选」，不再装假关系。
-   */
-
-  return { added, removed }
+  fresh.forEach((item, index) => insert.run(listId, item.bvid, base + index, now))
+  return fresh.length
 }
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * 两页请求之间的间隔
+ *
+ * 计的是**上一页返回之后**再等这么久，不含请求本身耗时 —— 所以实际节奏是
+ * 「请求 0.8 秒 + 停顿 1.5 秒」。懒加载是后台行为，慢一点没人感觉得到，
+ * 但请求密集就会撞 412，那才是真影响使用。
+ */
+const PAGE_GAP_MS = 1500
+
 
 /**
  * 导入一个列表（拉取 + 落库）
@@ -356,11 +364,12 @@ export const addVideoList = async (
   sourceId: string,
   mid?: string,
 ): Promise<{ record: VideoListRecord; skipped: number; existed: boolean }> => {
-  const detail = await fetchBiliList(kind, sourceId, { mid, max: MAX_LIST_ITEMS })
-  if (detail.items.length === 0) {
+  /** 只拉第 1 页：剩下的按需加载（见 `appendVideoListPage`） */
+  const page = await fetchBiliListPage(kind, sourceId, { mid, page: 1 })
+  if (page.items.length === 0) {
     throw new Error(
-      detail.skipped > 0
-        ? `这个列表里没有可播放的普通视频（跳过了 ${detail.skipped} 个合集 / 番剧条目）`
+      page.skipped > 0
+        ? `这个列表里没有可播放的普通视频（跳过了 ${page.skipped} 个合集 / 番剧条目）`
         : '这个列表是空的，或者没有可见内容',
     )
   }
@@ -369,27 +378,26 @@ export const addVideoList = async (
   const now = Date.now()
   const db = getDb()
 
-  /**
-   * 先查一遍是不是已经有这个列表
-   *
-   * 主键是「kind + 平台 id」拼出来的，所以重复导入必然命中同一行 ——
-   * 这时候走的其实是**同步**（下面 `applyRemoteItems` 的合并规则会保住收藏与手动添加的条目），
-   * 记录下 `existed` 只是为了给提示语用（「已导入」还是「已同步」）。
-   */
+  /** 主键是「kind + 平台 id」，重复导入必然命中同一行 */
   const existing = db
     .prepare(`SELECT last_index, created_at FROM videolists WHERE id = ?`)
     .get(id) as { last_index: number; created_at: number } | undefined
 
+  let added = 0
   tx(() => {
     db.prepare(
       `INSERT INTO videolists
-         (id, kind, source_id, mid, name, cover, item_count,
+         (id, kind, source_id, mid, name, cover, item_count, loaded_page,
+          has_more, skipped_total,
           sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'off', 0, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'off', 0, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          name         = excluded.name,
          cover        = excluded.cover,
          item_count   = excluded.item_count,
+         has_more     = excluded.has_more,
+         /** 重新导入只重拉第 1 页，已加载那些页里跳过的条目数不能丢 */
+         skipped_total = MAX(videolists.skipped_total, excluded.skipped_total),
          mid          = COALESCE(excluded.mid, videolists.mid),
          last_sync_at = excluded.last_sync_at,
          updated_at   = excluded.updated_at`,
@@ -398,26 +406,29 @@ export const addVideoList = async (
       kind,
       sourceId,
       mid ?? null,
-      detail.name,
-      detail.cover,
-      detail.itemCount,
+      page.name || '未命名列表',
+      page.cover,
+      page.total ?? page.items.length,
+      page.hasMore ? 1 : 0,
+      page.skipped,
       now,
-      /** 重新导入时**保留**上次播到第几条 */
+      /** 重新导入时**保留**上次播到第几条与已加载进度（`loaded_page` 不在 DO UPDATE 里） */
       existing?.last_index ?? 0,
       existing?.created_at ?? now,
       now,
     )
 
-    applyRemoteItems(db, id, detail)
+    added = mergeHeadInto(db, id, page.items)
   })
 
   const record = findVideoList(id)
   if (!record) throw new Error('列表写入失败')
   console.log(
-    `[videolist] 已${existing ? '同步' : '导入'}《${record.name}》${detail.items.length} 条` +
-      (detail.skipped > 0 ? `（跳过 ${detail.skipped} 个不支持的条目）` : ''),
+    `[videolist] 已${existing ? '合并' : '导入'}《${record.name}》+${added} 条` +
+      `（库里 ${getVideoListItems(id).length} 条、远端 ${page.total ?? '?'} 条）` +
+      (page.skipped > 0 ? `，跳过 ${page.skipped} 个不支持的条目` : ''),
   )
-  return { record, skipped: detail.skipped, existed: !!existing }
+  return { record, skipped: page.skipped, existed: !!existing }
 }
 
 /**
@@ -441,21 +452,44 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
   }
 
   try {
-    const detail = await fetchBiliList(record.kind as BiliListKind, record.sourceId, {
-      mid: record.mid ?? undefined,
-      max: MAX_LIST_ITEMS,
-    })
-    if (detail.items.length === 0) {
+    const kind = record.kind as BiliListKind
+    const mid = record.mid ?? undefined
+    const pageSize = listPageSize(kind)
+
+    /** 先拉第 1 页：既拿新内容，也拿远端总数（用来判断「新增了多少条」） */
+    const first = await fetchBiliListPage(kind, record.sourceId, { mid, page: 1 })
+    if (first.items.length === 0) {
       return { id, name: record.name, ok: false, error: '这个列表现在没有任何可播放的视频' }
+    }
+
+    /**
+     * 远端比上次记的多出多少条，就补拉几页
+     *
+     * `item_count` 是**上次同步时的远端总数**（懒加载下必须用远端口径，
+     * 否则「还有多少条没加载」算不出来）。上限 10 页：一次补 400 条已经很夸张，
+     * 再多说明这列表该重新导入，而不是慢慢同步。
+     */
+    const prevTotal = record.itemCount ?? 0
+    const remoteTotal = first.total
+    const delta = remoteTotal !== null ? Math.max(0, remoteTotal - prevTotal) : 0
+    const extraPages = Math.min(10, Math.max(0, Math.ceil(delta / pageSize) - 1))
+
+    const incoming = [...first.items]
+    for (let index = 1; index <= extraPages; index += 1) {
+      /** 上一页返回之后再等，不含请求耗时 */
+      await sleep(PAGE_GAP_MS)
+      const next = await fetchBiliListPage(kind, record.sourceId, { mid, page: index + 1 })
+      incoming.push(...next.items)
+      if (!next.hasMore) break
     }
 
     /** 同步前正在播的那条（按 bvid 记，不按下标） */
     const playingBvid = getVideoListItems(id)[record.lastIndex]?.bvid ?? null
 
     const db = getDb()
-    let counts = { added: 0, removed: 0 }
+    let added = 0
     tx(() => {
-      counts = applyRemoteItems(db, id, detail)
+      added = mergeHeadInto(db, id, incoming)
 
       const total = (
         db.prepare(`SELECT COUNT(*) AS n FROM videolist_items WHERE list_id = ?`).get(id) as
@@ -466,10 +500,7 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
       /**
        * `last_index` 按 bvid 重定位
        *
-       * 三种情况与音乐歌单一致：
-       *  ① 那条还在 → 用它在新列表里的下标；
-       *  ② 那条被移除了 → 保留原下标并夹进范围（效果是「下一条顶上来」）；
-       *  ③ 旧列表本来就是空的 → 0。
+       * 头部插入了新条目 → 全体下标后移，不重定位的话下次打开就在播「上一条」。
        */
       let nextIndex = 0
       if (total > 0) {
@@ -484,22 +515,37 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
         nextIndex = Math.max(0, Math.min(nextIndex, total - 1))
       }
 
+      /**
+       * `has_more` 只在「第 1 页就说没有下一页」时写成 0（整个列表就一页）；
+       * 否则保持原值 —— 同步不推进 `loaded_page`，别把已经加载到底的又标回「还有」。
+       */
       db.prepare(
         `UPDATE videolists
-            SET name = ?, cover = ?, last_sync_at = ?, updated_at = ?, last_index = ?
+            SET name = ?, cover = ?, item_count = ?,
+                has_more = CASE WHEN ? = 0 THEN 0 ELSE has_more END,
+                last_sync_at = ?, updated_at = ?, last_index = ?
           WHERE id = ?`,
-      ).run(detail.name, detail.cover, Date.now(), Date.now(), nextIndex, id)
+      ).run(
+        first.name || record.name,
+        first.cover ?? record.cover,
+        remoteTotal ?? total,
+        first.hasMore ? 1 : 0,
+        Date.now(),
+        Date.now(),
+        nextIndex,
+        id,
+      )
     })
 
-    console.log(`[videolist] 已同步《${detail.name}》：+${counts.added}/-${counts.removed}`)
+    console.log(`[videolist] 已同步《${first.name || record.name}》：+${added}`)
     return {
       id,
-      name: detail.name,
+      name: first.name || record.name,
       ok: true,
-      count: getVideoListItems(id).length,
-      added: counts.added,
-      removed: counts.removed,
-      skipped: detail.skipped,
+      count: remoteTotal ?? getVideoListItems(id).length,
+      added,
+      removed: 0,
+      skipped: first.skipped,
     }
   } catch (err) {
     console.error('[videolist] 同步失败:', err)
@@ -509,6 +555,86 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
       ok: false,
       error: err instanceof Error ? err.message : '同步失败',
     }
+  }
+}
+
+/**
+ * 加载下一页
+ *
+ * 追加到**末尾**，不挤动已有顺序：用户正看的那一段不该跳。
+ * 只在平台列表上有意义 —— 本地列表没有远端。
+ */
+export const appendVideoListPage = async (id: string): Promise<VideoListPageResult> => {
+  const record = findVideoList(id)
+  if (!record) throw new Error('列表不存在')
+  if (isLocalKind(record.kind) || !record.sourceId) {
+    throw new Error('本地列表没有更多内容可加载')
+  }
+
+  const nextPage = (record.loadedPage ?? 0) + 1
+  const page = await fetchBiliListPage(record.kind as BiliListKind, record.sourceId, {
+    mid: record.mid ?? undefined,
+    page: nextPage,
+  })
+
+  const db = getDb()
+  let added = 0
+  tx(() => {
+    const known = new Set(
+      (
+        db.prepare(`SELECT bvid FROM videolist_items WHERE list_id = ?`).all(id) as Array<{
+          bvid: string
+        }>
+      ).map((row) => row.bvid),
+    )
+    const fresh = page.items.filter((item) => !known.has(item.bvid))
+    const maxOrd =
+      (
+        db
+          .prepare(`SELECT COALESCE(MAX(ord), -1) AS m FROM videolist_items WHERE list_id = ?`)
+          .get(id) as { m: number } | undefined
+      )?.m ?? -1
+
+    for (const item of fresh) upsertVideoMeta(db, item)
+    const insert = db.prepare(
+      `INSERT INTO videolist_items (list_id, bvid, ord, favorites, origin, added_at)
+       VALUES (?, ?, ?, 0, 'sync', ?)`,
+    )
+    const now = Date.now()
+    fresh.forEach((item, index) => insert.run(id, item.bvid, maxOrd + 1 + index, now))
+    added = fresh.length
+
+    db.prepare(
+      `UPDATE videolists
+          SET loaded_page = ?, item_count = ?, has_more = ?,
+              skipped_total = skipped_total + ?, updated_at = ?
+        WHERE id = ?`,
+    ).run(
+      nextPage,
+      page.total ?? record.itemCount,
+      page.hasMore ? 1 : 0,
+      page.skipped,
+      Date.now(),
+      id,
+    )
+  })
+
+  /** 库里现在一共多少条（不是「已加载多少条」—— 跳过的不算） */
+  const inDb = (
+    db.prepare(`SELECT COUNT(*) AS n FROM videolist_items WHERE list_id = ?`).get(id) as
+      | { n: number }
+      | undefined
+  )?.n ?? 0
+  console.log(
+    `[videolist] 《${record.name}》第 ${nextPage} 页：+${added} 条` +
+      `（库里 ${inDb} 条、远端 ${page.total ?? record.itemCount ?? '?'} 条）` +
+      (page.hasMore ? '' : '（已到底）'),
+  )
+  return {
+    added,
+    loadedPage: nextPage,
+    total: page.total ?? record.itemCount,
+    hasMore: page.hasMore,
   }
 }
 
@@ -534,9 +660,10 @@ export const createLocalList = (name?: string): VideoListRecord => {
   const now = Date.now()
   db.prepare(
     `INSERT INTO videolists
-       (id, kind, source_id, mid, name, cover, item_count,
+       (id, kind, source_id, mid, name, cover, item_count, loaded_page,
+        has_more, skipped_total,
         sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
-     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 'off', 0, NULL, 0, ?, ?)`,
+     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 0, 0, 0, 'off', 0, NULL, 0, ?, ?)`,
   ).run(id, finalName, now, now)
   const record = findVideoList(id)
   if (!record) throw new Error('新建本地列表失败')
@@ -840,9 +967,10 @@ export const convertVideoListToLocal = (id: string): { id: string; name: string 
   tx(() => {
     db.prepare(
       `INSERT INTO videolists
-         (id, kind, source_id, mid, name, cover, item_count,
+         (id, kind, source_id, mid, name, cover, item_count, loaded_page,
+          has_more, skipped_total,
           sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
-       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 'off', 0, NULL, ?, ?, ?)`,
+       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 0, 0, 0, 'off', 0, NULL, ?, ?, ?)`,
     ).run(newId, record.name, record.cover, record.itemCount, record.lastIndex, record.createdAt, now)
 
     /**
@@ -953,7 +1081,7 @@ const assertEditableList = (listId: string): VideoListRecord => {
 /**
  * 把一批条目**并进**一个本地列表（只增不删）
  *
- * 和 `applyRemoteItems`（同步用）的区别：那个是「按远端重建这个列表」；
+ * 和 `mergeHeadInto`（同步用）的区别：那个是「按远端重建这个列表」；
  * 这里是「把另一批东西加进来」—— 本地列表没有远端来源，不存在「远端删了本地也要删」。
  *
  * 追加到**末尾**：本地列表里的顺序是用户自己攒的，一次导入几十条不该把已有内容整体挤到后面。

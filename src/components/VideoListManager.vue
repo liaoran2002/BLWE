@@ -26,10 +26,14 @@
     empty-main-text="从左边选一个列表查看条目，或点「新建列表」从链接 / 收藏夹 / 订阅合集导入"
     :empty-rows-text="emptyRowsText"
     empty-search-text="没有匹配的视频"
+    :has-more="hasMore"
+    :remaining-count="remainingCount"
+    :loading-more="loadingMore"
     @create="startCreate"
     @sync-all="syncAll"
     @switch="void ui.openManager('mv')"
     @play="onRowPlay($event)"
+    @load-more="loadMore"
   >
     <template #form>
       <div v-if="creating" class="mgr-form">
@@ -404,6 +408,8 @@ export default defineComponent({
       /** 「添加视频」确认框的开关与目标列表 */
       importVisible: false,
       importTarget: { id: '', name: '' },
+      /** 正在拉下一页（懒加载） */
+      loadingMore: false,
       /** 右侧正在显示「编辑」表单 */
       editing: false,
       saving: false,
@@ -552,6 +558,27 @@ export default defineComponent({
         missingHint: `文件不在这个位置了：${item.localPath || '（路径未知）'}`,
       }));
     },
+    /**
+     * 这个列表还有没有没拉下来的条目
+     *
+     * 只看接口说的 `hasMore`，**不能**用 `itemCount > items.length`：
+     * 远端总数包含被跳过的合集 / 番剧 / 充电专属条目，那些永远进不了库，
+     * 拿数量比就永远「还差几条」，点下去拉回 0 条、页数照涨（无限请求）。
+     */
+    hasMore(): boolean {
+      const record = this.selected;
+      if (!record || record.kind === 'local') return false;
+      return record.hasMore === true;
+    },
+    /** 占位行文案里的「还有多少条」（减掉跳过的，才是真正还能看到的） */
+    remainingCount(): number {
+      const record = this.selected;
+      if (!record) return 0;
+      return Math.max(
+        0,
+        (record.itemCount ?? 0) - (record.skippedTotal ?? 0) - this.items.length,
+      );
+    },
     /** 空列表时的引导文案按类型分：本地列表要指去「添加视频」 */
     emptyRowsText(): string {
       return this.selected?.kind === 'local'
@@ -625,6 +652,25 @@ export default defineComponent({
       this.selectedId = id;
     },
     /**
+     * 加载下一页
+     *
+     * 不做并发保护之外的节流：弹窗里的滚动事件本身很密，`loadingMore` 就是闸门。
+     * 失败不弹错误框（后台行为），只在控制台留一行，滚动再触发时会重试。
+     */
+    async loadMore(): Promise<void> {
+      const record = this.selected;
+      if (!record || this.loadingMore || !this.hasMore) return;
+      this.loadingMore = true;
+      try {
+        await this.store.loadMore(record.id);
+        await this.loadItems(record.id);
+      } catch (err) {
+        console.warn('[videolist] 加载下一页失败', err);
+      } finally {
+        this.loadingMore = false;
+      }
+    },
+    /**
      * 这个视频列表**此刻是不是真的在播**
      *
      * 和歌单侧对称：`activeId` 只在「播放源是视频列表」时才有意义，
@@ -638,6 +684,7 @@ export default defineComponent({
       if (kind === 'local') return '本地';
       if (kind === 'season') return '合集';
       if (kind === 'series') return '系列';
+      if (kind === 'space') return 'UP 投稿';
       return '收藏夹';
     },
     onImgError(e: Event) {
@@ -967,7 +1014,7 @@ export default defineComponent({
       }
 
       // ② 三种导入来源 → (kind, sourceId, mid)
-      let kind: 'fav' | 'season' | 'series' | null = null;
+      let kind: 'fav' | 'season' | 'series' | 'space' | null = null;
       let sourceId = '';
       let mid: string | undefined;
 

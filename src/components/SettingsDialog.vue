@@ -2,7 +2,7 @@
   <el-dialog
     v-model="visible"
     title="设置"
-    width="600px"
+    width="900px"
     :show-close="false"
     align-center
   >
@@ -1477,7 +1477,8 @@ export default defineComponent({
 /* 左侧目录 */
 .st-nav {
   flex: none;
-  width: 76px;
+  /* 字号放到最大（+50%）时，四个字的目录项也不会被挤成两行 */
+  width: 96px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1486,6 +1487,7 @@ export default defineComponent({
 }
 .st-nav-item {
   padding: 6px 8px;
+  white-space: nowrap;
   border-radius: 6px;
   font-size: calc(13px * var(--fs));
   cursor: pointer;
@@ -1662,7 +1664,9 @@ export default defineComponent({
 }
 .st-name {
   font-size: calc(13px * var(--fs));
+  /* 标签永远单行：字号滑块拉到 +50% 时也不许折成两行 */
   flex: none;
+  white-space: nowrap;
 }
 /* 分值 + 删除按钮横排的那一列（已废弃：分值行和标签行已拆成两行） */
 /*
@@ -1775,14 +1779,22 @@ export default defineComponent({
   display: flex;
   align-items: center;
   gap: 10px;
-  flex: none;
+  /* 右边这一列吃掉剩余宽度：弹窗加宽后滑块跟着变长，而不是留一片空白 */
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-end;
 }
 .st-slider {
-  width: 180px;
-  flex: none;
+  /* 不再是固定 180px：跟着弹窗宽度走，窄也不会小于 180 */
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 180px;
+  max-width: 420px;
 }
 .st-value {
-  width: 42px;
+  /* 固定 42px 在 +50% 字号下会把 `+50%` 撑出格子 */
+  min-width: 52px;
+  white-space: nowrap;
   text-align: right;
   font-size: calc(12px * var(--fs));
   /* 数字等宽，拖动时不会左右跳 */

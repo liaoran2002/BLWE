@@ -439,6 +439,16 @@ export interface IpcChannelMap {
     params: { id: string; bvid: string; favorite: boolean }
     result: void
   }
+  /**
+   * 加载下一页（懒加载）
+   *
+   * 平台列表只先拉第 1 页，剩下的靠这个一页一页补：界面上「还有 N 条未加载」、
+   * 滚到底、播放快到头，都走它。本地列表没有远端，调用会报错。
+   */
+  'videolists:loadMore': {
+    params: { id: string }
+    result: import('./playlist').VideoListPageResult
+  }
   /** 重新同步（重新拉列表；`last_index` 按 bvid 重定位） */
   'videolists:sync': {
     params: { id: string }

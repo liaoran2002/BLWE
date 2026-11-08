@@ -154,7 +154,7 @@
 | `tray.ts` | 托盘状态上报 + 自绘菜单四条 + 任务栏进度 |
 | `biliApiHandlers.ts` | ★ **搜索 / 解析视频 / 收藏**，见下面单独一节 |
 | `playlist.ts` | 歌单三条：`get` / `save` / `sync` |
-| `videolists.ts` | ★ **某站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ getItems/ setIndex/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
+| `videolists.ts` | ★ **某站视频列表**：`api:parseListInput` / `api:myFavFolders` / `api:mySubLists` / `api:classifyDrop` + `videolists:list/ add/ remove/ sync/ **loadMore**/ getItems/ setIndex/ addItemToDefault/ importLocal` + **本地文件善后三条** `local:pickVideo` / `local:relocate` / `local:exists`，见下 |
 | `music.ts` | `music:getPlaylistDetail` + `music:importPlaylist` —— ★ 前者是**唯一的加工点**：归一化曲目字段 + 拼好歌单主键，见下 |
 | `cache.ts` | 缓存三条：`clearAll` / `getStats` / `prune` |
 
@@ -260,14 +260,17 @@ return { info, songs, total, page, limit, source, id }
 
 | 导出 | 作用 |
 | :--- | :--- |
-| `fetchBiliList(kind, id, { mid, max })` | 拉一个列表（内部自己分页 + 限速，三种来源共用一个返回形状 `BiliListItem[]`） |
+| `fetchBiliList(kind, id, { mid, max })` | 拉**整个**列表（循环调下面的 `fetchBiliListPage`，限速照旧）—— 只在「添加视频」这类必须一次拿全的地方用 |
+| `fetchBiliListPage(kind, id, { mid, page })` | 拉**一页**（收藏夹 / UP 投稿 40 条，合集 / 系列 30 条），返回 `BiliListPage`：`items / total / hasMore / name / cover / skipped`。列表名和封面只有第 1 页带回来。四种来源的条目都归一成 `BiliListItem` |
 | `fetchMyFavFolders()` | 「我创建的收藏夹」列表（新建列表 → 收藏夹，**需要登录**）；带 `cover` 供界面的封面网格用 |
 | `fetchMySubscribedLists()` | 「订阅合集」：`x/v3/fav/folder/collected/list` → 只留 `type = 21`（合集），拿 `id`（season_id）+ **作者** `mid` + `cover`；`mid = 0` 的失效合集跳过 |
-| `parseListInput(text)` | 从粘贴的链接里认出「类型 + id」（收藏夹 / 合集 / 系列；识别不出返回 `null`） |
+| `parseListInput(text)` | 从粘贴的链接里认出「类型 + id」（收藏夹 / 合集 / 系列 / **UP 主空间**，空间链接放在最后匹配，避免抢掉空间下的收藏夹、合集链接；识别不出返回 `null`） |
 
-- **三种来源写在一个函数里**：它们的返回形状必须一致，差异只在「打哪个接口、字段叫什么」；
-  拆成三个函数的话「分页 / 限速 / 跳过不支持条目 / 归一字段」要在三处各写一遍。
-- **必须限条数**：`max` 默认 500（13 个请求，够用且不容易触发风控）。
+- **四种来源写在一个函数里**：它们的返回形状必须一致，差异只在「打哪个接口、字段叫什么」；
+  拆成四个函数的话「分页 / 限速 / 跳过不支持条目 / 归一字段」要在四处各写一遍。
+  UP 主投稿（`space`）是唯一把 **id 和 mid 当同一个值**的来源，`mid` 缺省时就用 `id`。
+- **平台列表不再一次拉全**：导入 / 拖入只拉第 1 页，其余交给懒加载（见下面 `utils/videolist.ts`）。
+  `max = 500` 的闸门只剩「添加视频」预览这一条路（一次拿全才好去重、才好让用户确认）。
 - **`type=21`（合集）/ 番剧 / 课程条目会被跳过并计数**（第一版不支持），
   跳过的数量回传给界面提示，而不是静默少几条。
 - **时长有两种形状**：有的接口给数字、有的给 `"04:03"`，统一在 `readDuration()` 里转成秒。
@@ -286,7 +289,7 @@ return { info, songs, total, page, limit, source, id }
 | `song_videos` | **候选关系**：哪首歌的候选里有它 / 排第几 / 收藏没有；PK `(search_key, bvid)`；另有 `title_hl` 存带 `<em>` 的标题 |
 | `videos` | **视频实体 + 播放地址**，PK `bvid`，全局一份（同一个 bvid 被两首歌引用也只存一份 dash） |
 | `song_meta` | 每首歌的 `selected_bvid` + `search_login_state`，PK `search_key` |
-| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789`）：kind / source_id / mid / name / item_count / **sync_mode + sync_interval_ms**（和歌单同一套三档策略：手动 / 启动时 / 定时）/ last_index |
+| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）/ last_index |
 | `videolist_items` | 列表成员 + 顺序，PK `(list_id, ord)` |
 | `song_videos_view` | **视图**：把 `song_videos` ⨯ `videos` 还原成**旧 `videos` 的 15 列形状**（旧读路径一行不用改） |
 | `videos_meta` | **视图**：`song_videos_view` 去掉全部地址列的只读投影（列表类读取走它，省 27 KB/行） |
@@ -368,6 +371,13 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   > 在某个查询上报错」—— 运行时才炸，最难查。改哈希后「忘了升版本」不可能再发生。
 - **不做迁移**：本项目只有一个用户、数据层从未发布过。指纹不匹配就
   **把库里所有表 / 视图都 DROP 掉再重建**（数据清空，**从不写迁移代码**）。
+
+  > 唯一的例外是**「只加列」**（`patchAdditiveColumns`）：加列不搬数据、风险最低，
+  > 但代价是清空用户手里的列表和播放位置 —— 为两列不值。所以指纹对不上时先试着把
+  > `ADDITIVE_COLUMNS` 里缺的列 `ALTER TABLE` 上去，补成功就把指纹推到新值、**保留数据**。
+  > 补完还会按「本地条数 ≥ 远端总数」把已经加载完的列表标成 `has_more = 0`，
+  > 顺手把差额记进 `skipped_total`，否则升级后那些列表会白挂一行「继续加载」。
+  > 其余结构变化（改类型 / 删列）仍然丢弃重建，那张名单也必须跟着清空。
 
   > ⚠️ **DROP 清单是动态取的，不是手写的**：早先手写一份
   > 「`DROP VIEW videos_meta; DROP TABLE videos; DROP TABLE song_meta; …`」，
@@ -559,6 +569,18 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 | `setVideoListIndex(id, index)` | 记录播到第几条 |
 | `ensureDefaultVideoList({create})` | 取「默认列表」：设置 → 最早的本地列表 → 新建（见下） |
 | `addItemToDefaultList(input)` | 拖入单条视频：加进默认列表并返回 `listId` 供播放 |
+
+**平台列表是懒加载的（`item_count` 是远端口径）**：导入 / 拖入只拉**第 1 页**（收藏夹 40 条、合集系列 30 条），
+`loaded_page` 记已拉了几页，界面末尾一行「还有 N 条未加载 · 点击加载」，滚到底自动触发。
+播放时按**整分钟**补页（`playback.prefetchNextListPage`）：随机播放不知道下一条是谁，用播放时间当节拍才覆盖得到。
+两页之间间隔 1.5 秒，**从上一页返回之后开始算**，不含请求耗时。同步是「头部合并」：新的插在置顶（收藏）区之后，
+只增不减 —— 远端删掉的条目等播到它、发现它没了时才清（`removeLocalItemFromList`）。
+
+**「还有没有下一页」只信接口的 `has_more`，不能用条数比**：远端 `item_count` 包含被跳过的合集 / 番剧 /
+充电专属条目（`page.skipped`，永远进不了库），拿 `item_count > 本地条数` 会得出「永远还差几条」，
+点下去拉回 0 条、`loaded_page` 照涨，变成无限请求。所以每页拉完把 `has_more` 和累加的 `skipped_total`
+一起写库；界面占位行只看 `has_more`，「还有 N 条」= `item_count - skipped_total - 本地条数`。
+播放补页的闸门也换成 `list.hasMore`（原来用 `itemCount`，总数未知的列表会永远不补页）。
 
 **导入为什么必须一个事务**：中途失败不能留下「列表有 500 条、但只有前 200 条能播」
 这种半截状态 —— 那种状态用户完全看不出原因。
@@ -1147,7 +1169,7 @@ queue 只回答「列表里有什么」。依赖方向因此是 `playback → qu
 | `SleepTimerPanel.vue` | 定时暂停弹窗（时长草稿 + 三个复选框，**只有确认才写回 store**） |
 | `ManagerDialog.vue` | **两个管理器共用的弹窗**（960 宽 / 内容区 62vh）：标题栏、左列表（含「默认」「本地」「平台」标签、正在播放圆点、同步中转圈）、右侧三态（表单 / 详情 / 空态）、搜索、**条目行**、空态、底部「新建 / 全部同步 / 换个管理器」。它不知道歌和视频的区别 —— 只认 `src/types/manager.ts` 里归一化过的数据；表单、详情头按钮、行尾按钮通过 `#form` / `#actions` / `#row-actions` 三个 slot 交给调用方。**样式不 scoped**，类名统一 `mgr-` 前缀，这样父组件写 `<div class="mgr-field">` 就能直接复用字段样式 |
 | `PlaylistManager.vue` | 歌单管理：只提供数据（`shellLists` / `shellDetail` / `shellRows`）与表单 —— 表单内容**原样**交给主进程、不做字段转换（见下）；**按歌单类型分流**（平台歌单只给同步方式 + 「转成本地歌单」，本地歌单给改名 + 链接导入器）；详情头按钮 `同步 · 编辑 · 从这里播放 · 删除`；**本地歌单的曲目行尾有「×」可删单条**（平台歌单不渲染，删除会走 `store.removeSongAt`，按**下标**删，正在播则重载队列）。UI 全部由 `ManagerDialog` 渲染，**没有自己的样式块** |
-| `VideoListManager.vue` | **视频管理**：只提供数据与表单/按钮。**「新建列表」一张表单收口四种来源**（空列表 / 粘贴链接 / 收藏夹 / 订阅合集，后两者是**封面网格**选片、选中高亮）；详情头按钮 `同步（仅平台）· 编辑 · 添加视频（仅本地）· 从这里播放 · 删除`；**「添加视频」走 `VideoImportDialog` 先预览再落库**（单条是视频详情，合集/收藏夹是列表详情 + 每条视频）；行尾走 `#row-actions`：收藏（置顶）/ 定位 / 移除；**本地文件丢失的条目置灰 + 「文件丢失」标 + 「定位」重选路径**。样式只留视频独有的三块（行尾按钮、收藏夹/订阅封面网格、`<code>`） |
+| `VideoListManager.vue` | **视频管理**：只提供数据与表单/按钮。**「新建列表」一张表单收口四种来源**（空列表 / 粘贴链接 / 收藏夹 / 订阅合集，后两者是**封面网格**选片、选中高亮）；**同步方式三选一**（手动 / 启动时 / 定时 + 间隔），本地列表没有这一栏；详情头按钮 `同步（仅平台）· 编辑 · 添加视频（仅本地）· 从这里播放 · 删除`；**「添加视频」走 `VideoImportDialog` 先预览再落库**（单条是视频详情，合集/收藏夹是列表详情 + 每条视频）；行尾走 `#row-actions`：收藏（置顶）/ 定位 / 移除；**本地文件丢失的条目置灰 + 「文件丢失」标 + 「定位」重选路径**。样式只留视频独有的三块（行尾按钮、收藏夹/订阅封面网格、`<code>`） |
 | `VideoImportDialog.vue` | 「添加视频」确认框（贴链接 → 预览 → 确认落库）。预览只读，取消不留痕迹；确认后写的是**本地列表**（单条置顶、一批追加末尾），不涉及歌曲搜索 |
 | `SongVideoListDialog.vue` | 列表面板，两种形态按 `listType` 切换：`songList` 歌单（MV）/ `videoList` 视频列表（MV = 这首歌的备选，OV = 当前合集）；点一行 / 刷新 / 爱心 / 加号都直接调 store |
 | `DropOverlay.vue` | 拖入遮罩（整窗虚线框 + 「松手即可导入并播放」），`dropActive` / `dropBusy` 来自 store |
@@ -1176,6 +1198,11 @@ queue 只回答「列表里有什么」。依赖方向因此是 `playback → qu
 - **左栏是「目录」不是 Tab**：注释给了理由「切换会让人找不到刚看过的那一项」
   （设置项要对照着调，如「时长容差」与「降级阈值」）+
   **用户原话「不要点一下就像换了个页面一样」**。
+
+- **界面字号滑条（`ui.fontScale`）**：`el-slider` 存的是百分比（`-50 ~ +50`，步进 10），
+  这里只负责写设置项；落到界面是 `utils/uiTheme.ts` 的 `--fs`，各组件字号写 `calc(Npx * var(--fs))`。
+  放大只影响弹窗里的字（理由与 Element Plus 覆盖见 ARCHITECTURE.md「界面字号」）。设置页整体加宽过，
+  就是给最大字号留的余量 —— 别把宽度写回固定窄值，字号拉到 +50% 会换行。
 
 - **`scrollToSection` 刻意不用 `scrollIntoView`**：它会把**所有可滚祖先**都滚一遍，
   包括弹窗外面那层，整个对话框跟着动。改成手算 `scrollTop` 只动一个容器。
@@ -1262,7 +1289,7 @@ presetId = detail.id                                // 已经是 tx_8153225605
 | :--- | :--- |
 | `setting.ts` | 配置的**响应式副本**（持久化在主进程，见「配置的读写与广播」） |
 | `playlists.ts` | 歌单副本 + 同步编排；**默认歌单删不掉**（`removePlaylist` 返回 `false`）；`updatePlaylist` 按类型剔字段（平台只留 `sync`、本地不留链接与同步）；`convertToLocal` 换 id 并重映射 `currentId` |
-| `videoLists.ts` | **某站视频列表副本**：列表 / 条目 / 同步 / 本地列表 / 收藏，以及 `activeId`（当前在播哪个列表，`''` = 音乐歌单） |
+| `videoLists.ts` | **某站视频列表副本**：列表 / 条目 / 同步 / 本地列表 / 收藏，以及 `activeId`（当前在播哪个列表，`''` = 音乐歌单）。**懒加载**：`loadMore(id)` 拉下一页（`loadingPageId` 挡并发，同一列表同时只发一页）；**三档同步**：`syncMany(ids)` / `syncAll()` / `syncOnStartupIfNeeded()` / `getDueSyncIds()`，判据 `isVideoListAutoSyncable` / `isVideoListSyncDue` 和歌单共用一套语义 |
 
 **`videoLists.ts` 与 `playlists.ts` 是并列的**（不是一个 store 里加个 `kind` 字段）：
 两者的表、id、同步方式都不同，混在一起会让「当前是哪种来源」变成一堆
@@ -1308,7 +1335,7 @@ const addPlaylist = async (input: {
 | :--- | :--- |
 | `dashPlayer.ts` | ★ MSE（dash）分片调度 |
 | `sleepTimer.ts` | ★ 定时暂停 / 定时关闭：倒计时 + 冻结 + 「播到 0-3 秒」判定 |
-| `uiTheme.ts` | 主题令牌（CSS 变量）：颜色 / 毛玻璃 / **闲置透明度** / 深浅判定 |
+| `uiTheme.ts` | 主题令牌（CSS 变量）：颜色 / 毛玻璃 / **闲置透明度** / **界面字号 `--fs`** / 深浅判定 |
 | `image.ts` | 图片地址规整 |
 | `plain.ts` | 深度解包（去响应式，写盘前） |
 | `title.ts` | 标题净化（只留 `<em>`） |
@@ -2288,6 +2315,7 @@ apply 相撞时，两次 apply 会交错 —— 先进壁纸那次在 attach 前
 
 | 设置项 | 存什么 | 落到哪 | 要点 |
 | :--- | :--- | :--- | :--- |
+| `ui.fontScale`（界面字号） | **百分比 -50 ~ +50**（步进 **10**，0 = 原样） | `src/utils/uiTheme.ts` → `--fs = 1 + 值/100`（无单位数字）；各组件写 `font-size: calc(13px * var(--fs))` | 只改**弹窗界面**（管理 / 列表 / 设置 / 关于）的字号，标题栏、控制栏、**托盘菜单都不跟着变**（托盘是主进程自己渲染的 `tray-menu.html`）。放大的只是字，行高与间距不动 |
 | `common.idleOpacity`（控制栏闲置透明度） | **百分比 0-100**（步进 **10**） | `src/utils/uiTheme.ts` → `--ui-idle-opacity`（**除 100**，`opacity` 收小数） | 只管**闲置态**；悬停时 CSS 写死 `opacity: 1`（`VideoControls.vue`）。与 `glassTransparency` 是两回事：那个管玻璃**底色**、悬停前后都一样 |
 | `common.autoLaunch`（开机自动启动） | 布尔，默认 `false` | 系统启动项（`app.setLoginItemSettings`） | **不落 CSS**；每次启动重写一遍（便携版挪位置后能自动纠正）；开发模式强制关 |
 | `player.autoDowngradeOnStall`（卡顿自动降低清晰度） | 布尔，默认 `false` | **不落 CSS**，只在 `App.vue` 的 `recoverFromStall` 里读 | **只管「降清晰度」那一步**；换备用源 / 降 durl 始终自动做。关着时提示「建议降到 XXX」而不是硬降 |

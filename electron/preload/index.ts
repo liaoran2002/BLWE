@@ -249,6 +249,8 @@ const api = {
     rendererInvoke('videolists:removeItem', { id, bvid }),
   setVideoListItemFavorite: (id: string, bvid: string, favorite: boolean): Promise<void> =>
     rendererInvoke('videolists:setFavorite', { id, bvid, favorite }),
+  loadMoreVideoListPage: (id: string) =>
+    rendererInvoke('videolists:loadMore', { id }),
   syncVideoList: (id: string): Promise<VideoListSyncResult> =>
     rendererInvoke('videolists:sync', { id }),
   getVideoListItems: (id: string): Promise<VideoListItem[]> =>

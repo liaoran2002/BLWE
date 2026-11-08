@@ -431,7 +431,7 @@ export interface PlaylistSaveParams {
  * 刻意**不包含**「稍后再看 / 历史 / UP 主投稿」：那些接口的鉴权与分页各不相同，
  * 第一版只做「公开可访问、且返回字段最规整」的三种。
  */
-export type VideoListKind = 'fav' | 'season' | 'series' | 'local'
+export type VideoListKind = 'fav' | 'season' | 'series' | 'space' | 'local'
 
 /**
  * 条目来源
@@ -449,6 +449,18 @@ export type VideoListOrigin = 'sync' | 'local'
  *  - `PlaylistRecord.songs` 是「歌」，还要再经过搜索才能变成视频；
  *  - 这里的成员**直接就是视频**（bvid），成员存在 `videolist_items`。
  */
+/** 「加载下一页」的结果（懒加载） */
+export interface VideoListPageResult {
+  /** 这一页真正新增了几条（重复的会跳过） */
+  added: number
+  /** 现在加载到第几页 */
+  loadedPage: number
+  /** 远端总数；接口没给时为 null */
+  total: number | null
+  /** 还有下一页吗 */
+  hasMore: boolean
+}
+
 /** 视频列表的同步策略，取值与音乐歌单的 `PlaylistSyncMode` 对齐 */
 export type VideoListSyncMode = 'off' | 'startup' | 'interval'
 
@@ -474,6 +486,23 @@ export interface VideoListRecord {
   syncMode: VideoListSyncMode
   /** 定时同步的间隔（毫秒）；只有 `interval` 模式有意义，其余为 0 */
   syncIntervalMs: number
+  /**
+   * 已加载到第几页（0 = 还没拉过内容）
+   *
+   * 平台列表是**懒加载**的：`itemCount` 是远端总数，这里记的是"本地已经拉下几页"。
+   * 下一批要拉的页码 = `loadedPage + 1`。本地列表恒为 0（没有远端）。
+   */
+  loadedPage: number
+  /**
+   * 接口说的「还有下一页吗」
+   *
+   * **判断「还能不能加载」只能用这个**，不能用 `itemCount > 本地条数`：
+   * 远端总数包含被跳过的合集 / 番剧 / 充电专属条目，那些永远进不了库。
+   * 每页拉完都会更新（见 `videolists.has_more`）。
+   */
+  hasMore: boolean
+  /** 累计跳过的条目数（合集 / 番剧 / 充电专属）；「还有 N 条」要减掉它 */
+  skippedTotal: number
   lastSyncAt: number | null
   /** 播到第几条（下标）；同步后由主进程按 bvid 重定位 */
   lastIndex: number
@@ -655,7 +684,7 @@ export type DropInputTarget =
    * 混在一起会让 `dropImportMusic` 里长出一个 `if (是单曲)`。
    */
   | { type: 'song'; url: string }
-  | { type: 'list'; kind: 'fav' | 'season' | 'series'; id: string; mid?: string }
+  | { type: 'list'; kind: Exclude<VideoListKind, 'local'>; id: string; mid?: string }
   /**
    * 单条视频：`input` 原样带回去交给 `parseVideoInput`
    *

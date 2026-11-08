@@ -267,6 +267,10 @@ export interface RendererAPI {
   /** 收藏 / 取消收藏（收藏 = 置顶；取消收藏位置不动） */
   setVideoListItemFavorite: (id: string, bvid: string, favorite: boolean) => Promise<void>
   /** 重新同步列表（`last_index` 会按 bvid 重定位，当前播放的仍是原来那条） */
+  /** 加载下一页（懒加载） */
+  loadMoreVideoListPage: (
+    id: string,
+  ) => Promise<import('./playlist').VideoListPageResult>
   syncVideoList: (id: string) => Promise<import('./playlist').VideoListSyncResult>
   /** 取列表条目（已在库里，不联网） */
   getVideoListItems: (id: string) => Promise<import('./playlist').VideoListItem[]>

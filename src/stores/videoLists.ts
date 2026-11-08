@@ -34,6 +34,7 @@ import type {
   VideoListItem,
   VideoListKind,
   VideoListRecord,
+  VideoListPageResult,
   VideoListSyncMode,
   VideoListSyncResult,
   VideoMetaInput,
@@ -112,6 +113,36 @@ export const useVideoListStore = defineStore('videoLists', () => {
     const ok = await api.renameVideoList(id, name)
     if (ok) await load()
     return ok
+  }
+
+  /**
+   * 加载下一页（懒加载）
+   *
+   * 平台列表只先拉第 1 页，其余按需补。`load()` 之后 `loadedPage` / `itemCount`
+   * 都刷新，界面据此算「还剩多少条没加载」。
+   */
+  /**
+   * 正在拉哪一页（同一列表同时只允许一个请求）
+   *
+   * 播放时的「整分钟自动加载」和界面上的滚动加载可能同时想拉 ——
+   * 不做闸门就会两发请求、重复写库。
+   */
+  const loadingPageId = ref<string | null>(null)
+
+  const isLoadingMore = (id: string): boolean => loadingPageId.value === id
+
+  const loadMore = async (id: string): Promise<VideoListPageResult> => {
+    if (loadingPageId.value === id) {
+      return { added: 0, loadedPage: 0, total: null, hasMore: true }
+    }
+    loadingPageId.value = id
+    try {
+      const result = await api.loadMoreVideoListPage(id)
+      await load()
+      return result
+    } finally {
+      loadingPageId.value = null
+    }
   }
 
   /**
@@ -312,6 +343,8 @@ export const useVideoListStore = defineStore('videoLists', () => {
     createLocal,
     rename,
     previewImport,
+    loadMore,
+    isLoadingMore,
     addItem,
     addItems,
     addItemToDefault,

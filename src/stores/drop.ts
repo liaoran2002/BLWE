@@ -62,7 +62,11 @@ export interface DropActions {
   handleDroppedText(text: string): Promise<void>;
   dropImportMusic(url: string): Promise<void>;
   dropImportSong(url: string): Promise<void>;
-  dropImportList(target: { kind: 'fav' | 'season' | 'series'; id: string; mid?: string }): Promise<void>;
+  dropImportList(target: {
+    kind: 'fav' | 'season' | 'series' | 'space';
+    id: string;
+    mid?: string;
+  }): Promise<void>;
   dropImportVideo(input: string): Promise<void>;
   handleDroppedFiles(files: File[]): Promise<void>;
   probeLocalDurations( listId: string, items: Array<{ bvid: string; url: string }>, ): Promise<void>;
@@ -241,7 +245,11 @@ export const dropActions: ThisType<DropContext> = {
   },
 
   /** 拖入的是 **某站列表**：导入（已有则同步）→ 从上次那个视频起播 */
-  async dropImportList(target: { kind: 'fav' | 'season' | 'series'; id: string; mid?: string }): Promise<void> {
+  async dropImportList(target: {
+    kind: 'fav' | 'season' | 'series' | 'space';
+    id: string;
+    mid?: string;
+  }): Promise<void> {
     this.uiStore.closeManagers();
     const { record, skipped, existed } = await this.videoListsStore.add(
       target.kind,

@@ -336,6 +336,7 @@ export interface PlaybackActions {
   onVideoLoaded(): void;
   onVideoPlayStateChange(): void;
   videoUpDate(): void;
+  prefetchNextListPage(): void;
   syncVideoQuality(): void;
   videoEnded(): void;
   scheduleBufferOverlay(): void;
@@ -1212,6 +1213,57 @@ export const playbackActions: ThisType<PlaybackContext> = {
     this.systemStore.updateMediaSession();
   },
 
+  /**
+   * 播到整分钟时，把「正在播的这个列表」的下一页拉下来
+   *
+   * ## 为什么用整分钟而不是「快播完了」
+   *
+   * 顺序播放可以看「离末尾还剩几条」，但**随机播放**根本不知道下一条是谁 ——
+   * 也许是已加载区里的任意一条，也许正好是没加载的那几条之一。
+   * 用播放时间当节拍就与播放顺序无关了：只要还在播、列表没加载完，
+   * 每分钟补一页，随机也能覆盖到。
+   *
+   * ## 三个闸门
+   *
+   * 1. `列表id@第几分钟` —— 同一分钟只触发一次（`timeupdate` 一秒好几次）；
+   * 2. 45 秒全局冷却 —— 换一条视频会从头计时，不然「1 分钟的短片」连播
+   *    会每条都触发一次，十几秒内打三四个请求；
+   * 3. 列表自己那条 `isLoadingMore` —— 界面滚动加载同时在拉时不重复发。
+   *
+   * 拉完把队列重载一次（`reloadCurrentPlaylistSongs` 只换数组、不打断播放），
+   * 新条目就进入 songs，随机表也会跟着重建。
+   */
+  prefetchNextListPage(): void {
+    if (this.queueStore.mode !== 'ov') return;
+    const listId = this.videoListsStore.activeId;
+    if (!listId) return;
+    const list = this.videoListsStore.find(listId);
+    if (!list || list.kind === 'local') return;
+    /**
+     * 到底了就不必再补
+     *
+     * 判据只能用接口给的 `hasMore`：远端总数包含被跳过的合集 / 番剧条目，
+     * 拿 `itemCount <= songs.length` 比会得出「已经齐了」的错结论。
+     */
+    if (!list.hasMore) return;
+    if (this.videoListsStore.isLoadingMore(listId)) return;
+
+    const minute = Math.floor(this.currentTime / 60);
+    if (minute < 1) return;
+    const key = `${listId}@${minute}`;
+    if (key === prefetchKey) return;
+    if (Date.now() - prefetchAt < 45_000) return;
+
+    prefetchKey = key;
+    prefetchAt = Date.now();
+    void this.videoListsStore
+      .loadMore(listId)
+      .then((result) => {
+        if (result.added > 0) void this.queueStore.reloadCurrentPlaylistSongs();
+      })
+      .catch((err) => console.warn('[videolist] 播放中自动加载下一页失败', err));
+  },
+
   videoUpDate(): void {
     const v = this.videoEl();
     if (!v) return;
@@ -1224,6 +1276,8 @@ export const playbackActions: ThisType<PlaybackContext> = {
     }
     // 少数源在 loadeddata 时尺寸还没就绪，这里补一次（拿到就不再重复算）
     if (!this.videoQuality) this.syncVideoQuality();
+    /** 播到整分钟时顺手把列表下一页拉下来（随机播放也能覆盖，见方法注释） */
+    this.prefetchNextListPage();
     // 节流记录播放进度，供下次续播
     this.systemStore.persistPlaybackStateThrottled();
     // 同步系统媒体控件的进度条
@@ -2378,6 +2432,15 @@ export const playbackActions: ThisType<PlaybackContext> = {
     return this.currentVideoCover();
   }
 };
+
+/**
+ * 「整分钟自动加载下一页」的节流记录
+ *
+ * 放模块级而不是 state：它不是界面状态，不需要响应式，也不该进重置键表
+ * （`ResetStateKey` 那一列）。`prefetchKey = 列表id@第几分钟`，同一分钟只触发一次。
+ */
+let prefetchKey = ''
+let prefetchAt = 0
 
 export const usePlaybackStore = defineStore<
   'playback',

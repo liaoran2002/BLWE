@@ -23,6 +23,7 @@ import {
 } from '../utils/localVideo'
 import {
   addItemToDefaultList,
+  appendVideoListPage,
   addLocalFilesToDefault,
   addLocalItem,
   addLocalItems,
@@ -109,6 +110,8 @@ export const registerVideoListHandlers = (): void => {
   mainHandle('videolists:setFavorite', ({ id, bvid, favorite }) =>
     setItemFavorite(id, bvid, favorite),
   )
+
+  mainHandle('videolists:loadMore', ({ id }) => appendVideoListPage(id))
 
   mainHandle('videolists:sync', ({ id }) => syncVideoList(id))
 

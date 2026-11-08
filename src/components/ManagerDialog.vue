@@ -151,7 +151,7 @@
             <span class="mgr-search-count">{{ filtered.length }} / {{ rows.length }}</span>
           </div>
 
-          <div class="mgr-items">
+          <div class="mgr-items" @scroll="onItemsScroll">
             <div
               v-for="row in filtered"
               :key="row.key"
@@ -196,6 +196,27 @@
             <div v-if="loadingRows" class="mgr-empty">正在读取条目…</div>
             <div v-else-if="filtered.length === 0" class="mgr-empty">
               {{ rows.length === 0 ? emptyRowsText : emptySearchText }}
+            </div>
+
+            <!--
+              懒加载占位行
+
+              平台列表只先拉第 1 页，这里是「还没拉下来的部分」。滚到底会自动加载，
+              点这一行也加载 —— 自动是为了顺手，手动是为了能控制（也方便验证）。
+            -->
+            <div
+              v-if="hasMore && !keyword"
+              class="mgr-loadmore"
+              :class="{ busy: loadingMore }"
+              @click="requestMore"
+            >
+              {{
+                loadingMore
+                  ? '正在加载…'
+                  : remainingCount > 0
+                    ? `还有 ${remainingCount} 条未加载 · 点击加载`
+                    : '继续加载下一页 · 点击加载'
+              }}
             </div>
           </div>
         </template>
@@ -249,8 +270,21 @@ export default defineComponent({
     emptyMainText: { type: String, default: '从左边选一个查看' },
     emptyRowsText: { type: String, default: '这里还没有条目' },
     emptySearchText: { type: String, default: '没有匹配的结果' },
+    /** 远端还有没拉下来的条目（平台列表的懒加载） */
+    hasMore: { type: Boolean, default: false },
+    /** 还有多少条没加载（用于占位行文案） */
+    remainingCount: { type: Number, default: 0 },
+    loadingMore: { type: Boolean, default: false },
   },
-  emits: ['update:visible', 'update:selectedId', 'create', 'sync-all', 'switch', 'play'],
+  emits: [
+    'update:visible',
+    'update:selectedId',
+    'create',
+    'sync-all',
+    'switch',
+    'play',
+    'load-more',
+  ],
   data() {
     return {
       keyword: '',
@@ -301,6 +335,22 @@ export default defineComponent({
   },
   methods: {
     formatDuration,
+    /**
+     * 滚到接近底部就预加载
+     *
+     * 留 80px 余量：等真正贴底才发请求，用户会看到一次明显停顿。
+     * 加载中不再触发（父组件那边也会有 `loadingMore` 挡住重复请求）。
+     */
+    onItemsScroll(event: Event): void {
+      if (!this.hasMore || this.loadingMore) return;
+      const el = event.target as HTMLElement;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > 80) return;
+      this.$emit('load-more');
+    },
+    requestMore(): void {
+      if (this.loadingMore) return;
+      this.$emit('load-more');
+    },
     /**
      * 记下「这个地址的封面加载不出来」
      *
@@ -667,6 +717,28 @@ export default defineComponent({
 }
 
 /* 空态 */
+.mgr-loadmore {
+  margin: 8px 2px 2px;
+  padding: 9px 10px;
+  text-align: center;
+  font-size: calc(12px * var(--fs));
+  color: var(--accent);
+  border: 1px dashed var(--panel-divider);
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+.mgr-loadmore:hover {
+  background: var(--panel-hover);
+  border-color: var(--accent);
+}
+.mgr-loadmore.busy {
+  cursor: default;
+  opacity: 0.6;
+  color: inherit;
+}
 .mgr-empty {
   padding: 24px 8px;
   text-align: center;

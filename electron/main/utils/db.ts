@@ -301,6 +301,18 @@ CREATE TABLE IF NOT EXISTS videolists (
   name         TEXT    NOT NULL,
   cover        TEXT,
   item_count   INTEGER,
+  -- 已加载到第几页（平台列表是懒加载的：item_count 是远端总数，这里记本地拉了几页）
+  loaded_page  INTEGER NOT NULL DEFAULT 0,
+  -- 接口说的「还有下一页吗」（1/0）
+  --
+  -- 不能用「item_count > 本地条数」代替：远端总数**包含被跳过的合集 / 番剧 / 充电专属**，
+  -- 那些条目永远进不了库，于是「还有 3 条未加载」会一直挂着、点了拉回 0 条、
+  -- loaded_page 还照涨，变成无限请求。唯一可信的是每页接口自己给的 has_more
+  -- （收藏夹是字段，合集 / 系列 / 投稿按「页数 × 页长 vs 总数」算）。
+  has_more     INTEGER NOT NULL DEFAULT 1,
+  -- 累计跳过的条目数（每页 page.skipped 累加）
+  -- 「还有 N 条」要减掉它，否则跳过的条目会永远算成「没加载」。
+  skipped_total INTEGER NOT NULL DEFAULT 0,
   -- 重新同步的策略，和音乐歌单同一套语义
   --   off      = 手动同步（只有点这个列表的「同步」才更新）
   --   startup  = 每次启动应用时同步
@@ -437,8 +449,9 @@ const getDbPath = (): string => path.join(app.getPath('userData'), DB_FILE_NAME)
  *  - 忘了"升版本"这件事**不可能再发生**（因为根本没有版本号要维护）；
  *  - 开发阶段反复改 schema 不用管版本，改完重启就生效。
  *
- * 代价：**每次改 schema 都会清库**（开发阶段无所谓，本来也没数据）。
- * 真要保留数据，把 `CREATE_TABLES_SQL` 改成增量 `ALTER TABLE` 即可。
+ * 代价：**除「加列」以外的 schema 变化仍会清库**。加列这类最常发生的变更会尽量
+ * 就地 `ALTER TABLE` 补上（见 `patchAdditiveColumns`）——用户手里有数据之后，
+ * 为两列把列表和播放位置清空不值得。
  */
 /**
  * 把建表语句规整成「只含结构」的形态：去掉 `--` 注释、压缩空白
@@ -589,6 +602,69 @@ const migrateVideosSplit = (database: SqliteDatabase, file: string): void => {
   }
 }
 
+/**
+ * 「只加列」的 schema 变更：能就地 ALTER 就不重建
+ *
+ * 指纹一变就 DROP 全库，对开发阶段没问题；但**用户手里已经有数据了**
+ * （列表、已加载的条目、播放位置），只为了加两列把库清掉不值。
+ *
+ * 这里只处理「加列」这一种情况：把缺的列 ALTER 上去，列加完结构就等于新 schema，
+ * 于是直接把 `user_version` 推到新指纹、跳过重建。
+ *
+ * ⚠️ 以后出现**改类型 / 删列 / 加索引以外**的结构变化，必须把这份名单清空
+ * （或改成更细的判断），否则这里会误判成「只差这几列」而漏掉真正的结构变化。
+ */
+const ADDITIVE_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
+  { table: 'videolists', column: 'has_more', ddl: `has_more INTEGER NOT NULL DEFAULT 1` },
+  { table: 'videolists', column: 'skipped_total', ddl: `skipped_total INTEGER NOT NULL DEFAULT 0` },
+]
+
+/**
+ * 补上 `ADDITIVE_COLUMNS` 里缺的列
+ *
+ * @returns 是否**真的补了**（没补就不用改指纹，让调用方走原来的重建流程）；
+ *          表还不存在时返回 `false` —— 那种情况交给 `CREATE_TABLES_SQL` 建。
+ */
+const patchAdditiveColumns = (database: SqliteDatabase): boolean => {
+  let patched = false
+  for (const item of ADDITIVE_COLUMNS) {
+    const columns = (database.pragma(`table_info("${item.table}")`) as Array<{ name: string }>).map(
+      (column) => column.name,
+    )
+    if (columns.length === 0) return false
+    if (columns.includes(item.column)) continue
+    database.exec(`ALTER TABLE "${item.table}" ADD COLUMN ${item.ddl}`)
+    console.log(`[db] 已补列 ${item.table}.${item.column}（保留原有数据）`)
+    patched = true
+  }
+  /**
+   * 补齐之后**顺手给老数据定一次「有没有到底」**
+   *
+   * 新列默认 `has_more = 1`（保守：宁可多显示一次占位行）。但有些列表在这次升级前
+   * 就已经全部加载完了（本地条数 ≥ 远端总数），留着 1 会让界面白挂一行「继续加载」。
+   * 这里按条数关系把它们标成 0，并把差额记进 `skipped_total`（差额就是当年被跳过的条目）。
+   */
+  if (patched) {
+    const ruled = database
+      .prepare(
+        `UPDATE videolists
+            SET has_more = 0,
+                skipped_total = MAX(
+                  skipped_total,
+                  MAX(0, COALESCE(item_count, 0) -
+                         (SELECT COUNT(*) FROM videolist_items WHERE list_id = videolists.id))
+                )
+          WHERE kind != 'local'
+            AND item_count IS NOT NULL
+            AND has_more = 1
+            AND item_count <= (SELECT COUNT(*) FROM videolist_items WHERE list_id = videolists.id)`,
+      )
+      .run()
+    if (ruled.changes > 0) console.log(`[db] 已标记 ${ruled.changes} 个列表「已加载到底」`)
+  }
+  return patched
+}
+
 const migrateSchema = (database: SqliteDatabase): void => {
   /**
    * ① 先处理「旧 videos 结构」
@@ -617,6 +693,16 @@ const migrateSchema = (database: SqliteDatabase): void => {
   /**
    * 指纹对不上 = 建表语句变了（开发期改了 schema）。
    *
+   * 先试「只加列」：补完列结构就等于新 schema，直接把指纹推上去、**保留数据**。
+   * 补不了（表不存在 / 不是加列这类变化）才走下面的丢弃重建。
+   */
+  if (patchAdditiveColumns(database)) {
+    database.pragma(`user_version = ${wanted}`)
+    console.log('[db] schema 已就地升级（未清空数据）')
+    return
+  }
+
+  /**
    * **直接丢弃重建**，不写逐字段搬运 —— 理由：
    *  - 本项目**只有一个用户**（作者本人），且数据层**从未发布过**，
    *    "升级"只发生在开发机上；
