@@ -21,7 +21,13 @@
  */
 import { randomUUID } from 'node:crypto'
 import { PLAYLIST_DATA_VERSION } from '@common/constants'
-import { getPlaybackSource } from './playback'
+import {
+  clearPlaybackSource,
+  getPlaybackSource,
+  relocatePlaybackIndex,
+  remapPlaybackSource,
+  saveProgress,
+} from './playback'
 import type {
   PlaylistRecord,
   PlaylistSaveParams,
@@ -92,7 +98,6 @@ const makeDefaultPlaylist = (): PlaylistRecord => {
     lastSyncAt: null,
     createdAt: now,
     updatedAt: now,
-    lastIndex: 0,
   }
 }
 
@@ -148,7 +153,6 @@ interface PlaylistDbRow {
   last_sync_at: number | null
   created_at: number
   updated_at: number
-  last_index: number
 }
 
 /**
@@ -255,8 +259,6 @@ const normalizeRecord = (input: Partial<PlaylistRecord>): PlaylistRecord | null 
     lastSyncAt: typeof input.lastSyncAt === 'number' ? input.lastSyncAt : null,
     createdAt: typeof input.createdAt === 'number' ? input.createdAt : now,
     updatedAt: typeof input.updatedAt === 'number' ? input.updatedAt : now,
-    lastIndex:
-      typeof input.lastIndex === 'number' && input.lastIndex >= 0 ? input.lastIndex : 0,
   }
   /** 本地歌单的链接 / 同步一律清掉（见 `applyLocalInvariant`） */
   return applyLocalInvariant(record)
@@ -322,7 +324,7 @@ const readPlaylistsFromDb = (): PlaylistRecord[] => {
   const playlistRows = db
     .prepare(
       `SELECT id, name, url, sync_mode, sync_interval_ms,
-              last_sync_at, created_at, updated_at, last_index
+              last_sync_at, created_at, updated_at
          FROM playlists
         ORDER BY created_at ASC`,
     )
@@ -398,7 +400,6 @@ const readPlaylistsFromDb = (): PlaylistRecord[] => {
       lastSyncAt: row.last_sync_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      lastIndex: row.last_index ?? 0,
     }),
   )
 }
@@ -449,8 +450,8 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
     const insertPlaylist = db.prepare(
       `INSERT INTO playlists
          (id, name, url, sync_mode, sync_interval_ms,
-          last_sync_at, created_at, updated_at, last_index)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_sync_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     /**
      * 曲目实体用 upsert：同一个 id 可能被多个歌单引用，
@@ -483,7 +484,6 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
         record.lastSyncAt,
         record.createdAt,
         record.updatedAt,
-        record.lastIndex,
       )
       record.songs.forEach((song, index) => {
         /**
@@ -693,20 +693,22 @@ export const appendSongToDefaultPlaylist = (
   )
   if (existingIndex >= 0) {
     /** 已经在了：只把播放位置挪到它，不重复插 */
-    def.lastIndex = existingIndex
     def.updatedAt = Date.now()
     savePlaylists({ playlists: data.playlists, currentId: def.id })
+    /** 位置是**播放状态**，写 `playback_state`，不写歌单本身（见那张表的注释） */
+    saveProgress({ kind: 'mv', id: def.id, index: existingIndex })
     return { record: getPlaylists().playlists.find((p) => p.id === def.id) ?? def, index: existingIndex, added: false }
   }
 
   def.songs = [...def.songs, song]
   /** 新歌接在最后，并把播放位置设成它 —— 拖进来就是想听这首 */
-  def.lastIndex = def.songs.length - 1
+  const nextIndex = def.songs.length - 1
   def.updatedAt = Date.now()
   const saved = savePlaylists({ playlists: data.playlists, currentId: def.id })
+  saveProgress({ kind: 'mv', id: def.id, index: nextIndex })
   return {
     record: saved.playlists.find((p) => p.id === def.id) ?? def,
-    index: def.lastIndex,
+    index: nextIndex,
     added: true,
   }
 }
@@ -720,8 +722,9 @@ export const appendSongToDefaultPlaylist = (
  * 就会造出一个「id 说是 QQ 歌单、实际没有链接也不能同步」的东西 ——
  * 两条互相矛盾的规则指向同一条记录，后面任何一处按 id 判断都会错。
  *
- * 所以换一个全新的 `pl_<uuid>`，旧 id 直接废弃。曲目、顺序、`lastIndex`
- * 全部保留（`playlist_songs` 只是把引用指过去，和改主键在同一个事务里）。
+ * 所以换一个全新的 `pl_<uuid>`，旧 id 直接废弃。曲目、顺序全部保留
+ * （`playlist_songs` 只是把引用指过去，和改主键在同一个事务里），
+ * 播放位置也跟着换 id（`remapPlaybackSource`，下标不动 —— 还是同一个列表）。
  *
  * ## 为什么不用 `writePlaylistsToDb`
  *
@@ -773,6 +776,8 @@ export const convertPlaylistToLocal = (id: string): PlaylistRecord => {
   target.updatedAt = Date.now()
   /** 正在播的就是它时，当前歌单指向也跟着换，否则高亮和进度都会丢 */
   if (data.currentId === id) data.currentId = nextId
+  /** 播放状态里的 id 是硬存的主键，换了 id 必须跟着改（下标不变，还是同一个列表） */
+  remapPlaybackSource('mv', id, nextId)
 
   console.log(`[playlist] 《${target.name}》已转成本地歌单（${id} → ${nextId}）`)
   return structuredClone(target)
@@ -907,6 +912,17 @@ export const savePlaylists = (params: PlaylistSaveParams): PlaylistStoreData => 
   data = { version: PLAYLIST_DATA_VERSION, currentId: nextCurrentId, playlists: normalized }
   writePlaylistsToDb(data)
   /**
+   * 正在播的歌单被删掉了 → 播放记录跟着清
+   *
+   * 不清的话 `playback_state` 会指着一个不存在的主键：下次启动读不到东西，
+   * 只能靠 `loadPlaybackSource` 的兜底回退 —— 那条兜底存在，但让死人指着活人
+   * 总归是脏数据（视频列表那边删列表时是直接 remap 的）。
+   */
+  const playback = getPlaybackSource()
+  if (playback.kind === 'mv' && !normalized.some((item) => item.id === playback.id)) {
+    clearPlaybackSource()
+  }
+  /**
    * 返回给渲染层的那份也要贴 `isDefault`
    *
    * 渲染层拿到之后会**直接覆盖**它本地的歌单数组（`playlists` store 的 `persist`），
@@ -1017,11 +1033,14 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
     target.source = detail.source
 
     /**
-     * ★ 把 `lastIndex` **重算成新列表里的位置**（这是「下标能当定位用」的前提）
+     * ★ 把「正在播的那一首」的位置**重算成新列表里的位置**
      *
      * 下标本身是脆弱的：同步后曲目会增删，第 N 个位置可能已经是别的歌。
      * 所以同步时必须把「用户上次听到的那首歌」的**新位置**算出来 ——
      * 此刻旧列表（`target.songs`）和新列表（`songs`）都在手上，正是做这件事的时机。
+     *
+     * 下标只在**这个歌单就是当前播放源**时有意义（`playback_state` 那一行），
+     * 别的歌单里那个数是历史残留，拿它算出来的位置纯属瞎猜。
      *
      * 三种情况：
      *  ① 那首歌还在 → 用它的新下标（可能是另一个位置了）
@@ -1030,20 +1049,23 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
      *  ③ 旧列表本来就是空的（新歌单）→ 0
      */
     const oldSongs = target.songs
-    const oldIndex = target.lastIndex
+    const playback = getPlaybackSource()
+    const isPlayingThis = playback.kind === 'mv' && playback.id === id
+    const oldIndex = isPlayingThis ? playback.index : 0
     const playedSong = oldSongs[oldIndex]
+    let nextIndex = 0
     if (songs.length === 0) {
-      target.lastIndex = 0
+      nextIndex = 0
     } else if (playedSong) {
       /** ① 按 `songId` 找它在新列表里的位置（不能用歌名 —— 同步可能改名）*/
       const newPos = songs.findIndex(
         (s) => songId(s).toLowerCase() === songId(playedSong).toLowerCase(),
       )
       /** ② 找不到（歌被删了）就保留原下标；两种情况都要夹进范围 */
-      target.lastIndex = Math.min(newPos >= 0 ? newPos : oldIndex, songs.length - 1)
-      target.lastIndex = Math.max(0, target.lastIndex)
+      nextIndex = Math.min(newPos >= 0 ? newPos : oldIndex, songs.length - 1)
+      nextIndex = Math.max(0, nextIndex)
     } else {
-      target.lastIndex = Math.min(Math.max(0, oldIndex), songs.length - 1)
+      nextIndex = Math.min(Math.max(0, oldIndex), songs.length - 1)
     }
 
     target.songs = songs
@@ -1060,6 +1082,8 @@ export const syncPlaylist = async (id: string): Promise<SyncResult> => {
      */
 
     writePlaylistsToDb(data)
+    /** 顺序已重排，把播放位置跟过去（不是当前源就什么都不做） */
+    relocatePlaybackIndex('mv', id, nextIndex)
     return { id, name: target.name, ok: true, count: songs.length, added, removed }
   } catch (err) {
     target.updatedAt = Date.now()

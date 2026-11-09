@@ -348,15 +348,12 @@ export interface PlaylistRecord {
   createdAt: number
   updatedAt: number
   /**
-   * 该歌单上次播放到**第几首**（下标，0 起）
+   * 注意：**没有 `lastIndex`**
    *
-   * ⚠️ 下标会被**重新同步**改变含义（曲目增删后第 N 个位置可能是别的歌）。
-   * 所以主进程在 `syncPlaylist` 里**必须重算**这个下标（按歌找新位置），
-   * 见那边的注释 —— 那才是这个字段能用的前提。
-   *
-   * 这首歌被删掉时保留原下标（夹进范围），效果是「下一首顶上来」。
+   * 「这个歌单上次播到第几首」是播放状态，不是歌单内容 —— 存这里的话，
+   * 整份覆盖的持久化（`savePlaylists` 先 DELETE 再全插）会拿渲染层内存里的
+   * 旧值把库里的新值冲掉。现在它只有一份：`playback_state.source_index`。
    */
-  lastIndex: number
   /**
    * 是不是**默认歌单**（拖入单曲的落点）
    *
@@ -504,8 +501,7 @@ export interface VideoListRecord {
   /** 累计跳过的条目数（合集 / 番剧 / 充电专属）；「还有 N 条」要减掉它 */
   skippedTotal: number
   lastSyncAt: number | null
-  /** 播到第几条（下标）；同步后由主进程按 bvid 重定位 */
-  lastIndex: number
+  /** 注意：**没有 `lastIndex`** —— 播到第几条在 `playback_state.source_index` */
 
   createdAt: number
   updatedAt: number

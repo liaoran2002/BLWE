@@ -105,7 +105,7 @@ Kotlin 原生反而**更直接**：ExoPlayer 本来就支持，UI 用 Compose，
 | :--- | ---: | :--- |
 | `main/utils/cache.ts` | 1125 | 搜索缓存 + 收藏 + 播放地址 + 过期清理 |
 | `main/ipc/biliApiHandlers.ts` | 877 | 搜索/解析的**编排**（缓存命中判断、合并收藏、写库前排序） |
-| `main/utils/playlist.ts` | 749 | 多歌单（增删改查、同步、按歌重算 `lastIndex`） |
+| `main/utils/playlist.ts` | 749 | 多歌单（增删改查、同步、按歌重算播放位置） |
 | `main/music/sources/wy.ts` | 321 | wy 歌单解析 |
 | `main/music/sources/tx.ts` | 261 | tx 歌单解析 |
 | `main/music/http.ts` | 208 | HTTP 层（自写，替代 LX 的 needle） |
@@ -152,7 +152,7 @@ session.cookies.get({})     ← 读登录 cookie（SESSDATA 等）
 | **某站 API**（签名/搜索/解析地址） | 1317 | ~900 | WBI 签名、`searchSongFiltered`（四级降级）、`extractDashStreams`、`readQualityOptions` |
 | **过滤排序**（`videoRank`） | 600 | ~450 | 纯逻辑逐行翻译（**必须与桌面行为一致**） |
 | **缓存**（`cache.ts`） | 1125 | ~600 | 桌面那套防抖/预热日志可省 |
-| **多歌单**（`playlist.ts`） | 749 | ~500 | 含同步、`lastIndex` 按歌重算 |
+| **多歌单**（`playlist.ts`） | 749 | ~500 | 含同步、播放位置按歌重算 |
 | **DB 层** | 456 | ~250 | DDL 搬 Room，DAO 重写 |
 | **歌单解析**（`music/*`） | 1092 | ~700 | 3 个音源 + wy 加密 |
 | **清晰度档位** | 140 | ~100 | |

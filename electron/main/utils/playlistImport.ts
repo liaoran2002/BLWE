@@ -46,8 +46,9 @@ export const importMusicPlaylist = async (
   /**
    * 已有 → 只换曲目与来源信息
    *
-   * `sync`（自动同步策略）、`name`、`lastIndex` 都不动：
-   * 用户拖入的意图是「我要看这个歌单」，不是「把歌单恢复出厂设置」。
+   * `sync`（自动同步策略）、`name` 都不动，**播放位置也不动**（它在
+   * `playback_state` 里，本来就不属于歌单记录）：用户拖入的意图是
+   * 「我要看这个歌单」，不是「把歌单恢复出厂设置」。
    */
   if (existing) {
     const updated: PlaylistRecord = {
@@ -79,7 +80,6 @@ export const importMusicPlaylist = async (
     lastSyncAt: now,
     createdAt: now,
     updatedAt: now,
-    lastIndex: 0,
   }
   const saved = savePlaylists({
     playlists: [...data.playlists, record],
@@ -101,8 +101,9 @@ export const importMusicPlaylist = async (
  * 默认歌单由 `appendSongToDefaultPlaylist` 保证存在（没有就现建、且删不掉），
  * 去重也在那边做（按 `songs.id` + `歌名-歌手` 两层，见那里的注释）。
  *
- * 返回的 `index` 就是要播的位置：主进程已经把默认歌单的 `lastIndex` 改成它，
- * 渲染层拿 `record.id` 调 `onPlaylistSwitch` 就会从这一首起播。
+ * 返回的 `index` 就是要播的位置：主进程已经把它写进 `playback_state`
+ * （`mv` + 默认歌单 id + 这个下标），渲染层拿 `record.id` 调 `onPlaylistSwitch`
+ * 就会从这一首起播。
  */
 export const importSongToDefault = async (
   url: string,

@@ -137,7 +137,6 @@ export const usePlaylistStore = defineStore('playlists', () => {
       lastSyncAt: now,
       createdAt: now,
       updatedAt: now,
-      lastIndex: 0,
     }
     playlists.value = [...playlists.value, record]
     currentId.value = record.id
@@ -255,22 +254,6 @@ export const usePlaylistStore = defineStore('playlists', () => {
     await persist()
   }
 
-  /**
-   * 记录当前歌单播放到第几首
-   *
-   * ⚠️ 下标会被**重新同步**改变含义（曲目增删后第 N 个位置可能是别的歌）。
-   * 所以主进程在 `syncPlaylist` 里会把它**重算**成新列表里的位置 ——
-   * 那是这个字段能当定位用的前提，见那边的注释。
-   */
-  const setLastIndex = async (index: number): Promise<void> => {
-    const target = current.value
-    if (!target || target.lastIndex === index) return
-    playlists.value = playlists.value.map((p) =>
-      p.id === target.id ? { ...p, lastIndex: index } : p,
-    )
-    await persist()
-  }
-
   /** 同步指定歌单（默认当前歌单）；重复歌曲由主进程固定去重 */
   const sync = async (ids?: string[]): Promise<SyncResult[]> => {
     const targetIds = ids ?? (currentId.value ? [currentId.value] : [])
@@ -346,7 +329,6 @@ export const usePlaylistStore = defineStore('playlists', () => {
     convertToLocal,
     removePlaylist,
     setCurrent,
-    setLastIndex,
     sync,
     syncAll,
     getStartupSyncIds,

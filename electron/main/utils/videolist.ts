@@ -53,7 +53,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, tx } from './db'
 import { getSetting, updateSetting } from './setting'
-import { remapPlaybackSource } from './playback'
+import { getPlaybackSource, relocatePlaybackIndex, remapPlaybackSource } from './playback'
 import { isLocalBvid, isLocalVideoFile, localBvidOfPath, localTitleOfPath } from './localVideo'
 
 /** 一个列表最多拉多少条（500 条收藏夹 = 13 个请求，已经够用且不容易触发风控） */
@@ -77,7 +77,6 @@ interface VideoListDbRow {
   sync_mode: string
   sync_interval_ms: number
   last_sync_at: number | null
-  last_index: number
   created_at: number
   updated_at: number
 }
@@ -125,7 +124,6 @@ const toRecord = (row: VideoListDbRow, defId: string = defaultListId()): VideoLi
   syncMode: toVideoSyncMode(row.sync_mode),
   syncIntervalMs: row.sync_interval_ms ?? 0,
   lastSyncAt: row.last_sync_at,
-  lastIndex: row.last_index ?? 0,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
   /** 默认列表（拖入单条视频的落点）：界面上不显示删除按钮 */
@@ -144,7 +142,7 @@ export const getVideoLists = (): VideoListRecord[] => {
       .prepare(
         `SELECT id, kind, source_id, mid, name, cover, item_count, loaded_page,
                 has_more, skipped_total,
-                sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at
+                sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at
            FROM videolists
           ORDER BY CASE WHEN kind = 'local' THEN 0 ELSE 1 END, created_at ASC`,
       )
@@ -170,7 +168,7 @@ export const findVideoList = (id: string): VideoListRecord | null => {
       .prepare(
         `SELECT id, kind, source_id, mid, name, cover, item_count, loaded_page,
                 has_more, skipped_total,
-                sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at
+                sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at
            FROM videolists WHERE id = ?`,
       )
       .get(id) as VideoListDbRow | undefined
@@ -281,7 +279,7 @@ const refreshCount = (db: ReturnType<typeof getDb>, listId: string): void => {
  * 也就是说：**你收藏的、你手动加的，同步不会删**；哪怕它在某站那边已经取消了收藏，
  * 只要本地还收藏着就留着（真要删就在列表里右键删掉）。
  *
- * 顺序重排后 `last_index` 由调用方按 bvid 重定位 —— 它记的是下标，会漂。
+ * 顺序重排后播放位置由调用方按 bvid 重定位（`relocatePlaybackIndex`）—— 它记的是下标，会漂。
  */
 /**
  * 把一批条目**并到列表头部**
@@ -381,10 +379,8 @@ export const addVideoList = async (
 
   /** 主键是「kind + 平台 id」，重复导入必然命中同一行 */
   const existing = db
-    .prepare(`SELECT last_index, created_at FROM videolists WHERE id = ?`)
-    .get(id) as
-    | { last_index: number; created_at: number }
-    | undefined
+    .prepare(`SELECT created_at FROM videolists WHERE id = ?`)
+    .get(id) as { created_at: number } | undefined
 
   let added = 0
   tx(() => {
@@ -392,8 +388,8 @@ export const addVideoList = async (
       `INSERT INTO videolists
          (id, kind, source_id, mid, name, cover, item_count, loaded_page,
           has_more, skipped_total,
-          sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'off', 0, ?, ?, ?, ?)
+          sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'off', 0, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          name         = excluded.name,
          cover        = excluded.cover,
@@ -415,8 +411,7 @@ export const addVideoList = async (
       page.hasMore ? 1 : 0,
       page.skipped,
       now,
-      /** 重新导入时**保留**上次播到第几条与已加载进度（`loaded_page` 不在 DO UPDATE 里） */
-      existing?.last_index ?? 0,
+      /** 重新导入时**保留**已加载进度（`loaded_page` 不在 DO UPDATE 里） */
       existing?.created_at ?? now,
       now,
     )
@@ -439,8 +434,8 @@ export const addVideoList = async (
  *
  * ## 必须先记住「现在播的是哪个 bvid」，再按新顺序找回它的位置
  *
- * `last_index` 是**下标**。收藏夹按收藏时间倒序，用户收藏一条新的，全体原点 +1 ——
- * 不重定位的话下次打开就在播「上一条」。
+ * 播放位置是**下标**（`playback_state.source_index`）。收藏夹按收藏时间倒序，
+ * 用户收藏一条新的，全体原点 +1 —— 不重定位的话下次打开就在播「上一条」。
  *
  * 这和音乐歌单 `syncPlaylist` 里那段是同一个坑，只是触发条件不同；
  * `playlist_songs` 那边靠 `toCacheKey` 反查，这里靠 bvid（更简单，因为条目天然唯一）。
@@ -486,11 +481,19 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
       if (!next.hasMore) break
     }
 
-    /** 同步前正在播的那条（按 bvid 记，不按下标） */
-    const playingBvid = getVideoListItems(id)[record.lastIndex]?.bvid ?? null
+    /**
+     * 同步前正在播的那条（按 bvid 记，不按下标）
+     *
+     * 下标只在**这个列表就是当前播放源**时有意义 —— 它在 `playback_state` 那一行，
+     * 别的列表自己不再存位置。
+     */
+    const playback = getPlaybackSource()
+    const playingIndex = playback.kind === 'ov' && playback.id === id ? playback.index : 0
+    const playingBvid = getVideoListItems(id)[playingIndex]?.bvid ?? null
 
     const db = getDb()
     let added = 0
+    let nextIndex = 0
     tx(() => {
       added = mergeHeadInto(db, id, incoming)
 
@@ -501,11 +504,10 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
       )?.n ?? 0
 
       /**
-       * `last_index` 按 bvid 重定位
+       * 播放位置按 bvid 重定位
        *
        * 头部插入了新条目 → 全体下标后移，不重定位的话下次打开就在播「上一条」。
        */
-      let nextIndex = 0
       if (total > 0) {
         if (playingBvid) {
           const pos = (
@@ -513,7 +515,7 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
               .prepare(`SELECT ord FROM videolist_items WHERE list_id = ? AND bvid = ?`)
               .get(id, playingBvid) as { ord: number } | undefined
           )?.ord
-          nextIndex = typeof pos === 'number' ? pos : Math.min(record.lastIndex, total - 1)
+          nextIndex = typeof pos === 'number' ? pos : Math.min(playingIndex, total - 1)
         }
         nextIndex = Math.max(0, Math.min(nextIndex, total - 1))
       }
@@ -526,7 +528,7 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
         `UPDATE videolists
             SET name = ?, cover = ?, item_count = ?,
                 has_more = CASE WHEN ? = 0 THEN 0 ELSE has_more END,
-                last_sync_at = ?, updated_at = ?, last_index = ?
+                last_sync_at = ?, updated_at = ?
           WHERE id = ?`,
       ).run(
         first.name || record.name,
@@ -535,10 +537,11 @@ export const syncVideoList = async (id: string): Promise<VideoListSyncResult> =>
         first.hasMore ? 1 : 0,
         Date.now(),
         Date.now(),
-        nextIndex,
         id,
       )
     })
+    /** 顺序已重排，把播放位置跟过去（不是当前源就什么都不做） */
+    relocatePlaybackIndex('ov', id, nextIndex)
 
     console.log(`[videolist] 已同步《${first.name || record.name}》：+${added}`)
     return {
@@ -665,8 +668,8 @@ export const createLocalList = (name?: string): VideoListRecord => {
     `INSERT INTO videolists
        (id, kind, source_id, mid, name, cover, item_count, loaded_page,
         has_more, skipped_total,
-        sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
-     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 0, 0, 0, 'off', 0, NULL, 0, ?, ?)`,
+        sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at)
+     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 0, 0, 0, 'off', 0, NULL, ?, ?)`,
   ).run(id, finalName, now, now)
   const record = findVideoList(id)
   if (!record) throw new Error('新建本地列表失败')
@@ -972,14 +975,13 @@ export const convertVideoListToLocal = (id: string): { id: string; name: string 
       `INSERT INTO videolists
          (id, kind, source_id, mid, name, cover, item_count, loaded_page,
           has_more, skipped_total,
-          sync_mode, sync_interval_ms, last_sync_at, last_index, created_at, updated_at)
-       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 0, 0, 0, 'off', 0, NULL, ?, ?, ?)`,
+          sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at)
+       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 0, 0, 0, 'off', 0, NULL, ?, ?)`,
     ).run(
       newId,
       record.name,
       record.cover,
       record.itemCount,
-      record.lastIndex,
       record.createdAt,
       now,
     )

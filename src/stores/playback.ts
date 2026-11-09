@@ -345,7 +345,7 @@ export interface PlaybackActions {
     id: string;
     name: string;
     songs: PlayItem[];
-    lastIndex: number;
+    index: number;
     lastPosition: number;
   } | null>;
   tryResume(): Promise<boolean>;
@@ -1400,25 +1400,22 @@ export const playbackActions: ThisType<PlaybackContext> = {
    * 取「当前播放源」的曲目
    *
    * 两个来源（某站视频列表 / 音乐歌单）在播放层长得一模一样，
-   * 差别只有两点：`songs` 从哪来、播到第几条记在哪张表。
-   * 这里一次抹平，续播和首启两条路就不用各写一遍分支 ——
-   * 否则「视频列表忘了写 last_index」这种 bug 只会出现在其中一条路上。
+   * 差别只有两点：`songs` 从哪来、`source_index` 指向哪个条目。
+   * 这里一次抹平，续播和首启两条路就不用各写一遍分支。
    */
   /**
    * 读「上次在播哪条线的哪个列表」以及它的曲目与位置
    *
-   * 两条来源在播放层长得一模一样，差别只有三点：`songs` 从哪来、`last_index`
-   * 记在哪张表、以及**类型是显式存的**（`playback_state.source_kind`）。
-   *
-   * 这里一次抹平，续播和首启两条路就不用各写一遍分支 ——
-   * 否则「歌单忘了写 last_index」这种 bug 只会出现在其中一条路上。
+   * 三样东西全在 `playback_state` 那一行里：`source_kind` 哪条线、
+   * `source_id` 哪个列表、`source_index` 第几条 —— 这里只是按 id 把曲目取出来。
+   * 列表自己不再存位置，所以不存在「库里的位置和内存里的位置不一致」这种事。
    */
   async loadPlaybackSource(): Promise<{
     kind: 'ov' | 'mv';
     id: string;
     name: string;
     songs: PlayItem[];
-    lastIndex: number;
+    index: number;
     lastPosition: number;
   } | null> {
     const source = await electronApi.getPlaybackSource();
@@ -1431,7 +1428,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
           id: record.id,
           name: record.name,
           songs,
-          lastIndex: record.lastIndex,
+          index: source.index,
           lastPosition: source.seconds,
         };
       }
@@ -1444,7 +1441,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
           id: record.id,
           name: record.name,
           songs: [...record.songs],
-          lastIndex: record.lastIndex,
+          index: source.index,
           lastPosition: source.seconds,
         };
       }
@@ -1461,7 +1458,8 @@ export const playbackActions: ThisType<PlaybackContext> = {
       id: fallback.id,
       name: fallback.name,
       songs: [...fallback.songs],
-      lastIndex: fallback.lastIndex,
+      /** 没有播放记录 = 从第一首开始，别拿一个别的列表的位置来凑 */
+      index: 0,
       lastPosition: source.seconds,
     };
   },
@@ -1482,11 +1480,10 @@ export const playbackActions: ThisType<PlaybackContext> = {
     /**
      * 回到该列表上次播放的位置
      *
-     * ⚠️ 下标本身会**被同步改变含义**（曲目增删后第 N 个位置可能是别的歌），
-     * 所以主进程在 `syncPlaylist` / `syncVideoList` 里会把它**重算**成
-     * 新列表里的位置 —— 这里只需要夹进范围。
+     * 下标是 `playback_state.source_index` 那一个数，主进程在同步 / 重排后
+     * 已经按 bvid / songId 重算过；这里只夹进范围。
      */
-    const index = Math.min(Math.max(0, source.lastIndex), source.songs.length - 1);
+    const index = Math.min(Math.max(0, source.index), source.songs.length - 1);
     this.queueStore.songs = source.songs;
     this.queueStore.listName = source.name;
     this.queueStore.currentIndex = index;

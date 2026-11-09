@@ -69,7 +69,8 @@ export const registerMusicHandlers = (): void => {
    * 拖入一首单曲 = 追加进默认歌单 + 设为当前
    *
    * 和上面那条的差别只在落点：那边整个歌单进来，这边一首歌进「默认歌单」。
-   * 播放位置由主进程顺手写好（`lastIndex` = 这首歌），渲染层拿 id 切过去就播它。
+   * 播放位置由主进程顺手写好（`playback_state.source_index` = 这首歌的位次），
+   * 渲染层拿 id 切过去就播它。
    */
   mainHandle('music:importSong', ({ url }) => importSongToDefault(url))
 }

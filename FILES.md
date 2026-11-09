@@ -284,14 +284,14 @@ return { info, songs, total, page, limit, source, id }
 
 | 表 / 视图 | 内容 |
 | :--- | :--- |
-| `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at / **last_index**） |
+| `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at）；**播放位置不在这里** |
 | `songs` | **歌曲实体，全局唯一**（id / name / singer / album / cover / duration）；**duration 存秒** |
 | `playlist_songs` | 歌单 ⨯ 歌曲的**成员关系 + 顺序**，PK `(playlist_id, ord)`，只有 `song_id` |
 | `song_videos` | **候选关系**：哪首歌的候选里有它 / 排第几 / 收藏没有；PK `(search_key, bvid)`；另有 `title_hl` 存带 `<em>` 的标题 |
 | `videos` | **视频实体 + 播放地址**，PK `bvid`，全局一份（同一个 bvid 被两首歌引用也只存一份 dash） |
 | `song_meta` | 每首歌的 `selected_bvid` + `search_login_state`，PK `search_key` |
-| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）/ **last_index** |
-| `playback_state` | **单行表**（`id` 恒为 1）：`source_kind`（`ov` / `mv`）+ `source_id`，回答「上次在播哪条线的哪个列表」。**不回答「播到哪」** —— 那是上面两张表的 `last_index`（第几条）+ `userData/last_position` 文件（第几秒） |
+| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）；**播放位置不在这里** |
+| `playback_state` | **单行表**（`id` 恒为 1）：`source_kind`（`ov` / `mv`）+ `source_id` + `source_index`，回答「上次在播哪条线的哪个列表的第几条」。秒数不在这里 —— 在 `userData/last_position` 文件 |
 | `videolist_items` | 列表成员 + 顺序，PK `(list_id, ord)` |
 | `song_videos_view` | **视图**：把 `song_videos` ⨯ `videos` 还原成**旧 `videos` 的 15 列形状**（旧读路径一行不用改） |
 | `videos_meta` | **视图**：`song_videos_view` 去掉全部地址列的只读投影（列表类读取走它，省 27 KB/行） |
@@ -387,6 +387,8 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
   > 补列完还会按「本地条数 ≥ 远端总数」把已经加载完的列表标成 `has_more = 0`，
   > 顺手把差额记进 `skipped_total`，否则升级后那些列表会白挂一行「继续加载」。
   > 其余结构变化（改类型 / 删列）仍然丢弃重建，那两张名单也必须跟着清空。
+  > 本轮删 `last_index` 就没往 `DROP_COLUMNS` 里加条目：库是手动 `ALTER TABLE`
+  > + `PRAGMA user_version` 一次性对齐的，代码里不写这种只跑一次的搬运。
 
   > ⚠️ **DROP 清单是动态取的，不是手写的**：早先手写一份
   > 「`DROP VIEW videos_meta; DROP TABLE videos; DROP TABLE song_meta; …`」，
@@ -468,7 +470,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 | `getPlaylists()` / `savePlaylists()` / `syncPlaylists()` | 集合的读 / 写 / 同步 |
 | `initPlaylists()` / `flushPlaylists()` | 启动加载 / 退出兜底落盘 |
 | `ensureDefaultPlaylist()` | 保证默认歌单（`pl_default`）在，没有就建 |
-| `appendSongToDefaultPlaylist(song)` | 拖入单曲的落点：两层去重后追加，并把 `lastIndex` 挪到它 |
+| `appendSongToDefaultPlaylist(song)` | 拖入单曲的落点：两层去重后追加，并把播放位置写到它 |
 | `convertPlaylistToLocal(id)` | **平台歌单 → 本地歌单**：换新 id、清链接与同步，一个事务里改两张表 |
 | `DEFAULT_PLAYLIST_ID` | 固定主键 `pl_default` —— 「是不是默认歌单」只看这一个字符串 |
 
@@ -550,7 +552,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 
   > 后者会把「同名但不同版本」（live 版、翻唱版）**误判成重复**。
 
-- **★ 同步时按歌重算 `last_index`**（这是「下标能当定位用」的前提）：
+- **★ 同步时按歌重算播放位置**（`playback_state.source_index`，这是「下标能当定位用」的前提）：
 
   下标本身是脆弱的 —— 曲目增删后第 N 个位置可能已经是另一首歌。
   同步时**旧列表和新列表都在手上**，正是重算的时机：
@@ -573,7 +575,7 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 | `findVideoList(id)` | 按 id 找一条（同步时要用 `kind` / `source_id` / `mid` 重打接口） |
 | `getVideoListItems(id)` | 条目（**纯读库，不联网**，LEFT JOIN `videos` 取标题封面） |
 | `addVideoList(kind, sourceId, mid)` | 拉取 + 落库（**一个事务**，见下） |
-| `syncVideoList(id)` | 重新同步 + `last_index` 按 bvid 重定位 |
+| `syncVideoList(id)` | 重新同步 + 播放位置按 bvid 重定位 |
 | `removeVideoList(id)` | 删列表 + 条目关系（`videos` 实体留给 GC 判断，被别的列表引用的不动） |
 | `setVideoListIndex(id, index)` | 记录播到第几条 |
 | `ensureDefaultVideoList({create})` | 取「默认列表」：设置 → 最早的本地列表 → 新建（见下） |
@@ -608,7 +610,7 @@ videolist_items  500 行（list_id, ord, bvid, favorites, origin）
 **地址一律等第一次播放时由 `cache.updateVideoResult()` 补**：500 条 × dash 是几十 MB +
 500 次请求，必被风控。
 
-**`syncVideoList` 的 `last_index` 重定位**（和音乐歌单同一个坑）：
+**`syncVideoList` 的播放位置重定位**（和音乐歌单同一个坑）：
 同步前记住「现在播的那条的 **bvid**」→ 同步后在新列表里找它的下标；
 找不到（被移出列表）就保留原下标并夹进范围。
 
@@ -633,9 +635,9 @@ FROM videolist_items)`）。
 
 | 导出 | 作用 | 什么时候写 |
 | :--- | :--- | :--- |
-| `getPlaybackSource()` | `playback_state` + 秒数文件 → `{ kind, id, seconds }` | 启动时读一次 |
-| `setPlaybackSource(kind, id)` | 只回答「谁」 | 切源 |
-| `saveProgress({ kind, id, index })` | 事务写两处：`playback_state` + 对应表 `last_index` | **切歌**（一首歌全程只写一次） |
+| `getPlaybackSource()` | `playback_state` + 秒数文件 → `{ kind, id, index, seconds }` | 启动时读一次 |
+| `setPlaybackSource(kind, id)` | 只回答「谁」，下标归零（同源重复调用保留原值） | 切源 |
+| `saveProgress({ kind, id, index })` | 一行 UPSERT：`playback_state` 的 kind / id / index | **切歌**（一首歌全程只写一次） |
 | `saveLastPosition(seconds)` | 写 `userData/last_position`（**无后缀**，内容就是一行数字） | **每秒** |
 | `remapPlaybackSource(kind, oldId, newId)` | 转本地（换 id）/ 删列表（清空）时跟过去 | 极少 |
 
@@ -707,7 +709,7 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 | 函数 | 干什么 |
 | :--- | :--- |
 | `importMusicPlaylist(url)` | 拖入**歌单**：解析 → 已有则同步、没有则新建 → 设为当前 |
-| `importSongToDefault(url)` | 拖入**单曲**：解析 → 追加进默认歌单（去重）→ 把 `lastIndex` 挪到它 |
+| `importSongToDefault(url)` | 拖入**单曲**：解析 → 追加进默认歌单（去重）→ 把播放位置写到它 |
 
 单曲不新建歌单，是因为拖一首歌进来的意图是「我想听这首」，不是「帮我建个歌单」——
 否则歌单列表里迟早攒出一堆只有一首歌的歌单。
@@ -715,7 +717,7 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 而后者已经在用音乐那边的同步逻辑 —— 塞进任何一边都会变成循环依赖。
 
 **「已有就同步」的判据**：主键相同（`平台_平台歌单id`）**或** `sourceUrl` 相同。
-命中后**只刷新曲目**，名字 / 同步策略 / `lastIndex` 全部保留 ——
+命中后**只刷新曲目**，名字 / 同步策略 / 播放位置全部保留 ——
 拖一下就把用户改过的名字还原成平台名，会让人以为出了 bug。
 
 **和 `savePlaylists` 的关系**：它是**全量覆盖**写库，所以这里必须先
@@ -877,6 +879,43 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 **不能比 exe**：安装版跑的是安装目录里的 `BLWE.exe`，发布的是 NSIS 安装包，
 两者不是同一个文件，哈希永远对不上；`app.asar` 在安装版 / 便携版里才是同一份。
 
+**两条路都试：`net.fetch` 不通就换全局 `fetch`**（起因是踩过一次「检查失败：fetch failed」但浏览器能开）：
+
+全局 `fetch` 是 Node 的 undici —— 自带 DNS、自带 CA 列表、**完全不看系统代理**；
+`net.fetch` 走 Chromium 网络栈（系统代理 + 系统证书 + DNS 缓存）。同一台机器上实测：
+
+```
+11-08 23:30   node fetch   → fetch failed
+                            cause: UNABLE_TO_VERIFY_LEAF_SIGNATURE（72ms，握手就死）
+              electron net → 200
+
+11-09 16:15   node fetch   → 200（683ms）      ← 同一个 URL，什么都没改
+              electron net → 200（840ms）
+```
+
+**所以这是环境相关的间歇问题，不是永久故障，也不能当成代码 bug**：那天本机有东西在做
+HTTPS 中间人（代理客户端的 TLS 解密 / 安全软件），证书链换成了它自己的 —— 浏览器用
+**系统证书库**所以认，undici 用**自带 CA 列表**所以不认；隔天代理一关、hosts 干净，
+两条路又都能通（当时 `ProxyEnable = 0`、`ProxyServer = 127.0.0.1:7897`、hosts 无 github 条目）。
+
+**所以两条都留着，`fetchRemoteBuild()` 里依次试，任一条拿到响应就算成功**：
+
+| 路 | 走什么 | 它什么时候通 |
+| :--- | :--- | :--- |
+| `net.fetch`（先） | Chromium：系统代理 + 系统证书库 | 开着代理（「浏览器能开」的那种状态） |
+| `fetch`（后） | Node undici：直连 + 自带 CA 列表 | 代理关了 / 系统代理指向死端口，但直连能出去 |
+
+只留一条都会出现「明明能上网，它就是说失败」：只走 `fetch` → 代理 + TLS 中间人时挂证书；
+只走 `net` → 系统代理开着但代理软件退了时，Chromium 会老老实实去连那个死端口。
+两条都挂才报错，把两边的码一起给出来（`两路都失败 —— 代理：…；直连：…`）。
+最坏等两轮超时（8 + 8 秒），真实失败大多是毫秒级。实测把第一路指向死端口：
+`ERR_UNSAFE_PORT` → 自动换第二路 → `200` 并解析成功。
+
+配套的 `describeError()` 负责把原因说成人话：
+undici 的 `fetch failed` 是空壳，真正的原因在 `err.cause`；Chromium 直接把 `net::ERR_*` 写在
+message 上。两套码都认（`ENOTFOUND` / `CERT_*` / `ECONNREFUSED` / `ERR_TIMED_OUT` …），
+再配一句提示（「本机有代理或安全软件在替换 HTTPS 证书」这类）。
+
 **读 asar 本体必须临时关掉 asar 补丁**（踩过）：Electron 把 `fs` 换成能读 asar 内部的版本，
 `fs.readFileSync('…/app.asar')` 会被当成「包内路径」，直接报 `ENOENT, not found in …app.asar`。
 所以读之前 `process.noAsar = true`、读完立刻还原。实测两种写法（`noAsar` / `original-fs`）
@@ -1017,7 +1056,7 @@ channel → `{params, result}` 的契约集中在这里，
   它们是**运行时状态**（当前在播谁、播到第几秒），却被塞进了「用户偏好」的文件里。
   后果是不对称：视频列表 id 落了盘，而「当前歌单」只存主进程内存，于是视频能续播、
   歌单永远回到第一个；秒数还因为全局只有一个值，换来源就串。
-  现在拆成：`playback_state` + 各表 `last_index`（谁、第几条，在库里），
+  现在收进：`playback_state` 一行（谁 + 第几条，在库里），
   `userData/last_position`（第几秒，一个小文件 —— 它每秒都变，不值得写库）。
   `player.resumeOnStart` 留着 —— 它才是偏好（要不要接着上次的位置）。
 
@@ -1603,7 +1642,7 @@ SOURCES[source].getListDetail(input, page)
 ```
 重新解析 → toPlaylistSongs 归一 → 截断到 2000 首
   → 按 songId 去重 → 算 added/removed（也按 songId）
-  → ★ 按歌重算 last_index → 写库
+  → ★ 按歌重算播放位置（playback_state.source_index）→ 写库
 ```
 
 `syncPlaylists(ids)` **串行**执行，避免同时打多个平台接口被限流。
@@ -1611,7 +1650,7 @@ SOURCES[source].getListDetail(input, page)
 > **去重/比较为什么用 `songId` 而不是 `歌名-歌手`**：后者会把
 > 「同名但不同版本」（live 版、翻唱版）**误判成重复**。
 
-> **★ `last_index` 为什么要重算**：下标是脆弱的 —— 曲目增删后第 N 个位置
+> **★ 播放位置为什么要重算**：下标是脆弱的 —— 曲目增删后第 N 个位置
 > 可能已经是另一首歌。同步时**旧列表和新列表都在手上**，正是重算的时机：
 > 那首歌还在就取它的**新下标**（按 `songId` `findIndex`，不能用歌名，同步可能改名）；
 > 被删了就保留原下标并夹进范围（效果是「下一首顶上来」，播放器的标准行为）。
@@ -2239,8 +2278,8 @@ fetch + getReader + append
 
 ```
 tryResume()
-  读 playback_state: kind（ov / mv）+ id   ← 哪条线、哪个列表
-  读那个列表的 last_index    + userData/last_position（秒数）
+  读 playback_state: kind（ov / mv）+ id + index   ← 哪条线、哪个列表、第几条
+  + userData/last_position（秒数）
   seekTo = resumeOnStart ? 文件的秒数 : 0   ← 开关只管「从第几秒」，不管「播哪首」
   ↓
 restoreSongVideo(songName, resumeTime)
@@ -2742,8 +2781,8 @@ openManager = 打开该页管理器          // 不碰工作区，不换播放�
        kind='mv'             → 主进程 initPlaylists 已经用它定了 `currentId`
        指向的列表已被删       → 主进程删列表时就改掉了（remapPlaybackSource），这里不用管
   → tryResume()
-       loadPlaybackSource()  // 按 kind 取：videolists 或 playlists 的 last_index + 秒数文件
-       songs = 该来源的条目；index = lastIndex
+       loadPlaybackSource()  // 读 playback_state 一行（kind / id / index）+ 秒数文件
+       songs = 该来源的条目；index = source_index
        seekTo = resumeOnStart ? lastPosition : 0   // 关掉开关 = 还是这首，但从 00:00 起
        restoreSongVideo(index, seekTo)              // 只有歌走这里（视频没有「上次播哪个」这个概念）
   → 续播失败 / 没有记录 → loadPlaylist()
@@ -2752,8 +2791,8 @@ openManager = 打开该页管理器          // 不碰工作区，不换播放�
 ```
 
 `system.saveProgress()` 是**唯一的写入口**（视频列表和歌单共用一条 IPC
-`playback:progress`）：一次事务写两处 —— `playback_state` 记「谁」，
-对应表记 `last_index`（**只在 `源 + 下标` 变了时才写**，一首歌全程一次）。
+`playback:progress`）：一行 UPSERT —— `playback_state` 记「谁 + 第几条」
+（**只在 `源 + 下标` 变了时才写**，一首歌全程一次）。
 秒数是另一条路：`savePosition()` → `playback:position` → 那个文本文件，每秒一次。
 
 写错表不会报错，只会「重启后回到第一条」，所以这件事收在一处，
@@ -2766,7 +2805,7 @@ openManager = 打开该页管理器          // 不碰工作区，不换播放�
 syncVideoList(id)
   → 记住当前在播那条的 bvid
   → fetchBiliList 重新拉
-  → 事务内：删旧 videolist_items → 重建 → 按 bvid 重定位 last_index
+  → 事务内：删旧 videolist_items → 重建 → 按 bvid 重定位 playback_state.source_index
   → 被移出列表的 videos 实体不立刻删（可能被别的列表 / 歌曲候选引用）
 
 ```
@@ -2777,7 +2816,7 @@ syncVideoList(id)
 | :--- | :--- | :--- |
 | 用 `favorites = 1` 标记「唯一候选」 | 用户点一下爱心，条目就没了 | 取消收藏会把 `favorites` 置 0，清理逻辑顺手把它删掉 |
 | 复用 `rankVideos` | 列表一条都放不出来 | 标题不含「歌名」、时长窗口 ±90s 会判死长视频 |
-| `last_index` 按下标记 | 新收藏一条后，重启播的是上一条 | 收藏夹倒序，全体下标 +1，必须按 bvid 重定位 |
+| 播放位置（下标）没重定位 | 新收藏一条后，重启播的是上一条 | 收藏夹倒序，全体下标 +1，必须按 bvid 重定位 |
 | 只删 `song_videos` 就删 `videos` | 另一个列表的地址缓存被连坐删掉 | `videos` 是全局共享的，必须 `gcOrphanVideos()` 同时看两张引用表 |
 | `SongVideoListDialog` 只认 `title/pic/author` | 视频列表行标题空、封面兜底、UP 主空 | 面板里装的形状比类型还多一种（MV 的视频面板是裸 `BiliVideo`、OV 的是列表条目）→ 统一走 `fieldsOf()` 按字段兜底 |
 | 切模式时清 `activeId` | 进度写到错的表、续播回到第一条 | `activeId` 是「在播哪个来源」，不是「在看哪个工作区」；浏览位置单独用 `browseVideoListId` |

@@ -285,7 +285,7 @@ export const uiActions: ThisType<UiContext> = {
     const target = page ?? this.queueStore.mode;
     this.playlistManagerVisible = target === 'mv';
     this.videoListVisible = target === 'ov';
-    /** 弹窗里要看的那份列表按需重读一次（切歌会改 lastIndex，store 那份是旧值） */
+    /** 弹窗里要看的那份列表按需重读一次（条目可能在别处增删过） */
     if (target === 'ov') await this.loadBrowseList();
   },
 

@@ -339,9 +339,9 @@ export const systemActions: ThisType<SystemContext> = {
   /**
    * 记一次播放进度（视频列表 / 歌单**共用的唯一写入口**）
    *
-   * 两样东西一起写进库：
-   *  - `playback_state`：现在在播哪条线的哪个列表；
-   *  - 那个列表自己的 `last_index`：播到第几条（秒数不在这里，见 `savePosition`）。
+   * 写的是 `playback_state` 那一行（`source_kind` + `source_id` + `source_index`），
+   * 秒数不在这里（见 `savePosition`）。列表自己不再存位置 —— 那就没有
+   * 「整份覆盖把位置冲回旧值」这条路了。
    *
    * **不写 setting**。「上次播到哪」是运行时状态，不是用户偏好 —— 以前秒数存
    * `player.resumeTime`（全局一个值，换来源就串）、视频列表 id 存

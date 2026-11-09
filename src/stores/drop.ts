@@ -228,8 +228,8 @@ export const dropActions: ThisType<DropContext> = {
    * 迟早攒出一堆只有一首歌的歌单。默认歌单由主进程保证存在（没有就现建、删不掉），
    * 去重也在那边（同一首歌拖第二次是「定位过去」，不是多一行）。
    *
-   * 起播不用传下标：主进程已经把默认歌单的 `lastIndex` 写成这首歌的位置，
-   * `onPlaylistSwitch` 会从那儿续播。
+   * 起播不用传下标：主进程已经把播放位置写进 `playback_state`
+   * （`mv` + 默认歌单 id + 这首歌的下标），`onPlaylistSwitch` 会从那儿续播。
    */
   async dropImportSong(url: string): Promise<void> {
     this.uiStore.closeManagers();
@@ -261,7 +261,10 @@ export const dropActions: ThisType<DropContext> = {
         (skipped > 0 ? `（跳过 ${skipped} 个不支持的条目）` : ''),
     );
     await this.uiStore.loadBrowseList();
-    await this.queueStore.onVideoListPlay(record.id, Math.max(0, record.lastIndex || 0));
+    /** 还是同一个列表就接着上次那条播（位置在 playback_state.source_index） */
+    const playback = await electronApi.getPlaybackSource();
+    const index = playback.kind === 'ov' && playback.id === record.id ? playback.index : 0;
+    await this.queueStore.onVideoListPlay(record.id, index);
   },
 
   /**

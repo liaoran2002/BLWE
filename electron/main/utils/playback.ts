@@ -1,18 +1,21 @@
 /**
- * 播放状态读写（**分两层，两层职责不同**）
+ * 播放状态读写（**两种东西、两个去处**）
  *
  * | 是什么 | 放哪 | 谁写 | 频率 |
  * | :--- | :--- | :--- | :--- |
- * | 上次在播哪条线的哪个列表 + 第几条 | 库（`playback_state` + 各表 `last_index`） | `saveProgress` | 只在切歌 / 切源时 |
+ * | 上次在播哪条线的哪个列表、第几条 | 库（`playback_state` 单行：kind + id + index） | `saveProgress` | 只在切歌 / 切源时 |
  * | 播到第几秒 | `userData/last_position` 一个小文件 | `saveLastPosition` | 每秒 |
  *
- * ## 为什么秒数不进库
+ * ## 为什么「谁 + 第几条」必须挤在一行里
  *
- * 它是一条**全局的当前播放位置**：换列表、换来源，下一次播放就把它覆盖掉了，
- * 按列表各存一份没有意义（那是过度设计，我加过又撤了）。进库还意味着每秒一次
- * 事务 + WAL 增长，而它丢了最多少续几秒 —— 一个几字节的文本文件刚好。
+ * 它们是同一个事实的三段：哪条线、哪个列表、第几条。拆开放（曾经下标在
+ * `playlists` / `videolists` 各自的 `last_index` 上）就会两头打架：
+ * 歌单侧持久化是整份覆盖、值来自渲染层内存，而 `saveProgress` 只改库不改内存 ——
+ * 刚写对的下标被下一次持久化带着旧值冲回去，续播时就灵时不灵。
  *
- * ## 为什么「谁」必须进库
+ * 收进这张只有一行的表之后，任何「覆盖列表」的路径都碰不到它。
+ *
+ * ## 为什么「谁」必须进库而不是散文件
  *
  * 它要跟列表的存在性绑定：删列表、转本地换 id 时得跟着改（`remapPlaybackSource`），
  * 而散文件做不到这一点。以前它是个设置项（`player.activeVideoListId`），
@@ -21,16 +24,17 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
-import type { PlaybackProgress, PlaybackSource } from '@common/types/playback'
-import { getDb, tx } from './db'
+import type { PlaybackProgress, PlaybackSource, PlaybackSourceKind } from '@common/types/playback'
+import { getDb } from './db'
 
 interface PlaybackStateRow {
   source_kind: string | null
   source_id: string | null
+  source_index: number
 }
 
 /** 没在播任何东西时的返回值 */
-const EMPTY: PlaybackSource = { kind: '', id: '', seconds: 0 }
+const EMPTY: PlaybackSource = { kind: '', id: '', index: 0, seconds: 0 }
 
 /**
  * 记录播放秒数的文件（**故意不带后缀**）
@@ -75,19 +79,24 @@ export const saveLastPosition = (seconds: number): void => {
 }
 
 /**
- * 读「上次在播的是哪条线的哪个列表」+ 秒数
+ * 读「上次在播的是哪条线的哪个列表的第几条」+ 秒数
  *
- * 秒数来自小文件，和库里的记录拼在一起返回 —— 调用方一次就能拿全
- * 「回到哪个列表的第几条的第几秒」。
+ * 秒数来自小文件，和库里的记录拼在一起返回 —— 续播时调一次
+ * `getPlaybackSource()` 就能拿全「回到哪个列表的第几条的第几秒」。
  */
 export const getPlaybackSource = (): PlaybackSource => {
   const seconds = getLastPosition()
   try {
     const row = getDb()
-      .prepare(`SELECT source_kind, source_id FROM playback_state WHERE id = 1`)
+      .prepare(`SELECT source_kind, source_id, source_index FROM playback_state WHERE id = 1`)
       .get() as PlaybackStateRow | undefined
     if (!row || !row.source_kind || !row.source_id) return { ...EMPTY, seconds }
-    return { kind: row.source_kind === 'ov' ? 'ov' : 'mv', id: row.source_id, seconds }
+    return {
+      kind: row.source_kind === 'ov' ? 'ov' : 'mv',
+      id: row.source_id,
+      index: Math.max(0, Math.floor(row.source_index) || 0),
+      seconds,
+    }
   } catch (err) {
     console.warn('[playback] 读取播放状态失败:', err)
     return { ...EMPTY, seconds }
@@ -95,28 +104,35 @@ export const getPlaybackSource = (): PlaybackSource => {
 }
 
 /**
- * 改「当前在播的是谁」（不带进度）
+ * 改「当前在播的是谁」（**下标归零**）
  *
- * 只在切源时用。正常播放过程中不需要单独调它 —— `saveProgress` 会顺带写好。
+ * 只在切源时用：换了一个列表，上一个列表的第几条对新列表毫无意义。
+ * 正常播放过程中不需要单独调它 —— `saveProgress` 会顺带写好。
  */
 export const setPlaybackSource = (kind: PlaybackSource['kind'], id: string): void => {
-  const db = getDb()
-  db.prepare(
-    `INSERT INTO playback_state (id, source_kind, source_id, updated_at)
-     VALUES (1, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET
-       source_kind = excluded.source_kind,
-       source_id   = excluded.source_id,
-       updated_at  = excluded.updated_at`,
-  ).run(kind || null, id || null, Date.now())
+  getDb()
+    .prepare(
+      `INSERT INTO playback_state (id, source_kind, source_id, source_index, updated_at)
+       VALUES (1, ?, ?, 0, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         source_kind  = excluded.source_kind,
+         source_id    = excluded.source_id,
+         source_index = CASE
+           -- 同一个源重复调（幂等），别把正在播的位置清掉
+           WHEN playback_state.source_kind = excluded.source_kind
+            AND playback_state.source_id   = excluded.source_id
+           THEN playback_state.source_index
+           ELSE 0
+         END,
+         updated_at   = excluded.updated_at`,
+    )
+    .run(kind || null, id || null, Date.now())
 }
 
 /**
  * 上报「切到哪一条」（**写库的唯一入口**）
  *
- * 两件事一起做，放在同一个事务里：`playback_state` 记「在播谁」、
- * 对应表记「第几条」。避免「源切了、下标没写」这种半截状态 ——
- * 那会让下次启动恢复到 A 列表，却拿着 B 列表的下标。
+ * 一行 UPSERT，不碰任何列表表 —— 列表表里已经没有下标了。
  *
  * `id` 为空表示当前没有可写的目标（比如视频列表被删、视频还在放），
  * 这时**什么都不做**：保留上一次的有效记录，比清空它更接近用户预期。
@@ -125,26 +141,35 @@ export const saveProgress = (progress: PlaybackProgress): void => {
   const { kind, id } = progress
   if (!id) return
   const index = Math.max(0, Math.floor(progress.index) || 0)
-  const now = Date.now()
-
-  tx(() => {
-    const db = getDb()
-    db.prepare(
-      `INSERT INTO playback_state (id, source_kind, source_id, updated_at)
-       VALUES (1, ?, ?, ?)
+  getDb()
+    .prepare(
+      `INSERT INTO playback_state (id, source_kind, source_id, source_index, updated_at)
+       VALUES (1, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
-         source_kind = excluded.source_kind,
-         source_id   = excluded.source_id,
-         updated_at  = excluded.updated_at`,
-    ).run(kind, id, now)
-
-    const table = kind === 'ov' ? 'videolists' : 'playlists'
-    db.prepare(`UPDATE ${table} SET last_index = ?, updated_at = ? WHERE id = ?`).run(
-      index,
-      now,
-      id,
+         source_kind  = excluded.source_kind,
+         source_id    = excluded.source_id,
+         source_index = excluded.source_index,
+         updated_at   = excluded.updated_at`,
     )
-  })
+    .run(kind, id, index, Date.now())
+}
+
+/**
+ * 同步后重定位下标（**只在当前源就是它时才写**）
+ *
+ * 列表重新同步 / 换平台后曲目顺序会变，第 N 个位置可能已经是别的条目。
+ * 主进程此刻同时握着旧列表和新列表，正是算「原来那条现在排第几」的时机。
+ *
+ * 别的列表不动：它们的位置本来就是历史残留，改了反而是凭空的写入。
+ */
+export const relocatePlaybackIndex = (
+  kind: PlaybackSourceKind,
+  id: string,
+  index: number,
+): void => {
+  const current = getPlaybackSource()
+  if (current.kind !== kind || current.id !== id) return
+  saveProgress({ kind, id, index })
 }
 
 /**
@@ -152,6 +177,7 @@ export const saveProgress = (progress: PlaybackProgress): void => {
  *
  * 转换本地列表会换一个新 id，删除则彻底没有 —— 两种情况都要跟过去，
  * 否则 `playback_state` 会指向一个不存在的 id，下次启动读不到东西还查不出原因。
+ * 换 id 时**下标原样保留**（还是同一个列表，位置没变）。
  */
 export const remapPlaybackSource = (
   kind: PlaybackSource['kind'],
@@ -160,7 +186,17 @@ export const remapPlaybackSource = (
 ): void => {
   const current = getPlaybackSource()
   if (current.kind !== kind || current.id !== oldId) return
-  setPlaybackSource(newId ? kind : '', newId)
+  if (!newId) {
+    clearPlaybackSource()
+    return
+  }
+  getDb()
+    .prepare(
+      `UPDATE playback_state
+          SET source_id = ?, updated_at = ?
+        WHERE id = 1`,
+    )
+    .run(newId, Date.now())
 }
 
 /** 清空播放源（比如整库重建后） */

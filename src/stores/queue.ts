@@ -253,8 +253,8 @@ export const queueActions: ThisType<QueueContext> = {
     if (source && source.songs.length > 0) {
       this.listName = source.name;
       this.songs = source.songs;
-      /** 回到上次播放的位置（下标由主进程在同步时重算，这里夹进范围） */
-      this.currentIndex = Math.min(Math.max(0, source.lastIndex), this.songs.length - 1);
+      /** 回到上次播放的位置（下标就是 playback_state.source_index 那一个数） */
+      this.currentIndex = Math.min(Math.max(0, source.index), this.songs.length - 1);
       // 兼顾「播放进度」：走这条兜底路径时（没有已缓存的视频可精确还原）
       // 也要把上次的秒数带上，否则换歌单/首启场景会丢掉进度。
       // 秒数来自 userData/last_position 那个小文件（全局的当前播放位置）。
@@ -324,7 +324,19 @@ export const queueActions: ThisType<QueueContext> = {
     // 换歌单时把进度重置，避免把上一个歌单的秒数带到新歌单
     this.songs = [...record.songs];
     this.listName = record.name;
-    this.currentIndex = Math.min(Math.max(0, record.lastIndex), Math.max(0, record.songs.length - 1));
+    /**
+     * 起播位置只有「这个歌单就是上次在播的那个」时才有意义
+     *
+     * 播放位置存的是**一个**（`playback_state.source_index`），不是每个歌单一份 ——
+     * 切到另一个歌单还沿用上一个歌单的下标，纯属串台。
+     */
+    const playback = await electronApi.getPlaybackSource();
+    const resumeIndex =
+      playback.kind === 'mv' && playback.id === record.id ? playback.index : 0;
+    this.currentIndex = Math.min(
+      Math.max(0, resumeIndex),
+      Math.max(0, record.songs.length - 1),
+    );
     this.videoList = [];
     this.videoListKeyword = '';
     this.currentVideoIndex = 0;

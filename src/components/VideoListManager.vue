@@ -267,7 +267,7 @@
                 size="small"
                 type="primary"
                 :disabled="isPlayingList(selected.id)"
-                @click="playList(selected)"
+                @click="void playList(selected)"
               >
                 {{ isPlayingList(selected.id) ? '正在播放' : '从这里播放' }}
               </el-button>
@@ -553,7 +553,7 @@ export default defineComponent({
         subtitle: item.author || '未知 UP 主',
         cover: normalizeImageUrl(item.cover),
         duration: item.duration,
-        playing: isActive && index === record?.lastIndex,
+        playing: isActive && index === this.queue.currentIndex,
         missing: !!item.missing,
         missingHint: `文件不在这个位置了：${item.localPath || '（路径未知）'}`,
       }));
@@ -620,12 +620,12 @@ export default defineComponent({
     formatDuration,
     async onOpen(): Promise<void> {
       this.creating = false;
-      /**
-       * 每次打开都重读一遍（纯数据库读，几毫秒）
-       *
-       * `lastIndex` 会在播放过程中不断被 player store 写库，store 里那份是旧值 ——
-       * 不重读的话「正在播」那行会停在打开程序时的位置。
-       */
+    /**
+     * 每次打开都重读一遍（纯数据库读，几毫秒）
+     *
+     * 「正在播哪一条」不在这里了 —— 它是播放状态（`playback_state.source_index`），
+     * 界面自己的 `queue.currentIndex` 就是当前值，不需要跟着库重读。
+     */
       try {
         await this.store.load();
       } catch (err) {
@@ -707,14 +707,17 @@ export default defineComponent({
     },
 
     // #region 播放
-    /** 从这个列表「上次播到的那条」开始（`lastIndex` 已由主进程按 bvid 重定位） */
-    playList(item: VideoListRecord): void {
+    /** 从这个列表「上次播到的那条」开始（位置在 `playback_state.source_index`） */
+    async playList(item: VideoListRecord): Promise<void> {
       if (!item.itemCount) {
         ElMessage.warning('这个列表还没有条目');
         return;
       }
+      /** 只有它正是当前播放源时才有「上次那条」；别的列表一律从第一条开始 */
+      const playback = await api.getPlaybackSource();
+      const index = playback.kind === 'ov' && playback.id === item.id ? playback.index : 0;
       void this.ui.onVideoListBrowse(item.id);
-      void this.queue.onVideoListPlay(item.id, Math.max(0, item.lastIndex || 0));
+      void this.queue.onVideoListPlay(item.id, index);
       this.visible = false;
     },
     playAt(item: VideoListRecord, index: number): void {

@@ -307,7 +307,7 @@ export interface IpcChannelMap {
    * 不该因此建一个新歌单出来。默认歌单由主进程保证存在（没有就现建，且删不掉）。
    *
    * `added` 区分「新加进去的」和「本来就在里面的」，只影响提示语；
-   * `index` 是它最终落在第几首（主进程顺手把默认歌单的 `lastIndex` 改成它，
+   * `index` 是它最终落在第几首（主进程顺手把播放位置写成它，
    * 渲染层拿这个 id 去 `onPlaylistSwitch` 就能从这一首起播）。
    */
   'music:importSong': {
@@ -464,7 +464,7 @@ export interface IpcChannelMap {
     params: { id: string }
     result: import('./playlist').VideoListPageResult
   }
-  /** 重新同步（重新拉列表；`last_index` 按 bvid 重定位） */
+  /** 重新同步（重新拉列表；播放位置由主进程按 bvid 重定位） */
   'videolists:sync': {
     params: { id: string }
     result: import('./playlist').VideoListSyncResult
@@ -483,14 +483,14 @@ export interface IpcChannelMap {
   // #endregion
 
   // #region 播放状态（**不是设置**：它在库里，不在 setting.json）
-  /** 读「上次在播哪条线的哪个列表」（位置去各自表的 last_index 取） */
+  /** 读「上次在播哪条线的哪个列表的第几条」（三样都在 `playback_state` 那一行） */
   'playback:get': { params: void; result: import('./playback').PlaybackSource }
   /** 切源（只在切换播放源时用，播放过程中由 `playback:progress` 顺带写） */
   'playback:setSource': {
     params: { kind: import('./playback').PlaybackSourceKind | ''; id: string }
     result: void
   }
-  /** 上报「切到哪一条」：写自己那条的 last_index + 更新「当前在播谁」（只在切歌时调） */
+  /** 上报「切到哪一条」：写 `playback_state` 的 kind / id / index（只在切歌时调） */
   'playback:progress': { params: import('./playback').PlaybackProgress; result: void }
   /** 上报「播到第几秒」：只写 userData/last_position 小文件（每秒一次） */
   'playback:position': { params: { seconds: number }; result: void }

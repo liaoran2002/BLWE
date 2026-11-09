@@ -448,7 +448,7 @@ interval  定时自动同步（间隔在 sync_interval_ms）
 导入 / 拖入 → fetchBiliListPage(第 1 页) → 建列表（item_count = 远端总数, loaded_page = 1）
 滚动到底  ┐
 点「加载」├→ videolists:loadMore → fetchBiliListPage(loaded_page + 1) → appendVideoListPage
-播到整分钟┘                         （只追加，不碰已有条目、不动 last_index）
+播到整分钟┘                         （只追加，不碰已有条目、不动播放位置）
 ```
 
 - **一页多少条由接口定**：收藏夹 / UP 投稿 40，合集 / 系列 30（`listPageSize`）。
@@ -1759,7 +1759,7 @@ targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
 
 | 表 | 一行代表 | 关键列 |
 | --- | --- | --- |
-| `videolists` | 一个列表 | `id`（`bv_fav_123` / `bv_local_xxx`）、`kind`（`fav`/`season`/`series`/**`local`**）、`source_id`、`mid`、`last_index` |
+| `videolists` | 一个列表 | `id`（`bv_fav_123` / `bv_local_xxx`）、`kind`（`fav`/`season`/`series`/**`local`**）、`source_id`、`mid`（播放位置不在这里，见 `playback_state`） |
 | `videolist_items` | 列表里的第 N 条 | PK `(list_id, bvid)`；`ord`、`favorites`、`origin`（`sync`/`local`） |
 | `videos` | 视频实体 + 播放地址 | `bvid` 主键，全局一份 |
 
@@ -1789,31 +1789,38 @@ targetVideo = { bvid, view_result, playurl_result }   // ← 整个替换
 写库前调用，而视频条目压根不走搜索接口。
 **不要**为了「统一入口」把视频塞回搜索链路 —— 那等于把音乐场景的规则硬套到视频上。
 
-#### 4. `last_index` 必须按 bvid 重定位
+#### 4. 播放位置只有一个，同步时按 bvid 重定位
 
-`videolists.last_index` 是**下标**。收藏夹按收藏时间倒序，用户新收藏一条，全体原点 +1 ——
-不同步的话下次打开就在播「上一条」。
+「播到第几条」是**播放状态**，存在 `playback_state.source_index`（那行还有
+`source_kind` / `source_id`），**不在 `videolists` / `playlists` 表里** ——
+按列表各存一份的话，歌单侧「整份覆盖」的持久化会拿渲染层内存里的旧值把库里的新值冲掉。
 
+`source_index` 是**下标**，会漂：收藏夹按收藏时间倒序，用户新收藏一条，全体原点 +1。
 `syncVideoList()` 的做法：同步前记住「现在播的那条的 **bvid**」，
 同步后在**新列表**里找它的下标；找不到（被移出列表）就保留原下标并夹进范围
-（效果是「下一条顶上来」）。这与音乐歌单 `syncPlaylist` 里那段是同一个坑，
-只是那边靠 `toCacheKey` 反查、这边靠 bvid（更简单，条目天然唯一）。
+（效果是「下一条顶上来」），再写回 `playback_state` —— **只有这个列表就是当前播放源时**才写。
+这与音乐歌单 `syncPlaylist` 里那段是同一个坑，只是那边靠 `songId` 反查、
+这边靠 bvid（更简单，条目天然唯一）。
 
-#### 5. 「当前在播哪个来源」落在设置里
+#### 5. 「当前在播谁」落在库里的 `playback_state`
 
-`songs` 只有一个数组，所以「这次打开该从哪个来源续播」必须有落盘的地方：
-`player.activeVideoListId`（`''` = 音乐歌单）。启动时：
+`songs` 只有一个数组，所以「这次打开回哪个来源、第几条」必须有落盘的地方 ——
+就是 `playback_state` 那一行（`id` 恒为 1）：
 
 ```
-读设置 → 找到那个列表 → videoListsStore.setActive(id) → tryResume() 走同一条路
-                        ↘ 列表已被删 → 把设置清回 ''（否则 fromVideoList 永远为真，
-                                        界面会按视频列表的文案渲染一个空来源）
+source_kind  'ov'（视频列表）| 'mv'（音乐歌单）| NULL（没在播）
+source_id    videolists.id 或 playlists.id
+source_index 第几条
 ```
 
-store 里两件事因此必须**成对**做：`setActiveVideoList()`（`actions/library.ts`）
-同时改 store 与设置；`recordPlayPosition()`（`actions/system.ts`）按来源分别写
-`playlists.last_index` / `videolists.last_index`。
-写错表不会报错，只会表现成「重启后位置回到第一条」—— 所以都收敛在一个函数里。
+启动时：读这一行 → 按 `source_id` 找到列表 → 取曲目 → `source_index` 定位那条 →
+`userData/last_position` 给秒数。指向的列表已被删时，删列表那边会
+`remapPlaybackSource()`（转本地换 id）或 `clearPlaybackSource()`（删除），
+渲染层还有一层兜底（找不到就回退当前歌单）。
+
+所以续播不是「每条线各写一套」，而是**一条链**：
+`playback:progress` 写这一行 → 启动读这一行。`playlist.ts` / `videolist.ts` 里
+任何整份覆盖都碰不到它。
 
 #### 6. 渲染层：两种条目共用一套展示
 
@@ -1949,7 +1956,7 @@ openManager(page) = 打开该页的管理器（不碰工作区）   // 不传 = 
 drop → api:classifyDrop（主进程，只读不联网）
         ├─ music  : 音乐**歌单**链接 → 切 MV → music:importPlaylist → 导入/同步 → 播第一首
         ├─ song   : 音乐**单曲**链接 → 切 MV → music:importSong → 追加进默认歌单 → 播它
-        ├─ list   : parseListInput() 认得收藏夹/合集/系列 → 切 OV → videolists:add → 从 last_index 播
+        ├─ list   : parseListInput() 认得收藏夹/合集/系列 → 切 OV → videolists:add → 从 playback_state 那条播
         └─ video  : 文本里有 BV 号 / b23.tv 短链        → 切 OV → videolists:addItemToDefault → 播第 1 条
 ```
 
@@ -2030,7 +2037,7 @@ ensureDefaultVideoList():
 用户在平台上改了名，这边同步一次就跟上，列表里不会挂着旧名字。
 
 **平台 → 本地是单向的**（`convertPlaylistToLocal`）：换新 id（`pl_<uuid>`）、
-`url` / `sync` 清零，曲目与 `lastIndex` 保留。换 id 是因为「是不是本地」看前缀，
+`url` / `sync` 清零，曲目与播放位置保留。换 id 是因为「是不是本地」看前缀，
 留着 `tx_xxx` 会造出自相矛盾的记录。两条 UPDATE 在同一个事务里
 （`playlist_songs` 没声明外键，不会级联，必须手动把 `playlist_id` 指过去）；
 同步进行中不允许转换 —— 否则 `syncPlaylist` 回来时会写到已经不存在的 id 上。
@@ -2069,7 +2076,7 @@ ensureDefaultVideoList():
 | 歌单管理里手动填 `海阔天空-Beyond` | `海阔天空-Beyond` |
 
 同一首歌会有两种 id。只比 id 的话拖一次就多一行，所以先按 id 精确命中，再按缓存键（`歌名-歌手`）兜一层，
-命中了就**定位过去**（把 `lastIndex` 挪到它），不重复插。
+命中了就**定位过去**（把播放位置挪到它），不重复插。
 
 **本地歌单导入走的是同一套判重**（`mergePlaylistSongs`，在 `common/types/playlist.ts`）——
 两处规则要是各写一遍，早晚会出现「拖进来不重复、导入进重复」这种说不清的行为。
@@ -2261,8 +2268,8 @@ CREATE TABLE IF NOT EXISTS playlists (
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at     INTEGER,
   created_at       INTEGER NOT NULL,
-  updated_at       INTEGER NOT NULL,
-  last_index       INTEGER NOT NULL DEFAULT 0        -- 上次播到第几首（**下标**，见下）
+  updated_at       INTEGER NOT NULL
+  -- 没有 last_index：「播到第几首」是播放状态，只有一份（playback_state.source_index）
 );
 
 -- 歌曲实体（**全局唯一**，与歌单无关）
@@ -2460,14 +2467,15 @@ JSON 要重新拆成列」三种情况，出错面远大于丢掉重来。
 > `sqlite_%` 开头的（`sqlite_sequence` / `sqlite_stat1`）是 SQLite 自己维护的，
 > **绝不能 drop**。实测清掉了 10 个旧表/视图（含那两个删歌词时漏掉的残留）。
 
-**★ `last_index` 是下标，但同步时会「按歌重算」**
+**★ 播放位置是下标，同步时会「按歌重算」**
 
-`last_index` 存的是**下标**（不是「哪首歌的 id」）。下标本身是脆弱的：
+`playback_state.source_index` 存的是**下标**（不是「哪首歌的 id」）。下标本身是脆弱的：
 歌单重新同步后曲目会增删，第 110 个位置可能已经是**另一首歌**了 ——
 用户续播会听到莫名其妙的东西。
 
 所以 `syncPlaylist` 在同步时会**把它重算成新列表里的位置**（此刻旧列表和新列表
-都在手上，正是做这件事的时机）：
+都在手上，正是做这件事的时机），再写回 `playback_state`：
+**只有这个歌单就是当前播放源时**才算、才写。
 
 ```
 ① 那首歌还在    → 用它的新下标（位置可能变了）
@@ -3074,9 +3082,15 @@ if (finalList.length === 0) {
 > 本轮就真的清过一次库（`playlists.id` 的语义从随机 UUID 改成
 > `平台_平台歌单id`，属于 schema 变化）—— 用户明确要求「不用管我，不要迁移，直接清库」。
 
-续播相关的信息存在 `setting.json` 里：`player.resumeOnStart`（记住播放进度）、`player.resumeTime`
-（上次播放到第几秒）；**播到第几首由每个歌单自己的 `lastIndex` 决定**（`player.playIndex` 是历史遗留、
-只写不读，已经删掉）。
+**例外说明**：`ADDITIVE_COLUMNS` / `DROP_COLUMNS` 里还留着一小撮「就地补列 / 删列」
+的逻辑，那是**上一轮**为保住 900 多条条目写的。本轮把播放位置收进 `playback_state`
+时删掉了 `playlists.last_index` / `videolists.last_index` —— 这**没有**再往那份名单里加条目：
+库是作者自己用 `ALTER TABLE` + `PRAGMA user_version` 一次性对齐的，代码里一行迁移都没写。
+以后凡是结构变化，默认就是这条：**手动对齐，或者清库重建**，不写兼容代码。
+
+续播相关的设置只有 `player.resumeOnStart`（要不要回到上次的秒数）；**播到哪个列表第几首
+在库里的 `playback_state`**（`source_kind` + `source_id` + `source_index`），
+秒数在 `userData/last_position` 文件里 —— 都已经不在 `setting.json` 里了。
 界面相关的：`common.themeColor` / `common.fontColor`（hex）、`common.glassTransparency`（0-100）、`common.glassBlur`（0-20）、`common.glassShadow`（0-20）。
 记录时机：切歌、切视频、视频加载完成、播放进度变化（节流 5 秒）、关闭窗口前。
 
@@ -3691,6 +3705,52 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
 `scripts/fingerprint.mjs` 仍然有用（`dist` 末尾自动跑），但产出的
 `release/fingerprint.json` 只是**中间产物**，CI 读完就丢，不进发布。
 
+### 为什么用 `net.fetch` 而不是全局 `fetch`
+
+有一阵子「关于」里点检查更新只回一句 `检查失败：fetch failed`，而同一台机器上浏览器
+打开 github.com 一点问题没有。查下去是这两条路的差别（同一台机器、同一个 URL）：
+
+```
+11-08 23:30   node -e "fetch(…)"        → fetch failed
+                                         cause: UNABLE_TO_VERIFY_LEAF_SIGNATURE（72ms）
+              electron net.fetch(…)     → 200
+
+11-09 16:15   node -e "fetch(…)"        → 200（683ms）   ← 什么都没改，隔天就好了
+              electron net.fetch(…)     → 200（840ms）
+```
+
+72 毫秒就死不是超时也不是被墙，是 **TLS 握手没通过**：那天本机有东西在做 HTTPS 中间人
+（代理客户端的 TLS 解密 / 安全软件），证书链被换成了它自己的。浏览器用**系统证书库**，
+里面有那张根证书；undici 用**自带的 CA 列表**，没有 —— 于是「浏览器能开、程序打不开」。
+隔天代理一关（`ProxyEnable = 0`）、hosts 里也没有 github 条目，两条路又都通了。
+
+**所以这不是 bug，是环境相关的间歇状态**，别把它写成「永远连不上」，也别指望某一方
+一定能复现。真正该处理的是「两套网络栈看到的世界不一样」—— 结论不是二选一，而是**两条都试**：
+
+```
+net.fetch（Chromium：系统代理 + 系统证书）──成功──→ 用它
+      │失败
+      ↓
+fetch（undici：直连 + 自带 CA）──────────成功──→ 用它
+      │失败
+      ↓
+报「两路都失败 —— 代理：<原因>；直连：<原因>」
+```
+
+两边的失败场景正好互补：只走 `fetch`，代理 + TLS 中间人时挂证书；只走 `net`，
+系统代理开着但代理软件退了（端口是死的）时 Chromium 会老老实实去连那个死端口。
+**任一条拿到响应就算成功**（404 也算 —— status 是另一回事，不该换路重试）。
+代价是最坏两轮超时（8 + 8 秒），但真实失败大多是毫秒级。
+
+实测（把第一路指向死端口）：`net::ERR_UNSAFE_PORT` → 换第二路 → `200` 并解析出 sha256。
+
+顺带把失败原因说成人话（`describeError()` + `HINTS`）：undici 的 `fetch failed` 是个空壳，
+真正的原因在 `err.cause`；Chromium 直接把 `net::ERR_*` 写在 message 上。两套码都认，
+再配一句提示 —— 不带上它，界面上那句「检查失败」等于什么都没说。
+
+**同时这也解释了为什么「检查更新」不能做成自动弹窗式报错**：状态会漂移，
+今天连不上不代表明天连不上，用户什么也做不了。自动检查继续静默，手动的才报原因。
+
 ### 为什么连不上就一声不吭
 
 GitHub 在国内经常不通（DNS 污染 / 超时）。失败也弹一句「检查更新失败」的话，
@@ -3749,22 +3809,29 @@ sha256 拼进发布说明正文。
 直接判失败 → 退回 `loadPlaylist()` 播空歌单。表现出来就是「歌单永远续不上」，
 而代码里一句报错都没有。
 
-### 切法：库里记「谁 + 第几条」，文件记「第几秒」
+### 切法：库里一行记「谁 + 第几条」，文件记「第几秒」
 
 ```
-playback_state (id = 1, source_kind, source_id)   -- 只有一个在播的源
-playlists.last_index / videolists.last_index      -- 各自播到第几条
-
-userData/last_position                            -- 一行数字：播到第几秒
+playback_state (id = 1, source_kind, source_id, source_index)  -- 唯一一个播放位置
+userData/last_position                                        -- 一行数字：播到第几秒
 ```
 
-- **「谁」全局唯一**（同一时刻只可能有一条线的一个列表在播）→ 单行表；
-- **「第几条」属于列表**（换列表就该是另一个下标）→ 跟各自那张表；
+- **「谁 + 第几条」是同一个事实的三段**（哪条线、哪个列表、第几条）→ 挤在一行；
 - **「第几秒」是全局的当前播放位置** → 一个几字节的文件，每秒覆盖。
 
-我一开始把秒数也按列表存了两列（`playlists.last_position` / `videolists.last_position`），
+下标曾经按列表各存一份（`playlists.last_index` / `videolists.last_index`），
+理由听起来也成立：「第几条属于列表」。但它和歌单的写库方式**直接打架**：
+`savePlaylists` 是整份覆盖（`DELETE FROM playlists` 再按渲染层传上来的对象重建），
+而 `saveProgress` 只改库、不改渲染层内存 —— 于是刚写对的 `last_index`
+会被下一次持久化（切歌单 / 加歌 / 重命名）带着内存里的旧值冲回去。
+症状是「视频续播一直好、歌单续播时灵时不灵」（视频列表走逐行 UPSERT，没有覆盖路径）。
+
+收进单行表之后这条路根本不存在：任何「覆盖列表」的写都碰不到它。
+
+我一开始还把秒数也按列表存了两列（`playlists.last_position` / `videolists.last_position`），
 一天就撤了：换列表、换来源，下一次播放就把它覆盖，分表存只是把同一个值切成 N 份
-互相打架的副本。删列用 `DROP COLUMN` 就地做（SQLite 3.35+），不为两列清空 800 条条目。
+互相打架的副本。删列用 `DROP COLUMN` 就地做（SQLite 3.35+），不为两列清空 800 条条目；
+老的 `last_index` 也一样 —— **代码里不写搬运逻辑**，库由作者自己对齐一次（见下一节）。
 
 ### 秒数为什么宁可写文件
 
@@ -3783,7 +3850,7 @@ userData/last_position                            -- 一行数字：播到第几
 
 ```
 每秒   system.savePosition() → playback:position → userData/last_position（文件）
-切歌   system.saveProgress() → playback:progress → 事务写库（playback_state + last_index）
+切歌   system.saveProgress() → playback:progress → 一行 UPSERT（playback_state）
 ```
 
 `saveProgress` 里还挡了一层「源 + 下标」的 key：没变就什么都不做 ——
@@ -3792,8 +3859,8 @@ userData/last_position                            -- 一行数字：播到第几
 以前是两条完全不同的路：视频走 `videolists:setIndex`（一行 UPDATE），
 歌单走 `playlists:save`（**全量覆盖**：`DELETE FROM playlists` + 重建 221 行
 `playlist_songs` 关系表），而 `timeupdate` 每 5 秒触发一次。写放大是次要的，
-真正的问题是「歌单那条路忘了写 last_index」这种 bug 只会在一条线上出现 ——
-两条路各写各的，就没有一处能保证对称。
+真正的问题是两条路各写各的、语义还不一样，就没有一处能保证对称 ——
+最后两边对同一个「播到第几条」给出不同的答案。
 
 ### 开关只管「从第几秒」，不管「播哪首」
 
@@ -3883,7 +3950,7 @@ IPC（`playlist:get` / `playlist:save` / `auth:reLogin` / `cache:clearSingle`）
 > 用 `electron-as-wallpaper` 换来了 Rust 工具链依赖和那个致命 bug。
 > 教训：**「暂时没用到」不等于「不需要」，尤其当替代方案会引入外部工具链时。**
 
-**后来又清掉的一批**（一次代码审查的结论）：`player.playIndex`（只写不读，续播用的是歌单的 `lastIndex`）、
+**后来又清掉的一批**（一次代码审查的结论）：`player.playIndex`（只写不读，续播用的是 `playback_state.source_index`）、
 `DuplicatePolicy` 的 `'keep'` 与那个从没人传的 `duplicatePolicy` 参数（现在同步固定去重）、
 `cache.clearSingle()`（IPC 与函数一起删了）、`ipc.ts` 里的 `PlaylistSong = string` / `Playlist`
 （与 `types/playlist.ts` 的结构化同名类型冲突，全项目已无引用）、`BROADCAST_EVENT_NAME` 里 11 个没人

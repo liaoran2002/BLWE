@@ -27,7 +27,7 @@
  * 不上传附件 —— 正文和安装包属于同一次发布，够用了，还省掉一次下载请求。
  * 本地打出来的包想手算也一样：`npm run fingerprint` 后看那个 json。
  */
-import { app, Notification, shell } from 'electron'
+import { app, net, Notification, shell } from 'electron'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -125,6 +125,75 @@ const parseRemoteBuild = (body: string): RemoteBuild | null => {
 }
 
 /**
+ * 常见失败原因 → 一句人话
+ *
+ * 这些码分两套：`net.fetch`（Chromium）给的是 `net::ERR_*`，全局 `fetch`（undici）
+ * 给的是 `ENOTFOUND` / `CERT_*` 这类 errno。两套都认，省得以后换回来又要改一遍。
+ */
+const HINTS: Array<{ test: RegExp; hint: string }> = [
+  {
+    test: /ERR_CERT|CERT_|UNABLE_TO_VERIFY|SELF_SIGNED|AUTHORITY_INVALID|DEPTH_ZERO/i,
+    hint: '本机有代理或安全软件在替换 HTTPS 证书，系统不认它',
+  },
+  {
+    test: /ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN|getaddrinfo/i,
+    hint: '域名解析不出来，检查 DNS 或代理',
+  },
+  { test: /ERR_INTERNET_DISCONNECTED|ENETUNREACH|EHOSTUNREACH/i, hint: '没有网络' },
+  { test: /ERR_CONNECTION_REFUSED|ECONNREFUSED/i, hint: '连接被拒绝，代理端口是不是没开' },
+  { test: /ERR_TIMED_OUT|ETIMEDOUT|ERR_CONNECTION_TIMED_OUT/i, hint: '连接超时' },
+  { test: /ERR_PROXY|ERR_TUNNEL/i, hint: '代理连不上' },
+]
+
+/**
+ * 把失败原因挖到底
+ *
+ * - undici 的 `fetch failed` 是个空壳，真正的原因（`ENOTFOUND` / `CERT_*`）在 `err.cause` 里；
+ * - Chromium 的 `net.fetch` 直接把 `net::ERR_*` 写在 message 上。
+ *
+ * 两条都收，再配一句人话 —— 否则界面上那句「检查失败：fetch failed」等于什么都没说。
+ * ⚠️ 这是**间歇性**的：同一台机器上代理开着 / 关着、切了节点，结果就可能不一样，
+ * 所以提示里不能写死「你没网」。
+ */
+const describeError = (err: unknown): string => {
+  if (!(err instanceof Error)) return String(err)
+  /** `AbortSignal.timeout` 抛的是 `TimeoutError`：说人话，别把 "The operation was aborted" 丢给用户 */
+  if (err.name === 'TimeoutError' || /aborted/i.test(err.message)) {
+    return `请求超时（${TIMEOUT_MS / 1000} 秒）`
+  }
+
+  const cause = (err as { cause?: unknown }).cause
+  const detail =
+    cause instanceof Error
+      ? [((cause as { code?: string }).code ?? ''), cause.message].filter(Boolean).join(': ')
+      : typeof cause === 'string'
+        ? cause
+        : ''
+
+  const all = `${err.message} ${detail}`
+  const hint = HINTS.find((item) => item.test.test(all))?.hint
+  const base = detail ? `${err.message}（${detail}）` : err.message
+  return hint ? `${base} —— ${hint}` : base
+}
+
+/**
+ * 一次请求的 init（两条路共用）
+ *
+ * `AbortSignal.timeout` **必须每次新建**：signal 一旦 abort 就不能复用，
+ * 拿同一个给第二次请求会立刻抛错。
+ */
+const requestInit = (): RequestInit => ({
+  headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'BLWE' },
+  signal: AbortSignal.timeout(TIMEOUT_MS),
+})
+
+interface FetchAttempt {
+  /** 日志 / 报错里怎么称呼这条路 */
+  name: string
+  run: () => Promise<Response>
+}
+
+/**
  * 取远端最新发布里的构建信息
  *
  * **一次请求就够**：那一行写在发布说明正文（`body`）里，不再另传附件。
@@ -133,15 +202,53 @@ const parseRemoteBuild = (body: string): RemoteBuild | null => {
  *
  * 跟 release 绑定这件事没变（正文也是这次发布的一部分），所以不会出现
  * 「提示有新版本、下到的却还是旧的」。可信度上也一样：能改正文的人同样能换附件。
+ *
+ * ## 两条路都试，都挂了才报错
+ *
+ * 这两条不是重复，它们看的是**两套不同的网络配置**：
+ *
+ * | 路 | 走什么 | 它什么时候才通 |
+ * | :--- | :--- | :--- |
+ * | `net.fetch` | Chromium：系统代理 + 系统证书库 + Chromium 的 DNS 缓存 | 机器上开着代理（「浏览器能开」的那种状态） |
+ * | `fetch` | Node undici：直连 + 自带 CA 列表 | 代理关了 / 系统代理指向一个没开的端口，但直连能出去 |
+ *
+ * 只留一条都会出现「明明能上网，它就是说失败」：
+ *  - 只走 `fetch`：代理 + TLS 中间人的机器上挂在证书（踩过 `UNABLE_TO_VERIFY_LEAF_SIGNATURE`，
+ *    而浏览器正常）；
+ *  - 只走 `net`：系统代理开着但代理软件退了的机器上，Chromium 会老老实实去连那个死端口。
+ *
+ * 所以两条都留着，**任一条拿到响应就算成功**（哪怕 404 —— status 是另一回事，不该换路重试）。
+ * 代价是最坏等两轮超时（8 + 8 秒）；真实失败大多是毫秒级（DNS / 证书 / 连接被拒），
+ * 只有「黑洞连接」才会等满。
  */
 const fetchRemoteBuild = async (): Promise<RemoteBuild & { url: string }> => {
-  const res = await fetch(RELEASE_API, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'BLWE' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  })
-  if (!res.ok) throw new Error(`GitHub 返回 ${res.status}`)
-  const release = (await res.json()) as ReleaseInfo
+  const attempts: FetchAttempt[] = []
+  /** `net` 必须等 app ready；没 ready 就只剩直连这一条（正常流程走不到这里） */
+  if (app.isReady()) {
+    attempts.push({ name: '代理', run: () => net.fetch(RELEASE_API, requestInit()) })
+  }
+  attempts.push({ name: '直连', run: () => fetch(RELEASE_API, requestInit()) })
 
+  const failures: string[] = []
+  let res: Response | null = null
+
+  for (let i = 0; i < attempts.length; i += 1) {
+    const attempt = attempts[i]
+    try {
+      res = await attempt.run()
+      break
+    } catch (err) {
+      failures.push(`${attempt.name}：${describeError(err)}`)
+      if (i < attempts.length - 1) {
+        console.log(`[update] ${attempt.name}这一路失败，换另一条重试：`, describeError(err))
+      }
+    }
+  }
+
+  if (!res) throw new Error(`两路都失败 —— ${failures.join('；')}`)
+  if (!res.ok) throw new Error(`GitHub 返回 ${res.status}`)
+
+  const release = (await res.json()) as ReleaseInfo
   const build = parseRemoteBuild(release.body ?? '')
   if (!build) throw new Error('发布说明里没有构建信息')
 
@@ -182,9 +289,13 @@ export const checkForUpdate = async (): Promise<UpdateCheckResult> => {
     /**
      * 失败就到这里为止：**不 log 成 error**，因为国内连不上是常态，
      * 每次启动刷一条红字只会让用户以为程序坏了。
+     *
+     * 但原因要留下来（`describeError` 会带上 `ENOTFOUND` / `CERT_*` 这类码），
+     * 否则「检查失败：fetch failed」看不出是没网、被墙，还是证书不认。
      */
-    console.log('[update] 检查更新失败（已静默）:', err instanceof Error ? err.message : err)
-    return { ...empty, error: err instanceof Error ? err.message : '连接失败' }
+    const reason = describeError(err)
+    console.log('[update] 检查更新失败（已静默）:', reason)
+    return { ...empty, error: reason }
   }
 }
 

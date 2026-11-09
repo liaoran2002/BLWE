@@ -247,7 +247,7 @@ export const useVideoListStore = defineStore('videoLists', () => {
     await load()
   }
 
-  /** 重新同步（`last_index` 由主进程按 bvid 重定位） */
+  /** 重新同步（播放位置由主进程按 bvid 重定位） */
   const sync = async (id: string): Promise<VideoListSyncResult> => {
     syncing.value = [...new Set([...syncing.value, id])]
     try {
@@ -360,6 +360,6 @@ export const useVideoListStore = defineStore('videoLists', () => {
     removeItem,
     setFavorite,
     sync,
-    items,
+    items,
   }
 })

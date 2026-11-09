@@ -153,17 +153,6 @@ export interface AppSetting {
   'player.loopMode': (typeof import('../constants').PLAY_LOOP_MODES)[number]
   /** 记住播放进度：启动时回到上次的歌单 / 歌曲 / 播放位置 */
   'player.resumeOnStart': boolean
-  /** 上次播放到的秒数（用于续播） */
-  /**
-   * 当前在播的 **某站视频列表** id（`bv_fav_123456` 这种）
-   *
-   * 空字符串 = 当前在播音乐歌单（由 `playlists.currentId` 说话）。
-   *
-   * 播放层只有一个 `songs` 数组，「这次打开该从哪个来源恢复」必须有个落盘的地方 ——
-   * 视频列表的播放位置存在 `videolists.last_index`（按 bvid 重定位过），
-   * 而「到底是哪个列表」就靠这个键。没有它，重启后会回到上次的音乐歌单，
-   * 用户刚导入的收藏夹等于每次都要重新点一遍。
-   */
   /**
    * 默认列表的 id（拖入单条视频时往这里放）
    *

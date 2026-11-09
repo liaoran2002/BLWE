@@ -131,18 +131,30 @@ const loadSqlite = (): SqliteConstructor => {
 /**
  * 播放状态的单行表（`id` 恒为 1）
  *
- * 回答的是「上次在播哪条线的哪个列表」，**它不是设置** —— 所以放库里，不放 setting.json。
- * 两条来源各自播到第几条第几秒记在自己的表上（`playlists` / `videolists` 的
- * `last_index` + `last_position`），这张表只回答「谁」。
+ * 回答「上次在播谁、第几条」，**它不是设置** —— 所以放库里，不放 setting.json。
+ *
+ * ## 为什么三样东西挤在一行里
+ *
+ * 它们是**同一个事实的三个部分**：`source_kind` 哪条线、`source_id` 哪个列表、
+ * `source_index` 第几条。合在一起才叫「一个播放位置」，拆开放各表就会出现
+ * 「源指向 A 列表、下标写的是 B 列表的」这种半截状态。
+ *
+ * 这里曾经把下标存在 `playlists` / `videolists` 各自的 `last_index` 上，
+ * 结果是：歌单侧写库是**整份覆盖**（`writePlaylistsToDb` 先 DELETE 再全插，
+ * 值取自渲染层内存），而 `saveProgress` 只改库不改内存 —— 于是刚写对的
+ * 下标会被下一次持久化（切歌单 / 加歌 / 重命名）带着旧值冲回去。
+ * 收进这张只有一行的表之后，那条覆盖路径根本碰不到它。
  *
  * `source_kind` 必须显式存：视频列表 id 是 'bv_xxx'，歌单 id 可能是 'pl_xxx' 或
  * 'tx_8153225605'，靠前缀猜类型是脆的（以后加一个来源就得改判据）。
  */
 const CREATE_PLAYBACK_STATE_SQL = `CREATE TABLE IF NOT EXISTS playback_state (
-  id          INTEGER PRIMARY KEY CHECK (id = 1),
-  source_kind TEXT,          -- 'ov'（视频列表）| 'mv'（音乐歌单）；空 = 没有在播的源
-  source_id   TEXT,          -- videolists.id 或 playlists.id
-  updated_at  INTEGER NOT NULL DEFAULT 0
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  source_kind  TEXT,          -- 'ov'（视频列表）| 'mv'（音乐歌单）；空 = 没有在播的源
+  source_id    TEXT,          -- videolists.id 或 playlists.id
+  -- 播到第几条（下标）。列表同步后按 bvid / songId 重新定位（见 utils/playback.ts）
+  source_index INTEGER NOT NULL DEFAULT 0,
+  updated_at   INTEGER NOT NULL DEFAULT 0
 );`
 const CREATE_TABLES_SQL = `
 -- 歌单
@@ -158,9 +170,8 @@ CREATE TABLE IF NOT EXISTS playlists (
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at     INTEGER,
   created_at       INTEGER NOT NULL,
-  updated_at       INTEGER NOT NULL,
-  -- 播到第几条（下标）
-  last_index       INTEGER NOT NULL DEFAULT 0
+  updated_at       INTEGER NOT NULL
+  -- 没有 last_index：播到第几条是**播放状态**，只有一条（playback_state.source_index）
 );
 
 ${CREATE_PLAYBACK_STATE_SQL}
@@ -340,8 +351,7 @@ CREATE TABLE IF NOT EXISTS videolists (
   -- 只对 interval 有意义；0 = 没设过
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at INTEGER,
-  -- 播到第几条（下标）。必须持久化：条目增删后要靠 bvid 重定位（见 utils/videolist.ts）
-  last_index   INTEGER NOT NULL DEFAULT 0,
+  -- 没有 last_index：见 playback_state.source_index（它是全局唯一的播放位置）
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
@@ -659,13 +669,16 @@ const DROP_COLUMNS: Array<{ table: string; column: string }> = [
   { table: 'videolists', column: 'last_position' },
 ]
 
+/** 这张表有没有这一列（`table_info` 空 = 表不存在） */
+const hasColumn = (database: SqliteDatabase, table: string, column: string): boolean =>
+  (database.pragma(`table_info("${table}")`) as Array<{ name: string }>).some(
+    (item) => item.name === column,
+  )
+
 const patchDroppedColumns = (database: SqliteDatabase): boolean => {
   let patched = false
   for (const item of DROP_COLUMNS) {
-    const columns = (database.pragma(`table_info("${item.table}")`) as Array<{ name: string }>).map(
-      (column) => column.name,
-    )
-    if (!columns.includes(item.column)) continue
+    if (!hasColumn(database, item.table, item.column)) continue
     database.exec(`ALTER TABLE "${item.table}" DROP COLUMN "${item.column}"`)
     console.log(`[db] 已删列 ${item.table}.${item.column}`)
     patched = true

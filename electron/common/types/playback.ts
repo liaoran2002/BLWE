@@ -1,15 +1,18 @@
 /**
  * 播放状态（**不是设置**）
  *
- * 「上次在播哪条线的哪个列表」和「那个列表播到第几条第几秒」都属于运行时状态，
+ * 「上次在播哪条线的哪个列表、第几条」和「播到第几秒」都属于运行时状态，
  * 所以它们落在数据库里，而不是 `setting.json`：
  *
- *  - `playback_state` 单行表 + `playlists` / `videolists` 各自的 `last_index` 回答「谁、第几条」；
+ *  - `playback_state` 单行表（`source_kind` + `source_id` + `source_index`）回答「谁、第几条」；
  *  - `userData/last_position` 一个小文件回答「第几秒」（它每秒都变，不值得写库）。
  *
- * 以前这两件事被切成两半：视频列表 id 塞进设置项 `player.activeVideoListId`（会落盘），
- * 而「当前歌单」只存主进程内存（重启就回到第一个歌单）。于是视频能续播、歌不能 ——
- * 这里把它合成一个概念，两条线共用同一套读写。
+ * 下标曾经按列表各存一份（`playlists.last_index` / `videolists.last_index`），
+ * 结果是歌单侧「整份覆盖」的持久化会把刚写对的位置冲回旧值 —— 续播时灵时不灵。
+ * 现在只有这一处：续播就是找出这一行、去对应列表取那一条。
+ *
+ * 以前这两件事还被切成两半：视频列表 id 塞进设置项 `player.activeVideoListId`
+ * （会落盘），而「当前歌单」只存主进程内存（重启就回到第一个歌单）。
  */
 
 /** 播放源类型：`ov` = 某站视频列表，`mv` = 音乐歌单 */
@@ -20,6 +23,13 @@ export interface PlaybackSource {
   kind: PlaybackSourceKind | ''
   /** `videolists.id` 或 `playlists.id` */
   id: string
+  /**
+   * 上次播到第几条（下标，0 起）
+   *
+   * 列表重新同步后主进程会按 bvid / songId 重新定位（见 `relocatePlaybackIndex`）——
+   * 下标本身会漂，这是它能当定位用的前提。
+   */
+  index: number
   /**
    * 上次播到第几秒
    *

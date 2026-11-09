@@ -266,7 +266,6 @@ export interface RendererAPI {
   removeVideoListItem: (id: string, bvid: string) => Promise<boolean>
   /** 收藏 / 取消收藏（收藏 = 置顶；取消收藏位置不动） */
   setVideoListItemFavorite: (id: string, bvid: string, favorite: boolean) => Promise<void>
-  /** 重新同步列表（`last_index` 会按 bvid 重定位，当前播放的仍是原来那条） */
   /** 加载下一页（懒加载） */
   loadMoreVideoListPage: (
     id: string,
