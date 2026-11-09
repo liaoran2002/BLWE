@@ -735,7 +735,7 @@ export default defineComponent({
       if (wasCurrent) void this.queue.onPlaylistSwitch(this.store.currentId);
       else void this.queue.reloadCurrentPlaylistSongs();
     },
-    /** 点歌单里的某首歌：切到该歌单并播放 */
+    /** 点歌单里的某首歌：切到该歌单并播放**这一条** */
     async play(index: number) {
       if (!this.selected) return;
       /**
@@ -745,7 +745,16 @@ export default defineComponent({
        */
       if (!this.isPlayingPlaylist(this.selected.id)) {
         await this.store.setCurrent(this.selected.id);
-        void this.queue.onPlaylistSwitch(this.selected.id);
+        /**
+         * 切源和「播第几条」**必须一次说完**
+         *
+         * 以前这里是 `void onPlaylistSwitch(id)` 再 `onPlayFromManager(index)`：
+         * 前者内部要 `await` 读播放状态，慢半拍回来把 `currentIndex` 拍回 0，
+         * 于是「点第 7 首」最后播的是第 1 首。把下标直接交给切源那一步，
+         * 只播一次、也不存在两次 playCurrent 抢。
+         */
+        await this.queue.onPlaylistSwitch(this.selected.id, index);
+        return;
       }
       void this.queue.onPlayFromManager(index);
     },

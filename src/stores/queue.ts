@@ -181,7 +181,7 @@ export interface QueueActions {
   reloadCurrentPlaylistSongs(): Promise<void>;
   loadPlaylist(): Promise<void>;
   onPlayFromManager(index: number): Promise<void>;
-  onPlaylistSwitch(id: string | null): Promise<void>;
+  onPlaylistSwitch(id: string | null, playIndex?: number): Promise<void>;
   setActiveVideoList(id: string): Promise<void>;
   onBrowsePlay(index: number): Promise<void>;
   onVideoListPlay(id: string, index: number): Promise<void>;
@@ -290,8 +290,15 @@ export const queueActions: ThisType<QueueContext> = {
     void this.playbackStore.playCurrent();
   },
 
-  /** 从歌单面板切换歌单 */
-  async onPlaylistSwitch(id: string | null): Promise<void> {
+  /**
+   * 从歌单面板切换歌单
+   *
+   * @param playIndex 点名要播第几首（用户在歌单里点了某一条）。
+   *   传了它就**直接播这一条**，不去猜什么「上次播放位置」——
+   *   「点哪条播哪条」是用户的手，不是程序能替他决定的。
+   *   不传（单纯切歌单 / 拖入导入）才读 `playback_state` 续上次的位置。
+   */
+  async onPlaylistSwitch(id: string | null, playIndex?: number): Promise<void> {
     /**
      * 切到音乐歌单 = 播放源从「视频列表」切回来
      *
@@ -325,14 +332,18 @@ export const queueActions: ThisType<QueueContext> = {
     this.songs = [...record.songs];
     this.listName = record.name;
     /**
-     * 起播位置只有「这个歌单就是上次在播的那个」时才有意义
+     * 起播位置
      *
-     * 播放位置存的是**一个**（`playback_state.source_index`），不是每个歌单一份 ——
-     * 切到另一个歌单还沿用上一个歌单的下标，纯属串台。
+     * - 用户在列表里点了某一条（`playIndex`）→ 就是它；
+     * - 单纯切歌单 → 只有「这个歌单就是上次在播的那个」才续位置，否则第一条。
+     *   播放位置存的是**一个**（`playback_state.source_index`），不是每个歌单一份，
+     *   拿别的歌单的下标来凑是串台。
      */
-    const playback = await electronApi.getPlaybackSource();
-    const resumeIndex =
-      playback.kind === 'mv' && playback.id === record.id ? playback.index : 0;
+    let resumeIndex = typeof playIndex === 'number' ? playIndex : 0;
+    if (typeof playIndex !== 'number') {
+      const playback = await electronApi.getPlaybackSource();
+      if (playback.kind === 'mv' && playback.id === record.id) resumeIndex = playback.index;
+    }
     this.currentIndex = Math.min(
       Math.max(0, resumeIndex),
       Math.max(0, record.songs.length - 1),
