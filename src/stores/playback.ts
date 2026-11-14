@@ -947,6 +947,18 @@ export const playbackActions: ThisType<PlaybackContext> = {
     // 这段窗口里旧视频元素报错不能算在新歌头上（否则会拿旧 bvid 重试，
     // 甚至把旧视频永久记到新歌名下），直接忽略。
     if (this.queueStore.videoListKeyword !== this.queueStore.currentKey) return;
+
+    /**
+     * **什么都没在播**时的报错没有归属，直接丢掉
+     *
+     * `clearNowPlaying()` 会把 `currentBvid` / `videoUrl` / `dashSource` 全清掉，
+     * 却不碰 `videoListKeyword` / `currentKey`（两个都是空串）—— 所以上面那道
+     * 「切歌窗口」守卫在这里恰好失效。这时迟到一声 `<video>` 的 error，会一路
+     * 走到最后那档「已跳过」并 `next()`，把下一首本来正常的歌跳掉。
+     *
+     * 判定用「三个播放态字段全空」：任一非空都说明确实有一条流该负责这次失败。
+     */
+    if (!this.currentBvid && !this.videoUrl && !this.dashSource) return;
   
     /**
      * dash（MSE）出错时先退回 durl，别直接判成「视频加载失败」。
@@ -1729,6 +1741,20 @@ export const playbackActions: ThisType<PlaybackContext> = {
     // 进度也属于上一条：不复位的话 playCurrent 会把上一条的秒数写进 resumeTime
     this.currentTime = 0;
     this.duration = 0;
+    /**
+     * 缓冲 UI 也属于上一条，换条立刻清
+     *
+     * 踩过：这里只清了视频信息，`buffering` / 百分比 / ticker 都留着 ——
+     * 用户在上一首缓冲到 95% 时切歌，新条要"搜索 + 解析"好几秒才出画，
+     * 这期间屏幕上一直挂着**上一条的 95%**，看起来就是"卡死了"。
+     * 清掉之后由 `onEngineStream` 的 `scheduleBufferOverlay()` 重新计时，
+     * 新条真要等也会从 0% 开始显示真实进度。
+     */
+    this.clearBufferOverlayTimer();
+    this.stopBufferTicker();
+    this.buffering = false;
+    this.bufferPercent = 0;
+    this.bufferSeconds = 0;
     this.systemStore.syncTrayState();
   },
 

@@ -3657,6 +3657,30 @@ JS 侧托盘 API 是否暴露图标矩形、`SetParent` 到 WorkerW 后 WebView2
 
 ---
 
+## 运行日志（打包后唯一的现场）
+
+**问题**：打包版没有控制台。用户遇到「卡在缓冲 95%」，能给的只有一张截图；
+而真正有用的东西（哪一首、解析到哪一步、看门狗有没有触发、渲染层报了什么）全在 `console` 里。
+
+**做法**：把**主进程 + 渲染层**的 `console` 一起落到 `userData/runtime.log`。
+
+| 决定 | 为什么 |
+| :--- | :--- |
+| 每次启动 `'w'` 清空重写 | 跑一个月就是几百兆，而真正要看的永远是最新那一段 |
+| 主进程包一层 `console` | 现有几十处调用点一行都不用改 |
+| 渲染层走 `console-message`，挂在 `browser-window-created` | 登录窗、壁纸窗各有自己的 webContents；只挂主窗口会在「壁纸模式下才复现」的问题上抓瞎 |
+| `writeSync` 而不是写流 | 退出路径 `process.on('exit')` 只能同步操作；流式写会丢最后几十行，而那几十行正是崩溃现场 |
+| 上限 8MB | 正常一天几百 KB；超了说明有东西在刷屏（那种情况本身该修），这里只防写满磁盘 |
+| 渲染层先过滤 `%c` 样式 | `console-message` 只给拼好的整串，不过滤的话一条彩色日志能占好几屏 |
+
+**两个环境两份日志**：dev 是 `%APPDATA%/BiLiWallpaperEngine/runtime.log`，
+便携版在 `blwedata/runtime.log` —— 同一个问题可以在「dev 复现」和「打包版复现」之间对着看。
+
+**初始化必须在单实例锁之后**：第二个实例也会以 `'w'` 打开同一个文件，
+放早了就把第一个实例正在写的内容清空了（和「`app.quit()` 是异步的、`whenReady` 仍会跑完」是同一个坑）。
+
+---
+
 ## 检查更新（指纹比对，不自动安装）
 
 **目标**：用户下次打开就能知道「发布页上那份和我手上这份不一样」，然后自己去下。
@@ -3915,6 +3939,8 @@ userData/last_position                                        -- 一行数字：
 | **第 4 轮的词和第 1 轮一模一样** | 括号在最前面时（`(Intro)` / `【伴奏】晴天`），正名是退回用括号内容撑起来的，而 `tail` 又是同一串 → 第 4 轮把第 1 轮的搜索词原样再发一次，纯浪费请求 | `tail` 的每个词都在 `name` 里时**置空**（`isCoveredBy`，按词集判而不是整串，词序不同也算重复），第 4 轮退回 `可视化` |
 | **带空格的歌名几乎必然被挡** | `【伴奏】晴天` 的正名是 `伴奏 晴天`，`normalize` 去掉空格后变成 `伴奏晴天`，要求标题里**连着**出现这 5 个字 —— 而实际标题是「伴奏 - 晴天」「晴天（伴奏）」，连不起来 | `passHardFilter` 里「**整串不中且是多词 → 拆词分别判**」，每个词都要独立出现。普通歌名（单词）行为完全不变 |
 | **换清晰度白打一次请求** | `switchQuality` 传了 `skipCache: true`，把「地址还没过期」这条快路径也废掉了 | 去掉 `skipCache`：某站一条 dash 流本来就带全部候选档位，库里存的 playurl 是**整个响应**，所以换档位只需 `extractDashStreams(缓存的 playurl, 新qn)` —— **不联网**。地址过期 / 没那个档位 / 登录态变了时，主进程自己会重新解析 |
+| **迟到的 `<video>` error 把下一首跳掉** | `clearNowPlaying()` 清了三态字段（`currentBvid` / `videoUrl` / `dashSource`），却没清 `videoListKeyword` / `currentKey` —— 两个都成了空串，`videoError` 开头那道「切歌窗口」守卫因此**恰好失效**，error 一路走到「已跳过」并 `next()` | `videoError` 开头再加一条：三态字段**全空**就直接返回（没有在播的流，这次报错没有归属）|
+| **停 MSE 会话时元素报「源不支持」** | `DashSession.stop()` 先 `revokeObjectURL`，而 `el.src` 还指着那个 blob → 下一轮事件里报 `MEDIA_ERR_SRC_NOT_SUPPORTED`，冒到播放层被当成「这条视频坏了」（白重解析一次，重则跳歌） | 顺序反过来：`pause` + `removeAttribute('src')` + `load()` 先把元素摘干净，再 revoke；且只在 `el.src` 确实等于这个 blob 时才动（被别的源接管过就不碰）|
 
 **主进程**
 
@@ -3936,6 +3962,7 @@ userData/last_position                                        -- 一行数字：
 | 打开外链没有白名单 | `app:openExternal` 只放行 http/https |
 | **用户可见文案里写满了内部细节** | 提示语原来长这样：「被某站限流了」「某站把请求拦下来了」「SourceBuffer 配额超限」「无法获取视频 CID」「HTTP 500」。用户会**截图**，等于把「我们在按接口规则大量请求 + 怎么实现的」写在屏幕上；而且对用户毫无帮助（他只需要知道「怎么办」）。现在**统一收口**：`errMsg()` 加一道技术文案过滤（状态码 / 全大写错误码 / `SourceBuffer` 等内部词命中就换成「操作失败，请稍后再试」，原文只进控制台）；各处 `throw` 的文案改成人话；`RateLimitError` 的 message 也改成中性措辞，识别靠**类型**而不是靠匹配「风控」这种词 |
 | **同时开两个实例 → 第二个窗口里一个歌单都没有** | 原来**没有单实例锁**。第二个实例完整跑起来、也去开同一个 `blwe.db` —— 而 **SQLite 允许多个连接打开同一文件**（`new Database()` 根本不会失败），于是它读到的歌单是空的（WAL 里第一个实例还没 checkpoint 的部分它看不见）。用户看到的就是「再开一个窗口，里面啥都没有」。<br>修法：`app.requestSingleInstanceLock()`，拿不到就 `app.quit()`；第一个实例监听 `second-instance` 用 `restoreWindow()` 把窗口拉到前台（顺带处理「窗口最小化了」「壁纸模式下挂在桌面层」两种状态 —— 裸 `show()` 对 WorkerW 子窗口是无效的）。<br>⚠️ **光 quit 不够**：`app.quit()` 是**异步**的，不会中断执行流，排队的 `whenReady` 回调照样跑完、照样 `initSetting` / `initPlaylists`（实测第二个实例日志里能看见 `[playlist] 已加载 0 个歌单`）。所以 `whenReady` 回调开头还要一道 `if (!singleInstanceLockHeld) return`。<br>⚠️ 顺序：锁必须在 `setupUserDataPath()` **之后**（便携版会改写 userData 路径，锁得跟着用同一个路径，否则便携版和安装版会被当成两个不同实例）、在 `initSetting()` **之前** |
+| **打包后出问题只能靠截图** | 加运行日志：主进程 + 渲染层的 `console` 一起落 `userData/runtime.log`（每次启动清空，上限 8MB）—— 设计取舍见下面「运行日志」一节 |
 
 **顺手删掉的死代码**：`common/index.ts`（没人 import 的 barrel）、`wallpaperDetect.ts`
 （WorkerW 检测没人调用，当时壁纸走的是 `electron-as-wallpaper`）、三个「声明了但从没被读取」的设置

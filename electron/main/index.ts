@@ -33,6 +33,7 @@ import {
 } from './utils/setting'
 import * as biliApi from './biliApi'
 import * as cacheManager from './utils/cache'
+import { closeRuntimeLog, initRuntimeLog } from './utils/runtimeLog'
 import { initPlaylists, flushPlaylists } from './utils/playlist'
 import { ensureDefaultVideoList, getVideoLists } from './utils/videolist'
 import { installMediaProtocol, mediaSchemeDescriptor } from './mediaProtocol'
@@ -2090,6 +2091,16 @@ void app.whenReady().then(async () => {
    */
   if (!singleInstanceLockHeld) return
 
+  /**
+   * 第 1.9 步：接上运行日志（`userData/runtime.log`，每次启动清空）
+   *
+   * 放在这里而不是更早：必须在**拿到单实例锁之后**，否则第二个实例会以 `'w'`
+   * 打开同一个文件，把第一个实例正在写的内容清掉。
+   * 也必须早于 `initSetting` / `initPlaylists`，这样启动阶段的日志才收得到。
+   * dev 下不落文件（终端里本来就能看），见 `initRuntimeLog`。
+   */
+  initRuntimeLog()
+
   // 第 2 步：初始化配置（读盘 + 迁移 + 合并默认值）与歌单集合
   initSetting()
   initPlaylists()
@@ -2541,6 +2552,7 @@ app.on('before-quit', () => {
   }
   flushSetting()
   flushPlaylists()
+  closeRuntimeLog()
 })
 
 // 兜底：进程即将退出时同步再刷一次

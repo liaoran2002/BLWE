@@ -653,6 +653,24 @@ FROM videolist_items)`）。
 或 `tx_8153225605`（平台导入）。猜前缀等于把「有哪些来源」写死在字符串判断里，
 以后加一个来源就得回来改判据 —— 所以 `source_kind` 显式存一列。
 
+### `utils/runtimeLog.ts` —— 运行日志（`userData/runtime.log`）
+
+**职责**：把**主进程 + 渲染层**的 `console` 一起落到一个文件里，打包后出问题有据可查。
+
+- 每次启动以 `'w'` 打开：**清空重写**，只留这一次运行；
+- 行首 `时间 [main|renderer] 级别`，多行文本按行加前缀；
+  **消息里不要再写 `[main]`** —— 那一列已经由 `write()` 统一加，写了就是重复；
+- 主进程用一层 `console` 包装（现有调用点一行不用改），渲染层走
+  `webContents.on('console-message')`（挂在 `browser-window-created` 上，登录窗 / 壁纸窗一起收）；
+- 渲染层日志先过一遍 `%c` 清理：三方库的彩色日志会把 `%c` 和一大串 CSS 一起带进来
+  （`console-message` 只给拼好的整串，不过滤的话一行能占好几屏），只留人能读的那句；
+- 用 `writeSync` 而不是流：`process.on('exit')` 里只能同步操作，否则崩溃前最后几十行正好丢掉；
+- 单次上限 8MB（正常一天几百 KB），超了写一行提示后停止。
+
+> dev 和打包版都写，但**是两个 userData 目录**（dev 是 `%APPDATA%/BiLiWallpaperEngine`，
+> 便携版是旁边的 `blwedata`），可以拿两份日志对着看。
+> 初始化位置必须在**单实例锁之后** —— 第二个实例会以 `'w'` 清掉第一个实例的日志。
+
 ### `utils/dropInput.ts` —— 拖入识别（新）
 
 **职责**：一段文本 → `DropInputTarget`（`music` / `song` / `list` / `video` / `none`）。

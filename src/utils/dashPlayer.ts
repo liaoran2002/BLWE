@@ -31,6 +31,15 @@ export interface MediaElementLike {
   readonly readyState: number
   readonly paused: boolean
   readonly seeking: boolean
+  /**
+   * 摘掉旧源用的三个能力（真实 `<video>` / `@types/dom` 里都有）
+   *
+   * 标成可选是因为这个接口是**精简**的：只为 DashSession 需要的那几个成员建模，
+   * 不想把整个 HTMLMediaElement 拖进来。调用处一律可选链 + 兜底。
+   */
+  pause?(): void
+  load?(): void
+  removeAttribute?(name: string): void
 }
 
 export interface DashSource {
@@ -377,7 +386,26 @@ export class DashSession {
         /* 忽略 */
       }
     }
+    /**
+     * 顺序不能反：**先让元素松开这个 blob，再 revoke**
+     *
+     * 踩过：直接 revoke 时 `el.src` 还指着它，元素会在下一轮事件里报一个
+     * `MEDIA_ERR_SRC_NOT_SUPPORTED`。那个 error 会冒到播放层，被当成「这条视频坏了」
+     * 处理 —— 轻则白重解析一次，重则直接跳掉下一首（`videoError` 的最后一档）。
+     *
+     * `load()` 会把元素带回 NETWORK_EMPTY：不等它，revoke 之后元素仍在尝试读
+     * 一个已经不存在的源。
+     */
     if (this.objectUrl) {
+      try {
+        if (this.el.src === this.objectUrl) {
+          this.el.pause?.()
+          this.el.removeAttribute?.('src')
+          this.el.load?.()
+        }
+      } catch {
+        /* 元素已被卸载，或者已被别的源接管 —— 那就不该由我们动它 */
+      }
       try {
         URL.revokeObjectURL(this.objectUrl)
       } catch {
