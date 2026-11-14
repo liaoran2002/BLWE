@@ -1553,20 +1553,14 @@ export const playbackActions: ThisType<PlaybackContext> = {
     // 歌曲信息先切过来：搜索往返期间界面显示的也该是这首歌
     this.queueStore.currentKey = songName;
   
+    /** 这轮搜索的候选（先拿在手里，等起播之后再铺到界面上，见下面） */
+    let candidates: BiliVideo[] = [];
     try {
       const res = await this.uiStore.withNet(() => electronApi.searchSong(parts.song, parts.singer));
-      const videos = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
-      /**
-       * 顺序已经是最终顺序 —— 主进程 `rankVideos` **在写库之前**排好的
-       * （收藏整段置顶，其余按「歌手名命中 +100」再叠关键词加权）。
-       * 渲染层**不再排序**，直接用返回的顺序。
-       */
-      this.queueStore.videoList = videos;
-      this.queueStore.videoListKeyword = songName;
+      candidates = (res.data as { result?: BiliVideo[] } | null)?.result ?? [];
     } catch (err) {
       // 搜索失败不致命：至少还能把记住的那个视频播起来
       console.warn('[resume] 搜索失败，只按记住的视频续播', err);
-      this.queueStore.videoList = [];
     }
   
     if (seekTo > 0) {
@@ -1577,11 +1571,24 @@ export const playbackActions: ThisType<PlaybackContext> = {
     // 交给 playCandidate 解析并起播：它顺手回填标题/封面/清晰度，地址过期会自动重取
     await this.playCandidate(cachedBvid);
     if (this.currentBvid === cachedBvid && (this.videoUrl || this.dashSource)) {
+      /**
+       * ★ 候选列表必须在**起播之后**铺
+       *
+       * `playCandidate` 走的是「在当前这一条里换 bvid」那条路，候选沿用
+       * `engine.current.candidates` —— 而刚启动时 `current` 还是 null，
+       * 于是 `onEngineStream` 收到的是空候选，按「视频条目」的规则把
+       * `videoList` 清空了。之前在这里（起播之前）赋值，正好被它冲掉，
+       * 结果续播后打开视频列表只有孤零零一条。
+       */
+      this.queueStore.videoList = candidates;
+      this.queueStore.videoListKeyword = songName;
+      this.queueStore.currentVideoIndex = candidates.findIndex((v) => v.bvid === cachedBvid);
+  
       // 记住的视频不在这轮搜索结果里 -> 补成列表第一项，别让「正在播的」在列表里找不到
       if (this.queueStore.currentVideoIndex < 0) {
         this.queueStore.videoList = [
           { bvid: cachedBvid, title: this.queueStore.videoName, pic: this.videoPic || null },
-          ...this.queueStore.videoList,
+          ...candidates,
         ];
         this.queueStore.currentVideoIndex = 0;
       }
@@ -1589,7 +1596,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
     }
   
     // 记住的视频已经播不了（被删 / 换源）-> 退回搜索结果第一条
-    const first = this.queueStore.videoList[0];
+    const first = candidates[0];
     if (!first || first.bvid === cachedBvid) return false;
     console.warn('[resume] 记住的视频已失效，改用搜索结果第一条', first.bvid);
     await this.playCandidate(first.bvid);
