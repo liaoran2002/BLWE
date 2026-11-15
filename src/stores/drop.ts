@@ -5,10 +5,12 @@
  * 指针拿到别的 store 实例（惰性求值，所以模块之间可以互相 import 而不成环）。
  */
 import { defineStore } from 'pinia';
+import { DEFAULT_PLAYLIST_ID, isLocalPlaylistId } from '@common/types/playlist';
 import type { DropInputTarget } from '@common/types/playlist';
 import type { AppData } from '../types/app';
 import { ElMessage } from 'element-plus';
 import electronApi from '../api/electron';
+import { isInternalDrag } from '../utils/dnd';
 import { probeMedia } from '../utils/mediaProbe';
 
 import { usePlaylistStore } from './playlists';
@@ -17,10 +19,22 @@ import { useUiStore } from './ui';
 import { useVideoListStore } from './videoLists';
 
 /** ===== state ===== */
-export type DropState = Pick<
-  AppData,
-  'dropActive' | 'dropBusy' | '_dragDepth'
->;
+/** 拖入落点的一侧：默认列表 / 当前列表（只在分栏时存在） */
+export interface DropPane {
+  kind: 'ov' | 'mv'
+  id: string
+  name: string
+}
+
+export type DropState = Pick<AppData, 'dropActive' | 'dropBusy' | '_dragDepth'> & {
+  /**
+   * 鼠标现在停在遮罩的哪半边（`''` = 不分栏，或还没移动过）
+   *
+   * 遮罩本身是 `pointer-events: none`（它必须让 drop 事件穿过去），
+   * 所以没法用 hover 判断 —— 在 `dragover` 里按 `clientX` 算。
+   */
+  dropHalf: 'left' | 'right' | ''
+};
 
 export const dropState = (): DropState => ({
   /** 正拖着东西悬在窗口上（显示「松手导入」遮罩） */
@@ -31,6 +45,8 @@ export const dropState = (): DropState => ({
 
   /** dragenter/dragleave 的进出计数（子元素之间移动也会触发，不能只用布尔） */
   _dragDepth: 0,
+
+  dropHalf: '',
 });
 
 /** ===== getters ===== */
@@ -39,7 +55,16 @@ export interface DropGetters {
   readonly queueStore: ReturnType<typeof useQueueStore>;
   readonly uiStore: ReturnType<typeof useUiStore>;
   readonly videoListsStore: ReturnType<typeof useVideoListStore>;
-
+  /**
+   * 左右两个落点（`null` = 不分栏，走老的「直接进默认列表」逻辑）
+   *
+   * 只有「当前在播的是**本地**列表且不是默认那个」时才分栏：
+   *  - 视频线：当前列表 `kind === 'local' && !isDefault`；
+   *  - 歌单线：当前歌单带 `pl_` 前缀且不是 `pl_default`。
+   *
+   * 平台歌单 / 平台列表不分栏 —— 往它们里面加东西，下次同步就没了。
+   */
+  readonly dropTargets: { left: DropPane; right: DropPane } | null;
 }
 
 export type DropGetterFns = { [K in keyof DropGetters]: () => DropGetters[K] };
@@ -50,6 +75,27 @@ export const dropGetters: ThisType<DropContext> = {
   uiStore: () => useUiStore(),
   videoListsStore: () => useVideoListStore(),
 
+  dropTargets(): { left: DropPane; right: DropPane } | null {
+    if (this.queueStore.mode === 'ov') {
+      const current = this.videoListsStore.find(this.videoListsStore.activeId);
+      if (!current || current.kind !== 'local' || current.isDefault) return null;
+      const def = this.videoListsStore.lists.find((item) => item.isDefault);
+      if (!def || def.id === current.id) return null;
+      return {
+        left: { kind: 'ov', id: def.id, name: def.name },
+        right: { kind: 'ov', id: current.id, name: current.name },
+      };
+    }
+    const current = this.playlistsStore.current;
+    if (!current || current.id === DEFAULT_PLAYLIST_ID) return null;
+    if (!isLocalPlaylistId(current.id)) return null;
+    const def = this.playlistsStore.playlists.find((item) => item.id === DEFAULT_PLAYLIST_ID);
+    if (!def || def.id === current.id) return null;
+    return {
+      left: { kind: 'mv', id: def.id, name: def.name },
+      right: { kind: 'mv', id: current.id, name: current.name },
+    };
+  },
 };
 
 /** ===== actions ===== */
@@ -57,17 +103,22 @@ export interface DropActions {
   dropTextOf(e: DragEvent): string;
   onDocDragEnter(e: DragEvent): void;
   onDocDragOver(e: DragEvent): void;
-  onDocDragLeave(): void;
+  onDocDragLeave(e?: DragEvent): void;
   onDocDrop(e: DragEvent): void;
   handleDroppedText(text: string): Promise<void>;
   dropImportMusic(url: string): Promise<void>;
   dropImportSong(url: string): Promise<void>;
-  dropImportList(target: {
-    kind: 'fav' | 'season' | 'series' | 'space';
-    id: string;
-    mid?: string;
-  }): Promise<void>;
+  dropImportList(
+    target: {
+      kind: 'fav' | 'season' | 'series' | 'space';
+      id: string;
+      mid?: string;
+    },
+    /** 原始链接：分栏（并进已有列表）时要拿它去预览，不能只有解析出的 id */
+    input?: string,
+  ): Promise<void>;
   dropImportVideo(input: string): Promise<void>;
+  dropPaneFor(kind: 'ov' | 'mv'): DropPane | null;
   handleDroppedFiles(files: File[]): Promise<void>;
   probeLocalDurations( listId: string, items: Array<{ bvid: string; url: string }>, ): Promise<void>;
 }
@@ -113,6 +164,12 @@ export const dropActions: ThisType<DropContext> = {
 
   /** 拖着东西**进入**窗口：只有「像链接/文本/文件」的才算，其他（比如选中的文字）不显示遮罩 */
   onDocDragEnter(e: DragEvent): void {
+    /**
+     * 界面内的排序拖动（管理弹窗里拖条目 / 拖列表）不是「拖入」：
+     * 它同样带着 `text/plain`，不挡掉的话整窗会闪出「松手导入」遮罩。
+     * 见 `utils/dnd.ts`。
+     */
+    if (isInternalDrag(e)) return;
     const dt = e.dataTransfer;
     if (!dt) return;
     const types = Array.from(dt.types);
@@ -131,18 +188,71 @@ export const dropActions: ThisType<DropContext> = {
 
   /** 悬停：**必须** preventDefault，否则 Electron 会把拖进来的链接当页面导航（窗口白屏） */
   onDocDragOver(e: DragEvent): void {
+    /**
+     * 排序拖动在**这里连 `preventDefault` 都不能做**（也不能写 `dropEffect`）
+     *
+     * 这个监听挂在 `document` 上、走冒泡 —— 它在条目的 `dragover` **之后**执行。
+     * 那边刚声明 `effectAllowed = 'move'`（拖着的行自己），这里再写
+     * `dropEffect = 'copy'`，浏览器认为两者不兼容，会把 `dropEffect` 归零；
+     * 而 `dropEffect === 'none'` 时松手**不会派发 `drop`** —— 这就是「拖动排序松手没反应」。
+     *
+     * 返回之后没有任何人 preventDefault 也没关系：条目自己的 `dragover` 已经 prevent 了，
+     * 落到空白处本来也就该是「拖回原处、什么都不发生」。
+     */
+    if (isInternalDrag(e)) return;
+    /**
+     * 分栏时记录鼠标落在哪半边
+     *
+     * 遮罩是 `pointer-events: none`（必须让 drop 穿过去），所以不能靠 hover；
+     * 只在 `dragover` 里按 `clientX` 算，滚轮 / 布局都影响不到它。
+     */
+    this.dropHalf = this.dropTargets
+      ? e.clientX < window.innerWidth / 2
+        ? 'left'
+        : 'right'
+      : '';
+    /**
+     * 内层已经接管了这次悬停（比如排序条目在上面 `preventDefault` 并声明了 `move`）：
+     * 这里再写一次 `dropEffect = 'copy'`，两种操作不一致时浏览器会把 `dropEffect` 归零，
+     * 而它为 `none` 时松手**不派发 `drop`** —— 排序「松手没反应」正是这么来的。
+     * 认这个信号而不是只认自定义类型：万一某个环境不让写自定义类型，这条也能兜住。
+     */
+    if (e.defaultPrevented) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
   },
 
   /** 离开：减计数，减到 0 才算真的离开窗口 */
-  onDocDragLeave(): void {
+  onDocDragLeave(e?: DragEvent): void {
+    /** 排序拖动没计过数（见 `onDocDragEnter`），也就没有「离开」可言 */
+    if (e && isInternalDrag(e)) return;
     this._dragDepth = Math.max(0, this._dragDepth - 1);
-    if (this._dragDepth === 0 && !this.dropBusy) this.dropActive = false;
+    if (this._dragDepth === 0 && !this.dropBusy) {
+      this.dropActive = false;
+      this.dropHalf = '';
+    }
   },
 
   /** 松手 */
   onDocDrop(e: DragEvent): void {
+    /**
+     * 排序拖动的松手由条目自己的 `drop` 处理（重排顺序）。
+     * 让它冒上来会走到「把 text/plain 当链接去识别」那条路 —— 弹一句「没认出这是什么」。
+     */
+    if (isInternalDrag(e)) return;
+    /**
+     * 第二道闸：某个元素已经在自己的 `drop` 里 `preventDefault` 并处理掉了
+     * （排序拖动就是这条路），别再把它当「拖进来的链接」识别一遍。
+     * 外部的文件 / 链接落到行上时，行那边会**故意不** preventDefault，仍然走下面。
+     */
+    if (e.defaultPrevented) {
+      this._dragDepth = 0;
+      if (!this.dropBusy) {
+        this.dropActive = false;
+        this.dropHalf = '';
+      }
+      return;
+    }
     e.preventDefault();
     this._dragDepth = 0;
     if (this.dropBusy) return;
@@ -200,19 +310,50 @@ export const dropActions: ThisType<DropContext> = {
     try {
       if (target.type === 'music') await this.dropImportMusic(target.url);
       else if (target.type === 'song') await this.dropImportSong(target.url);
-      else if (target.type === 'list') await this.dropImportList(target);
+      else if (target.type === 'list') await this.dropImportList(target, raw);
       else await this.dropImportVideo(target.input);
     } catch (err) {
       ElMessage.error('导入失败：' + this.uiStore.errMsg(err));
     } finally {
       this.dropBusy = false;
       this.dropActive = false;
+      this.dropHalf = '';
     }
+  },
+
+  /**
+   * 这次拖入该落到哪一侧（`null` = 不分栏，走老逻辑）
+   *
+   * 要按**内容类型**匹配：分栏只在同一条线上才成立 —— 当前在播视频列表时，
+   * 拖进来的是一首歌就没有「左/右」可言，老老实实进默认歌单。
+   */
+  dropPaneFor(kind: 'ov' | 'mv'): DropPane | null {
+    if (!this.dropHalf) return null;
+    const targets = this.dropTargets;
+    if (!targets) return null;
+    const pane = targets[this.dropHalf];
+    return pane.kind === kind ? pane : null;
   },
 
   /** 拖入的是**音乐歌单**：导入（已有则同步）→ 播第一首 */
   async dropImportMusic(url: string): Promise<void> {
     this.uiStore.closeManagers();
+    /** 分栏：并进**已有的**歌单，不新建、不打断正在播的 */
+    const pane = this.dropPaneFor('mv');
+    if (pane) {
+      const result = await electronApi.importMusicIntoPlaylist(pane.id, url);
+      await this.playlistsStore.load();
+      ElMessage.success(
+        result.kind === 'song'
+          ? result.added
+            ? `已加入《${result.name}》`
+            : `《${result.name}》里已经有这首了`
+          : `已向《${result.name}》加入 ${result.added} 首` +
+              (result.duplicated > 0 ? `（${result.duplicated} 首已有）` : ''),
+      );
+      return;
+    }
+
     const { record, existed } = await electronApi.importMusicPlaylist(url);
     await this.playlistsStore.load();
     ElMessage.success(
@@ -233,7 +374,8 @@ export const dropActions: ThisType<DropContext> = {
    */
   async dropImportSong(url: string): Promise<void> {
     this.uiStore.closeManagers();
-    const { record, added, songName } = await electronApi.importMusicSong(url);
+    const pane = this.dropPaneFor('mv');
+    const { record, added, songName } = await electronApi.importMusicSong(url, pane?.id ?? '');
     await this.playlistsStore.load();
     /**
      * 只说「哪首歌进了哪个歌单」。不提「第 N 首」：
@@ -245,12 +387,39 @@ export const dropActions: ThisType<DropContext> = {
   },
 
   /** 拖入的是 **某站列表**：导入（已有则同步）→ 从上次那个视频起播 */
-  async dropImportList(target: {
-    kind: 'fav' | 'season' | 'series' | 'space';
-    id: string;
-    mid?: string;
-  }): Promise<void> {
+  async dropImportList(
+    target: {
+      kind: 'fav' | 'season' | 'series' | 'space';
+      id: string;
+      mid?: string;
+    },
+    input = '',
+  ): Promise<void> {
     this.uiStore.closeManagers();
+    /**
+     * 分栏：把整个收藏夹 / 合集**并进已有列表**，而不是新建一个
+     *
+     * 这是「往这个列表里补充内容」的语义，所以不打断正在播的那条。
+     */
+    const pane = this.dropPaneFor('ov');
+    if (pane) {
+      if (!input.trim()) throw new Error('没有拿到链接');
+      const preview = await this.videoListsStore.previewImport(input);
+      if (preview.type === 'none') throw new Error('没认出这个链接');
+      if (preview.type === 'video') {
+        await this.videoListsStore.addItem(pane.id, preview.item);
+        ElMessage.success(`已加入《${pane.name}》`);
+      } else {
+        const result = await this.videoListsStore.addItems(pane.id, preview.items);
+        ElMessage.success(
+          `已向《${pane.name}》加入 ${result.added} 条` +
+            (result.existed > 0 ? `（${result.existed} 条已在列表里）` : '') +
+            (preview.skipped > 0 ? `，跳过 ${preview.skipped} 个不支持的条目` : ''),
+        );
+      }
+      await this.uiStore.loadBrowseList();
+      return;
+    }
     const { record, skipped, existed } = await this.videoListsStore.add(
       target.kind,
       target.id,
@@ -274,7 +443,11 @@ export const dropActions: ThisType<DropContext> = {
    */
   async dropImportVideo(input: string): Promise<void> {
     this.uiStore.closeManagers();
-    const { listId, listName } = await this.videoListsStore.addItemToDefault(input);
+    const pane = this.dropPaneFor('ov');
+    const { listId, listName } = await this.videoListsStore.addItemToDefault(
+      input,
+      pane?.id ?? '',
+    );
     ElMessage.success(`已加入《${listName}》，正在播放`);
     await this.uiStore.loadBrowseList();
     await this.queueStore.onVideoListPlay(listId, 0);
@@ -306,13 +479,16 @@ export const dropActions: ThisType<DropContext> = {
       return;
     }
   
+    const pane = this.dropPaneFor('ov');
     this.dropBusy = true;
     this.dropActive = true;
     try {
       this.uiStore.closeManagers();
   
-      const { listId, listName, items, skipped } =
-        await this.videoListsStore.importLocal(paths);
+      const { listId, listName, items, skipped } = await this.videoListsStore.importLocal(
+        paths,
+        pane?.id ?? '',
+      );
   
       if (items.length === 0) {
         ElMessage.error(
@@ -338,6 +514,7 @@ export const dropActions: ThisType<DropContext> = {
     } finally {
       this.dropBusy = false;
       this.dropActive = false;
+      this.dropHalf = '';
     }
   },
 

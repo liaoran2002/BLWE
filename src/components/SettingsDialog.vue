@@ -572,6 +572,47 @@
           </div>
         </div>
       </div>
+      <!-- 数据 -->
+      <div :data-section="'data'" class="st-group">
+        <div class="st-group-title">数据</div>
+        <!--
+          配置文件位置
+
+          ⚠️ 这不是 `setting.json` 里的一项：这条设置要回答「setting.json 在哪个目录」，
+          存进 setting.json 就成了自指。它落在 `%APPDATA%/BLWE/data-dir.json`，
+          由主进程在 `setupUserDataPath()` 里读（见 `main/portable.ts`）。
+
+          改完必须重启才生效 —— 运行中换 userData 等于把开着的 SQLite 和已读进内存的
+          配置一起搬家，那是另一件事。
+        -->
+        <div class="st-row st-row--stack">
+          <div class="st-name">配置文件位置</div>
+          <el-radio-group
+            :model-value="dataDir?.mode ?? 'appdata'"
+            :disabled="dataDirBusy"
+            @update:model-value="(v) => onDataDirMode(v as DataDirMode)"
+          >
+            <el-radio value="appdata">APPDATA</el-radio>
+            <el-radio value="portable">便携版</el-radio>
+            <el-radio value="custom">自定义</el-radio>
+          </el-radio-group>
+          <div class="st-desc st-path">
+            当前：{{ dataDir?.currentPath || '读取中…' }}
+            <el-button
+              v-if="dataDir?.mode === 'custom'"
+              link
+              type="primary"
+              size="small"
+              @click="pickCustomDir"
+            >
+              重新选择
+            </el-button>
+          </div>
+          <div class="st-desc">
+            改完需要重启生效；新位置是一份独立的数据，不会自动搬运已有的歌单和收藏。
+          </div>
+        </div>
+      </div>
       </div>
     </div>
 
@@ -580,7 +621,7 @@
 
 <script lang="ts">
 import { defineComponent } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import {
   ASPECT_RATIO_FREE,
   ASPECT_RATIO_MAX_LENGTH,
@@ -617,6 +658,7 @@ import {
   VIDEO_QUALITY_OPTIONS,
 } from '@common/constants';
 import type { AppSetting } from '@common/types/app_setting';
+import type { DataDirInfo, DataDirMode } from '@common/types/dataDir';
 import api from '../api/electron';
 import { useSettingStore } from '../stores/setting';
 import { parseHexColor } from '../utils/uiTheme';
@@ -643,6 +685,7 @@ const TABS = [
   { key: 'ui', label: '界面' },
   { key: 'common', label: '通用' },
   { key: 'search', label: '搜索' },
+  { key: 'data', label: '数据' },
 ] as const;
 
 type TabKey = (typeof TABS)[number]['key']
@@ -737,6 +780,10 @@ export default defineComponent({
        * 点了别的档的「删除分值档」会把待确认的换成那一档。
        */
       deletingScore: null as string | null,
+      /** 「配置文件位置」：当前目录 / 三种来源的路径（主进程给的，界面不自己拼） */
+      dataDir: null as DataDirInfo | null,
+      /** 正在改这一项（解析路径 + 写指针 + 可能弹重启确认），期间禁掉 radio */
+      dataDirBusy: false,
     };
   },
   computed: {
@@ -832,17 +879,26 @@ export default defineComponent({
     },
   },
   watch: {
-    // 每次打开时刷新一次占用
-    modelValue(visible: boolean) {
+    /**
+     * 每次打开时刷新一次占用、重读「配置文件位置」
+     *
+     * ⚠️ 这里 watch 的是 `visible`（computed，背后是 `ui.settingsVisible`），
+     * **不是 `modelValue`**：这个弹窗的开关早就改成走 store 了，
+     * 组件根本没有 `modelValue` 这个 prop。以前这里写的是 `modelValue`，
+     * 于是整段回调从来没触发过 —— 表现为「配置文件位置一直显示读取中、radio 点了没反应」，
+     * 以及关弹窗时 rAF 循环没被收掉。
+     */
+    visible(visible: boolean) {
       if (visible) {
         void this.refreshCacheStats();
+        void this.loadDataDir();
         return;
       }
       /**
        * 关弹窗时把「滚动停止检测」停掉
        *
-       * ⚠️ 这个组件是**常驻挂载**的（`v-model` 而不是 `v-if`），
-       * 所以关弹窗不会触发 `beforeUnmount` —— 清理必须写在这里。
+       * ⚠️ 这个组件是**常驻挂载**的，所以关弹窗不会触发 `beforeUnmount` ——
+       * 清理必须写在这里。
        *
        * `watchScrollSettle` 是个自我调度的 rAF 循环。用户点着左栏目录、
        * 滚动还没停就关掉弹窗时，循环里读的是已经隐藏的容器，
@@ -855,7 +911,11 @@ export default defineComponent({
     },
   },
   mounted() {
-    if (this.visible) void this.refreshCacheStats();
+    /** 正常不会「挂载时就已经打开」，但组件一旦被别处提前渲染，这里也该跟上 */
+    if (this.visible) {
+      void this.refreshCacheStats();
+      void this.loadDataDir();
+    }
   },
   beforeUnmount() {
     /** 组件真被销毁时（App 卸载）也兜一次，别留着 rAF */
@@ -868,6 +928,109 @@ export default defineComponent({
     set<K extends keyof AppSetting>(key: K, value: AppSetting[K]): void {
       void this.store.update({ [key]: value } as Partial<AppSetting>);
     },
+
+    // #region 配置文件位置
+    /**
+     * 读「配置文件位置」的现状
+     *
+     * 每次打开设置都重读一次：这一项不归 `setting.json` 管，主进程才是权威
+     * （用户可能上次改完没重启，也可能手动动过指针文件）。就一次 IPC。
+     */
+    async loadDataDir(): Promise<void> {
+      try {
+        this.dataDir = await api.getDataDir();
+      } catch (err) {
+        console.warn('[setting] 读取配置文件位置失败', err);
+      }
+    },
+
+    /**
+     * 换「配置文件位置」
+     *
+     * 选「自定义」时**先弹文件夹选择框**：点这个 radio 的意图就是挑目录，
+     * 用户取消就什么都不做（radio 保持原样 —— 不能出现「选了自定义却没路径」的状态）。
+     *
+     * 写完只落指针文件，**不立刻生效**：`setupUserDataPath()` 只在启动时跑一次，
+     * 所以这里固定提示重启。
+     */
+    async onDataDirMode(mode: DataDirMode): Promise<void> {
+      if (this.dataDirBusy) return;
+      /**
+       * 还没读到现状就先补读一次
+       *
+       * 万一 `getDataDir` 那次失败（或弹窗刚打开、读盘还没回来），
+       * 直接 return 会让这一项**永久点不动** —— 用户只能重启程序，
+       * 而他并不知道要重启。这里多花一次 IPC，把状态救回来。
+       */
+      if (!this.dataDir) await this.loadDataDir();
+      if (!this.dataDir) {
+        ElMessage.error('读取配置文件位置失败，请重开设置或重启程序');
+        return;
+      }
+      /** 已经在这个模式上（自定义除外，那一次点击本来就该重新挑目录） */
+      if (this.dataDir.mode === mode && mode !== 'custom') return;
+      await this.applyDataDir(mode);
+    },
+
+    /** 「重新选择」：已经是自定义时换一个文件夹 */
+    async pickCustomDir(): Promise<void> {
+      if (this.dataDirBusy) return;
+      await this.applyDataDir('custom');
+    },
+
+    /** 真正落盘：可能要弹选择框、可能弹重启确认 */
+    async applyDataDir(mode: DataDirMode): Promise<void> {
+      if (!this.dataDir) return;
+      let customPath = this.dataDir.customPath;
+      if (mode === 'custom') {
+        const picked = await api.pickDataDir();
+        if (!picked) return;
+        customPath = picked;
+      }
+
+      this.dataDirBusy = true;
+      try {
+        const result = await api.setDataDir({ mode, customPath });
+        if (!result.ok) {
+          ElMessage.error(result.error || '设置失败');
+          return;
+        }
+        await this.loadDataDir();
+        /**
+         * 提示里要给**将来生效**的目录，不是「现在在用的」
+         *
+         * `dataDir.currentPath` 问的是主进程「本次运行读写的目录」，
+         * 刚保存完它还没变（`setupUserDataPath()` 只在启动时跑一次），
+         * 直接拿它显示会写成旧路径 —— 用户以为改到了别的地方。
+         * 所以按模式自己选对应的那个路径。
+         */
+        const target =
+          mode === 'custom'
+            ? customPath
+            : mode === 'portable'
+              ? (this.dataDir?.portablePath ?? '')
+              : (this.dataDir?.appdataPath ?? '');
+        try {
+          await ElMessageBox.confirm(
+            `配置文件位置已改为：\n${target}\n\n` +
+              `重启后生效；重启前仍在用：${this.dataDir?.currentPath ?? ''}\n` +
+              '新位置是一份独立的数据，原来目录里的歌单和收藏不会自动搬过去。',
+            '需要重启',
+            { confirmButtonText: '立即重启', cancelButtonText: '稍后', type: 'warning' },
+          );
+        } catch {
+          // 点了「稍后」：设置已经写好了，下次启动自然生效
+          ElMessage.success('已保存，下次启动生效');
+          return;
+        }
+        await api.relaunchApp();
+      } catch (err) {
+        ElMessage.error('设置失败：' + (err instanceof Error ? err.message : String(err)));
+      } finally {
+        this.dataDirBusy = false;
+      }
+    },
+    // #endregion
 
     // #region 左侧目录（滚动定位 + scroll spy）
     /**
@@ -1658,6 +1821,21 @@ export default defineComponent({
 /* 标签行要**顶对齐**：标签可能换行，居中会让左标题浮在中间很怪 */
 .st-row--tags {
   align-items: flex-start;
+}
+/*
+ * 「配置文件位置」这种**上下排**的行
+ *
+ * radio 三个选项加上路径可能很宽，横排会把 `.st-name` 挤成两行、路径还会溢出。
+ * 改成上下：标题一行，控件一行，说明文字各自换行。
+ */
+.st-row--stack {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+/* 路径可能很长，允许在任意位置折行（不然会顶出弹窗） */
+.st-path {
+  word-break: break-all;
 }
 .st-row:last-child {
   border-bottom: none;

@@ -16,7 +16,7 @@
 -->
 <template>
   <el-dialog
-    v-model="visible"
+    v-model="shown"
     width="620px"
     :show-close="false"
     align-center
@@ -130,6 +130,7 @@ import { defineComponent } from 'vue';
 import { ElMessage } from 'element-plus';
 import type { VideoImportPreview, VideoMetaInput } from '@common/types/playlist';
 import { normalizeImageUrl } from '../utils/image';
+import { toPlain } from '../utils/plain';
 import { useVideoListStore } from '../stores/videoLists';
 import { useUiStore } from '../stores/ui';
 
@@ -244,15 +245,21 @@ export default defineComponent({
 
       this.submitting = true;
       try {
+        /**
+         * ⚠️ 必须 `toPlain`：`result` 存在 `data` 里，Vue 会把整棵树变成响应式 Proxy，
+         * `p.item` / `p.items` 拿到的都是 Proxy。把 Proxy 交给 `ipcRenderer.invoke`
+         * 会直接抛 `An object could not be cloned`（结构化克隆不认 Proxy）。
+         * 剥成普通对象再发。
+         */
         if (p.type === 'video') {
-          const result = await this.store.addItem(this.listId, p.item as VideoMetaInput);
+          const result = await this.store.addItem(this.listId, toPlain(p.item) as VideoMetaInput);
           ElMessage.success(
             result.existed
               ? `《${p.item.title || p.item.bvid}》已经在列表里，已置顶`
               : `已添加《${p.item.title || p.item.bvid}》`,
           );
         } else {
-          const result = await this.store.addItems(this.listId, p.items);
+          const result = await this.store.addItems(this.listId, toPlain(p.items));
           ElMessage.success(
             `已从《${p.name}》导入 ${result.added} 条` +
               (result.existed > 0 ? `（${result.existed} 条已在列表里）` : '') +

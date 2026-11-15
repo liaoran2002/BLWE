@@ -110,6 +110,7 @@
 │   │   ├── title.ts                # 窗口标题拼装
 │   │   ├── sleepTimer.ts           # 定时暂停 / 定时关闭
 │   │   ├── mediaProbe.ts           # 本地视频探针
+│   │   ├── dnd.ts                  # 排序拖动 vs 拖入导入的分界（dataTransfer 自定义类型）
 │   │   └── uiTheme.ts              # 主题令牌（颜色/模糊/阴影）
 │   └── components/
 │       ├── AppTitlebar.vue         #   标题栏（纯展示：歌名 / 模式 / 窗口按钮 / 置顶）
@@ -118,6 +119,7 @@
 │       ├── PlaylistPanel.vue       # ★ 左上歌单入口（点一下直接开管理弹窗）
 │       ├── PlaylistManager.vue     # ★ 歌单管理弹窗（新建 / 编辑 / 同步 / 曲目）
 │       ├── VideoListManager.vue    # ★ 视频管理弹窗（四种来源 / 封面网格 / 本地文件丢失）
+│       ├── ManagerDialog.vue       # ★ 两个管理器共用的弹窗外壳（左列表 / 三态 / 条目行 / 拖动排序）
 │       ├── SettingsDialog.vue      # ★ 设置弹窗
 │       ├── AboutDialog.vue         # ★ 关于弹窗（仓库地址 / 作者与 DeepSeek·大肥鱼头像）
 │       ├── AddVideoDialog.vue      # ★ 「添加视频」弹窗（粘贴链接 → 解析 → 收藏）
@@ -1981,7 +1983,9 @@ drop → api:classifyDrop（主进程，只读不联网）
 | `_dragDepth` 计数 | `dragenter` 在**子元素之间移动**时也触发，只用布尔值会在第一次 `dragleave` 就误判「离开窗口」，遮罩一闪一闪 |
 | `drop` 里才读 `getData` | `dragover` 阶段浏览器出于安全把内容清空，只留 `types` |
 | 取文本顺序 | `text/uri-list` → `text/plain` → 从 `text/html` 抠第一个 `href` |
-| 本地文件 | **不支持**：播放链是围着「bvid → dash → MSE」建的，多一条本地文件源要动缓存键 / 封面 / 续播 / 托盘媒体信息，留给单独一期 |
+| **排序拖动不是「拖入」** | 管理弹窗里拖条目也在同一条冒泡路径上，而且带着 `text/plain` —— 不拦的话整窗闪遮罩、松手还会被当链接去识别。靠 `dataTransfer` 里的自定义类型 `application/x-blwe-reorder` 区分（`src/utils/dnd.ts`） |
+| **`dragover` 里绝不能盖 `dropEffect`** | 排序那边声明的是 `effectAllowed = 'move'`，document 级 `dragover` 走冒泡、在它之后执行，再写 `dropEffect = 'copy'` 就是不兼容值 → 浏览器归零成 `none` → **规范规定 `none` 时松手不派发 `drop`**。表现：拖动排序永远「松手没反应」 |
+| 本地文件 | 支持：走 preload 的 `webUtils.getPathForFile()` 拿真实路径，再当「本地列表的一条」导入（见下面本地视频那节）。Electron 32 起 `File.path` 已移除 |
 
 **「已有就同步」不另写一套**：视频列表的主键是 `平台kind_平台id` 拼出来的，
 `addVideoList` 天然幂等（`ON CONFLICT(id) DO UPDATE` + `applyRemoteItems` 的合并规则），
@@ -2268,7 +2272,8 @@ CREATE TABLE IF NOT EXISTS playlists (
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at     INTEGER,
   created_at       INTEGER NOT NULL,
-  updated_at       INTEGER NOT NULL
+  updated_at       INTEGER NOT NULL,
+  sort_order       INTEGER NOT NULL DEFAULT 0   -- 左栏拖动排序（老库全 0 → created_at 兜底）
   -- 没有 last_index：「播到第几首」是播放状态，只有一份（playback_state.source_index）
 );
 
@@ -3815,6 +3820,72 @@ sha256 拼进发布说明正文。
 应用端只认 `releases/latest`，所以「覆盖同一个发布」就够了，不必一 commit 一个 tag。
 代价是**指纹每次都变** —— 任何代码改动都会让在用的人收到一次提示（同一指纹只提示一次）；
 改文档不触发构建（`paths-ignore`），所以不会产生这种噪音。
+
+## 拖入放哪：默认 vs 当前
+
+拖链接进来时，「落在哪个列表」以前没有选择 —— 单条进默认列表、整张收藏夹导入成新列表。
+现在多了一条：**当前在播的是「本地列表 / 本地歌单」且不是默认那个**时，遮罩分成左右两半。
+
+```
+                     窗口中间一条竖线
+┌──────────────────────────┬──────────────────────────┐
+│  默认列表                │  当前列表（正在播的那个）  │
+│  （暗）                  │  （鼠标在这边 → 亮）      │
+└──────────────────────────┴──────────────────────────┘
+```
+
+判定在 `drop.ts` 的 `dropTargets`：
+
+| 当前播放 | 左 | 右 | 不满足时 |
+| :--- | :--- | :--- | :--- |
+| 本地视频列表、非默认 | 默认列表 | 那个列表 | 不显示 |
+| 本地歌单（`pl_`）、非 `pl_default` | 默认歌单 | 那个歌单 | 不显示 |
+
+**平台列表 / 平台歌单不分栏**：往它们里面加东西，下次同步就没了（歌单那边 `addSongsToPlaylist`
+本来就会拒）。所以「分栏」只在用户自己攒的那份数据上出现。
+
+高亮靠 `dropHalf`：遮罩是 `pointer-events: none`（必须让 drop 事件穿过去），
+没法用 hover，于是在 `dragover` 里按 `clientX < innerWidth / 2` 算。
+松手时才按内容类型匹配一次（`dropPaneFor('ov' | 'mv')`）—— 当前播视频、拖进来的是一首歌，
+就没有「左右」可言，老实进默认歌单。
+
+**整张收藏夹 / 整个歌单拖到某一半 = 并进那个列表**（不是新建），并且**不打断正在播的**：
+这是「往这个列表补充内容」，不是「我现在要看它」。
+
+## 顺序的两层
+
+| 哪一层 | 存在哪 | 怎么改 |
+| :--- | :--- | :--- |
+| 左栏「有哪些列表、谁在前」 | `playlists.sort_order` / `videolists.sort_order` | 歌单：数组顺序 → `persist()` 按下标写；视频列表：`reorderVideoLists(ids)` 一批 UPDATE |
+| 列表内「第几条」 | `playlist_songs.ord` / `videolist_items.ord` | 歌单：换数组顺序 → 全量覆盖；视频：`reorderVideoListItems(id, bvids)` |
+
+**收藏条目在视频列表里锁死**：`favorites = 1` 的行既是「收藏」也是「置顶」，它的位置由
+`setItemFavorite` 写 `ord = 0` 决定，而且下次同步会把收藏区整体提回最前。所以拖动排序时
+主进程**无条件**把它们按原相对顺序放回最前，前端也把这几行设成 `draggable = false`
+且不许当落点 —— 与其让用户拖完发现没动，不如直接不给拖。
+
+**搜索时不许拖条目**：`filtered` 只是子集，`from/to` 与真实下标对不上，
+挪过去会「看起来跳了一段」。
+
+**平台列表 / 平台歌单的条目不给拖**：那些条目是远端投影，排了下次同步就被覆盖。
+判据是 `rowsReorderable`（父组件传「当前选中的是不是本地那份」），连 `draggable` 都不设，
+光标也不变成抓手 —— 与其让用户拖完发现没动，不如直接不给拖。左栏的列表顺序不受限：
+那只是「界面上谁排前面」，`sort_order` 是本地元数据。
+
+**落点画在「两条之间的缝」上**：悬停某行上半 = 插到它前面，下半 = 插到它后面。
+一个插入点横跨相邻两行 —— 上面那条的下部分 + 下面那条的上部分各画一段从缝往里渐隐的色带；
+拖到最后一条之后时只有它自己的下部分亮（下面没有行了，这条规则自动成立）。
+
+**`to` 不是「被悬停那一行的下标」**：`to` 用的是「先移出、再插入」的口径（store 那边就是
+`splice(from,1)` 之后 `splice(to,0,x)`），所以 `from < over` 时要差一位
+（插在 over 之前 → `over-1`，之后 → `over`）。直接用 `over` 会在「往上挪」时多走一格，
+看着像跳了一段。换算收在 `ManagerDialog.vue` 的 `resolveDropIndex`，左栏与条目共用。
+
+**行下方那片空白也必须接住**：行级 `drop` 只覆盖「正好落在某一行上」。列表比容器矮时
+最后一条下面是空地，视频列表底部还可能有「还有 N 条未加载」那条占位 —— 在那里松手没落到任何行，
+`drop` 没人接，条目就弹回原位；而高亮还亮着（`dragOverRow` 停在最后一条上没人清），
+看起来像「明明亮了却没生效」。所以两个滚动容器（`.mgr-side-list` / `.mgr-items`）
+也挂 `dragover` / `drop`：落在行内就放行给行自己（`closest` 判断），落在空白/占位上就算放到末尾。
 
 ## 播放状态该放哪：状态不是设置
 

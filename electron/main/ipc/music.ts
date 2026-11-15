@@ -21,7 +21,7 @@
 import { mainHandle } from '@common/mainIpc'
 import { resolvePlaylist } from '../music'
 import { toPlaylistSongs } from '../utils/playlist'
-import { importMusicPlaylist, importSongToDefault } from '../utils/playlistImport'
+import { importMusicIntoPlaylist, importMusicPlaylist, importSongTo } from '../utils/playlistImport'
 import { playlistKey } from '@common/types/playlist'
 
 export const registerMusicHandlers = (): void => {
@@ -72,5 +72,17 @@ export const registerMusicHandlers = (): void => {
    * 播放位置由主进程顺手写好（`playback_state.source_index` = 这首歌的位次），
    * 渲染层拿 id 切过去就播它。
    */
-  mainHandle('music:importSong', ({ url }) => importSongToDefault(url))
+  mainHandle('music:importSong', ({ url, playlistId }) =>
+    importSongTo(typeof playlistId === 'string' ? playlistId : '', url),
+  )
+
+  /**
+   * 把一整张歌单 / 一首单曲**并进指定的本地歌单**
+   *
+   * 和 `music:importPlaylist` 的区别：那个是「导入成一个新歌单」，
+   * 这个是「往我已有的歌单里加歌」（拖到右半边「当前歌单」时走这条）。
+   */
+  mainHandle('music:importIntoPlaylist', ({ playlistId, url }) =>
+    importMusicIntoPlaylist(playlistId, url),
+  )
 }

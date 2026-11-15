@@ -37,6 +37,7 @@ import type {
   SyncResult,
 } from '@common/types/playlist'
 import {
+  DEFAULT_PLAYLIST_ID,
   isLocalPlaylistId,
   parseCacheKey,
   platformIdOfSongId,
@@ -73,17 +74,8 @@ let data: PlaylistStoreData = emptyData()
  */
 const newId = (): string => `pl_${randomUUID()}`
 
-/**
- * 默认歌单的**固定主键**
- *
- * 视频列表那边靠「设置项记 id + 三级兜底」来认默认列表，因为默认列表
- * 可以是用户已有的任意一个 local 列表。歌单这边不需要那种自由度：
- * 默认歌单是我们自己建的、只有这一个，所以直接钉死主键 ——
- * 判断「是不是默认」就是比一个字符串，不存在「设置项指向一个已经被删掉的 id」的漂移。
- *
- * 前缀仍是 `pl_`，和手动新建的歌单一个系列（`newId()` 生成 `pl_<uuid>`）。
- */
-export const DEFAULT_PLAYLIST_ID = 'pl_default'
+/** 默认歌单的固定主键 —— 定义在 common 里（渲染层也要用同一个值） */
+export { DEFAULT_PLAYLIST_ID }
 
 const DEFAULT_PLAYLIST_NAME = '默认歌单'
 
@@ -153,6 +145,8 @@ interface PlaylistDbRow {
   last_sync_at: number | null
   created_at: number
   updated_at: number
+  /** 左栏顺序（拖动改它）。老库全 0，`created_at` 兜底 */
+  sort_order: number
 }
 
 /**
@@ -318,15 +312,20 @@ export const toPlaylistSongs = (
 
 // #region 读
 
-/** 读全部歌单（含曲目），按 created_at 排序 —— 界面上的顺序必须稳定 */
+/**
+ * 读全部歌单（含曲目），按**左栏顺序**排
+ *
+ * `sort_order` 是用户拖出来的顺序；老库这一列全 0，所以要 `created_at` 兜底 ——
+ * 否则所有歌单的 sort_order 相等，顺序就变成 SQLite 的返回顺序（不可依赖）。
+ */
 const readPlaylistsFromDb = (): PlaylistRecord[] => {
   const db = getDb()
   const playlistRows = db
     .prepare(
       `SELECT id, name, url, sync_mode, sync_interval_ms,
-              last_sync_at, created_at, updated_at
+              last_sync_at, created_at, updated_at, sort_order
          FROM playlists
-        ORDER BY created_at ASC`,
+        ORDER BY sort_order ASC, created_at ASC`,
     )
     .all() as PlaylistDbRow[]
   if (playlistRows.length === 0) return []
@@ -450,8 +449,8 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
     const insertPlaylist = db.prepare(
       `INSERT INTO playlists
          (id, name, url, sync_mode, sync_interval_ms,
-          last_sync_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_sync_at, created_at, updated_at, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     /**
      * 曲目实体用 upsert：同一个 id 可能被多个歌单引用，
@@ -474,7 +473,7 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
     /** 本次保存里出现过的 song id（用来决定 `songs` 表要删哪些） */
     const keepIds = new Set<string>()
 
-    for (const record of store.playlists) {
+    for (const [order, record] of store.playlists.entries()) {
       insertPlaylist.run(
         record.id,
         record.name,
@@ -484,6 +483,14 @@ const writePlaylistsToDb = (store: PlaylistStoreData): void => {
         record.lastSyncAt,
         record.createdAt,
         record.updatedAt,
+        /**
+         * 左栏顺序**就是**传入数组的顺序
+         *
+         * 不单独存一个 `sortOrder` 字段：那会变成两份顺序（数组一份、字段一份），
+         * 拖动只改数组时字段不跟着走，下次读库又回到老位置。
+         * 数组顺序是界面唯一表达「谁在上面」的方式，直接落成下标。
+         */
+        order,
       )
       record.songs.forEach((song, index) => {
         /**
@@ -681,33 +688,49 @@ export const ensureDefaultPlaylist = (): PlaylistRecord => {
  *
  * @returns 命中的下标，以及是不是新加进去的
  */
-export const appendSongToDefaultPlaylist = (
+export const appendSongToPlaylist = (
+  playlistId: string,
   song: PlaylistSong,
 ): { record: PlaylistRecord; index: number; added: boolean } => {
-  const def = ensureDefaultPlaylist()
+  const target = playlistId
+    ? data.playlists.find((item) => item.id === playlistId)
+    : ensureDefaultPlaylist()
+  if (!target) throw new Error('歌单不存在')
+  /**
+   * 平台歌单的曲目是远端的投影：手动加进去下次同步就没了，
+   * 所以只允许本地歌单（`pl_` 前缀）。
+   */
+  if (!isLocalPlaylistId(target.id)) {
+    throw new Error('平台歌单的曲目由平台决定，先「转成本地歌单」才能添加')
+  }
+
   const id = songId(song)
   const key = toCacheKey(song).toLowerCase()
 
-  const existingIndex = def.songs.findIndex(
+  const existingIndex = target.songs.findIndex(
     (item) => songId(item) === id || toCacheKey(item).toLowerCase() === key,
   )
   if (existingIndex >= 0) {
     /** 已经在了：只把播放位置挪到它，不重复插 */
-    def.updatedAt = Date.now()
-    savePlaylists({ playlists: data.playlists, currentId: def.id })
+    target.updatedAt = Date.now()
+    savePlaylists({ playlists: data.playlists, currentId: target.id })
     /** 位置是**播放状态**，写 `playback_state`，不写歌单本身（见那张表的注释） */
-    saveProgress({ kind: 'mv', id: def.id, index: existingIndex })
-    return { record: getPlaylists().playlists.find((p) => p.id === def.id) ?? def, index: existingIndex, added: false }
+    saveProgress({ kind: 'mv', id: target.id, index: existingIndex })
+    return {
+      record: getPlaylists().playlists.find((p) => p.id === target.id) ?? target,
+      index: existingIndex,
+      added: false,
+    }
   }
 
-  def.songs = [...def.songs, song]
+  target.songs = [...target.songs, song]
   /** 新歌接在最后，并把播放位置设成它 —— 拖进来就是想听这首 */
-  const nextIndex = def.songs.length - 1
-  def.updatedAt = Date.now()
-  const saved = savePlaylists({ playlists: data.playlists, currentId: def.id })
-  saveProgress({ kind: 'mv', id: def.id, index: nextIndex })
+  const nextIndex = target.songs.length - 1
+  target.updatedAt = Date.now()
+  const saved = savePlaylists({ playlists: data.playlists, currentId: target.id })
+  saveProgress({ kind: 'mv', id: target.id, index: nextIndex })
   return {
-    record: saved.playlists.find((p) => p.id === def.id) ?? def,
+    record: saved.playlists.find((p) => p.id === target.id) ?? target,
     index: nextIndex,
     added: true,
   }

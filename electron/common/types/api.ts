@@ -155,8 +155,20 @@ export interface RendererAPI {
   ) => Promise<import('./ipc').IpcChannelMap['music:getPlaylistDetail']['result']>
   /** 拖入歌单链接：导入（已有则同步）并设为当前 —— 会写库 */
   importMusicPlaylist: (url: string) => Promise<import('./ipc').IpcChannelMap['music:importPlaylist']['result']>
-  /** 拖入单曲链接：追加进默认歌单并把它设为当前 —— 会写库 */
-  importMusicSong: (url: string) => Promise<import('./ipc').IpcChannelMap['music:importSong']['result']>
+  /**
+   * 拖入单曲链接：追加进指定歌单（`playlistId` 为空 = 默认歌单）并把它设为当前
+   *
+   * 会写库。拖动导入时由调用方传「当前歌单」的 id。
+   */
+  importMusicSong: (
+    url: string,
+    playlistId?: string,
+  ) => Promise<import('./ipc').IpcChannelMap['music:importSong']['result']>
+  /** 把一整张歌单 / 一首单曲**并进**指定的本地歌单（不新建歌单） */
+  importMusicIntoPlaylist: (
+    playlistId: string,
+    url: string,
+  ) => Promise<import('./ipc').IpcChannelMap['music:importIntoPlaylist']['result']>
   // #endregion
 
   // #region 歌单 / 缓存
@@ -247,14 +259,20 @@ export interface RendererAPI {
     mode: import('./playlist').VideoListSyncMode,
     intervalMs?: number,
   ) => Promise<boolean>
-  /** 拖入单条视频：放进**默认列表**（没有就现建），返回落点供播放 */
+  /** 拖入单条视频：放进指定列表（`listId` 为空 = 默认列表），返回落点供播放 */
   addVideoItemToDefault: (
     input: string,
+    listId?: string,
   ) => Promise<import('./ipc').IpcChannelMap['videolists:addItemToDefault']['result']>
-  /** 拖入本地视频文件：登记 + 挂进默认列表（条目带 `url`，供探针与起播） */
+  /** 拖入本地视频文件：登记 + 挂进指定列表（`listId` 为空 = 默认列表） */
   importLocalVideoFiles: (
     paths: string[],
+    listId?: string,
   ) => Promise<import('./ipc').IpcChannelMap['videolists:importLocal']['result']>
+  /** 左栏（列表本身）拖动排序：传完整顺序 */
+  reorderVideoLists: (ids: string[]) => Promise<boolean>
+  /** 条目拖动排序：收藏条目由主进程锁在最前 */
+  reorderVideoListItems: (id: string, bvids: string[]) => Promise<boolean>
   /**
    * 拖进来的 `File` → 真实磁盘路径（Electron 32 起 `File.path` 已移除）
    *
@@ -324,6 +342,17 @@ export interface RendererAPI {
   // #region 应用
   /** 用系统默认浏览器打开链接（只允许 http/https） */
   openExternal: (url: string) => Promise<boolean>
+  /** 「配置文件位置」：当前生效的目录 + 三种来源各自的路径 */
+  getDataDir: () => Promise<import('./dataDir').DataDirInfo>
+  /** 改「配置文件位置」（**下一次启动生效**）；目录不可写时返回 `ok:false` */
+  setDataDir: (choice: {
+    mode: import('./dataDir').DataDirMode
+    customPath: string
+  }) => Promise<{ ok: boolean; error?: string }>
+  /** 弹系统文件夹选择框；取消返回 null */
+  pickDataDir: () => Promise<string | null>
+  /** 重启应用 */
+  relaunchApp: () => Promise<void>
   // #endregion
 
   // #region 壁纸

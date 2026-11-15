@@ -206,8 +206,17 @@ export const useVideoListStore = defineStore('videoLists', () => {
    * 「哪个是默认列表」由主进程决定（设置项 + 库），渲染层只拿回来的 id 去播放。
    * 这里顺手 `load()`：列表数量 / 条目数都可能变了，侧边栏要跟着刷新。
    */
-  const addItemToDefault = async (input: string): Promise<{ listId: string; listName: string }> => {
-    const result = await api.addVideoItemToDefault(input)
+  /**
+   * 加入单条视频
+   *
+   * `listId` 为空 = 默认列表（拖入单条视频的老落点）；
+   * 传了就进那个列表（拖到遮罩右半边「当前列表」时）。
+   */
+  const addItemToDefault = async (
+    input: string,
+    listId = '',
+  ): Promise<{ listId: string; listName: string }> => {
+    const result = await api.addVideoItemToDefault(input, listId)
     await load()
     return { listId: result.listId, listName: result.listName }
   }
@@ -224,13 +233,14 @@ export const useVideoListStore = defineStore('videoLists', () => {
    */
   const importLocal = async (
     paths: string[],
+    listId = '',
   ): Promise<{
     listId: string
     listName: string
     items: Array<VideoListItem & { url: string }>
     skipped: Array<{ path: string; reason: string }>
   }> => {
-    const result = await api.importLocalVideoFiles(paths)
+    const result = await api.importLocalVideoFiles(paths, listId)
     await load()
     return result
   }
@@ -245,6 +255,23 @@ export const useVideoListStore = defineStore('videoLists', () => {
   const setFavorite = async (id: string, bvid: string, favorite: boolean): Promise<void> => {
     await api.setVideoListItemFavorite(id, bvid, favorite)
     await load()
+  }
+
+  /**
+   * 左栏拖动排序
+   *
+   * 传完整顺序（拖动后数组的样子），主进程按下标写库，然后重读一遍 ——
+   * 以库里的顺序为准，避免本地数组和库各说各话。
+   */
+  const reorder = async (ids: string[]): Promise<void> => {
+    const ok = await api.reorderVideoLists(ids)
+    if (ok) await load()
+  }
+
+  /** 条目拖动排序（收藏条目会被主进程锁在最前，所以必须重读） */
+  const reorderItems = async (id: string, bvids: string[]): Promise<void> => {
+    const ok = await api.reorderVideoListItems(id, bvids)
+    if (ok) await load()
   }
 
   /** 重新同步（播放位置由主进程按 bvid 重定位） */
@@ -357,6 +384,8 @@ export const useVideoListStore = defineStore('videoLists', () => {
     hasIntervalSync,
     minSyncInterval,
     importLocal,
+    reorder,
+    reorderItems,
     removeItem,
     setFavorite,
     sync,

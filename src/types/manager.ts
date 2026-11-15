@@ -75,6 +75,14 @@ export interface ManagerRow {
   /** 本地文件不在了：压暗 + 出「文件丢失」角标 */
   missing?: boolean
   missingHint?: string
+  /**
+   * 这一行**不能拖动排序**
+   *
+   * 视频列表里收藏 = 置顶（`favorites = 1`），主进程排序时会把它们无条件
+   * 放回最前，所以拖它、或把别的行拖到它上面都不会有结果 —— 与其让用户
+   * 拖完发现没动，不如直接不给拖。
+   */
+  locked?: boolean
 }
 
 /** 右侧主区当前处于哪一态 */

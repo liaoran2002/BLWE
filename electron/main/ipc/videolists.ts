@@ -22,9 +22,9 @@ import {
   relocateLocalVideo,
 } from '../utils/localVideo'
 import {
-  addItemToDefaultList,
+  addItemToList,
   appendVideoListPage,
-  addLocalFilesToDefault,
+  addLocalFilesTo,
   addLocalItem,
   addLocalItems,
   addVideoList,
@@ -35,6 +35,8 @@ import {
   previewVideoImport,
   removeVideoList,
   removeVideoListItem,
+  reorderVideoListItems,
+  reorderVideoLists,
   renameVideoList,
   setItemFavorite,
   setVideoListSyncMode,
@@ -93,8 +95,11 @@ export const registerVideoListHandlers = (): void => {
    * `<video>` 探针实测（用的就是待会儿真播放的那个解码器，比任何扩展名白名单准）。
    * 所以这里返回的条目带着 `url`，渲染层拿它探一下就知道了。
    */
-  mainHandle('videolists:importLocal', ({ paths }) => {
-    const result = addLocalFilesToDefault(Array.isArray(paths) ? paths : [])
+  mainHandle('videolists:importLocal', ({ paths, listId }) => {
+    const result = addLocalFilesTo(
+      typeof listId === 'string' ? listId : '',
+      Array.isArray(paths) ? paths : [],
+    )
     return {
       ...result,
       items: result.items.map((item) => ({ ...item, url: localMediaUrl(item.bvid) })),
@@ -102,7 +107,9 @@ export const registerVideoListHandlers = (): void => {
   })
 
   /** 拖入单条视频：放进默认列表（没有就现建），返回 listId 让渲染层去播 */
-  mainHandle('videolists:addItemToDefault', ({ input }) => addItemToDefaultList(input))
+  mainHandle('videolists:addItemToDefault', ({ input, listId }) =>
+    addItemToList(typeof listId === 'string' ? listId : '', input),
+  )
 
   mainHandle('videolists:removeItem', ({ id, bvid }) => removeVideoListItem(id, bvid))
 
@@ -113,6 +120,12 @@ export const registerVideoListHandlers = (): void => {
   mainHandle('videolists:loadMore', ({ id }) => appendVideoListPage(id))
 
   mainHandle('videolists:sync', ({ id }) => syncVideoList(id))
+
+  /** 左栏拖动排序：传完整顺序，按下标写进 sort_order */
+  mainHandle('videolists:reorder', ({ ids }) => reorderVideoLists(ids))
+
+  /** 条目拖动排序：收藏条目由主进程锁在最前（见 `reorderVideoListItems`） */
+  mainHandle('videolists:reorderItems', ({ id, bvids }) => reorderVideoListItems(id, bvids))
 
   /**
    * 取列表条目

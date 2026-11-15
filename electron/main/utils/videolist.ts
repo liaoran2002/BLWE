@@ -79,6 +79,8 @@ interface VideoListDbRow {
   last_sync_at: number | null
   created_at: number
   updated_at: number
+  /** 左栏顺序（拖动改它）。老库全 0，`created_at` 兜底 */
+  sort_order: number
 }
 
 const isLocalKind = (kind: string): boolean => kind === 'local'
@@ -133,8 +135,9 @@ const toRecord = (row: VideoListDbRow, defId: string = defaultListId()): VideoLi
 /**
  * 读全部视频列表
  *
- * **本地列表排在前面**（它们是用户自己攒的，最常用），同类里按创建时间 ——
- * 侧边栏顺序必须稳定，否则每次读库都跳一下。
+ * 顺序：`sort_order`（用户拖出来的）优先；老库这一列全是 0，
+ * 于是退化成原来的规则（**本地列表在前**，同类按创建时间）——
+ * 这样升级后第一次打开不会突然全部按创建时间乱掉。
  */
 export const getVideoLists = (): VideoListRecord[] => {
   try {
@@ -142,9 +145,12 @@ export const getVideoLists = (): VideoListRecord[] => {
       .prepare(
         `SELECT id, kind, source_id, mid, name, cover, item_count, loaded_page,
                 has_more, skipped_total,
-                sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at
+                sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at,
+                sort_order
            FROM videolists
-          ORDER BY CASE WHEN kind = 'local' THEN 0 ELSE 1 END, created_at ASC`,
+          ORDER BY sort_order ASC,
+                   CASE WHEN kind = 'local' THEN 0 ELSE 1 END,
+                   created_at ASC`,
       )
       .all() as VideoListDbRow[]
     const defId = defaultListId()
@@ -388,8 +394,8 @@ export const addVideoList = async (
       `INSERT INTO videolists
          (id, kind, source_id, mid, name, cover, item_count, loaded_page,
           has_more, skipped_total,
-          sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'off', 0, ?, ?, ?)
+          sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'off', 0, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          name         = excluded.name,
          cover        = excluded.cover,
@@ -414,6 +420,8 @@ export const addVideoList = async (
       /** 重新导入时**保留**已加载进度（`loaded_page` 不在 DO UPDATE 里） */
       existing?.created_at ?? now,
       now,
+      /** 只在**第一次导入**时生效：`ON CONFLICT` 那段故意不更新它，重导不能把列表挪位置 */
+      nextListSortOrder(),
     )
 
     added = mergeHeadInto(db, id, page.items)
@@ -658,6 +666,14 @@ export const nextLocalListName = (): string => {
   return `本地列表${n}`
 }
 
+/** 新建的列表接在最后：当前最大 sort_order + 1（老库全 0 时就是 1） */
+const nextListSortOrder = (): number => {
+  const row = getDb()
+    .prepare(`SELECT COALESCE(MAX(sort_order), -1) AS n FROM videolists`)
+    .get() as { n: number } | undefined
+  return (row?.n ?? -1) + 1
+}
+
 /** 新建一个**本地列表**（没有远端来源，条目靠手动添加） */
 export const createLocalList = (name?: string): VideoListRecord => {
   const db = getDb()
@@ -668,9 +684,9 @@ export const createLocalList = (name?: string): VideoListRecord => {
     `INSERT INTO videolists
        (id, kind, source_id, mid, name, cover, item_count, loaded_page,
         has_more, skipped_total,
-        sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at)
-     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 0, 0, 0, 'off', 0, NULL, ?, ?)`,
-  ).run(id, finalName, now, now)
+        sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at, sort_order)
+     VALUES (?, 'local', NULL, NULL, ?, NULL, 0, 0, 0, 0, 'off', 0, NULL, ?, ?, ?)`,
+  ).run(id, finalName, now, now, nextListSortOrder())
   const record = findVideoList(id)
   if (!record) throw new Error('新建本地列表失败')
   console.log(`[videolist] 已新建本地列表《${record.name}》`)
@@ -721,16 +737,18 @@ export const ensureDefaultVideoList = (
 }
 
 /**
- * 「拖入单条视频」：加进默认列表（没有就现建一个）
+ * 「拖入/添加单条视频」到**指定列表**（`listId` 为空 → 默认列表）
  *
- * 顺便把「哪个列表是默认的」这件事留在主进程 —— 渲染层只拿 `listId` 去播放，
- * 不需要知道默认列表是怎么挑出来的。
+ * 默认列表的判定在 `ensureDefaultVideoList()` 里（设置项 + 三级兜底），
+ * 渲染层不需要知道它是怎么挑出来的；传了 id 就用那个列表 ——
+ * 拖到右半边「当前列表」时走的就是这条。
  */
-export const addItemToDefaultList = async (
+export const addItemToList = async (
+  listId: string,
   input: string,
 ): Promise<{ listId: string; listName: string; item: VideoListItem }> => {
-  const list = ensureDefaultVideoList()
-  if (!list) throw new Error('默认列表创建失败')
+  const list = listId ? findVideoList(listId) : ensureDefaultVideoList()
+  if (!list) throw new Error(listId ? '列表不存在' : '默认列表创建失败')
   /** 拖入是「直接播放」，不走预览确认 —— 这里自己解析一次 */
   const info = await parseVideoInput(input)
   const meta: VideoMetaInput = {
@@ -751,7 +769,7 @@ export const addItemToDefaultList = async (
 /**
  * 「拖入本地文件」：登记 + 挂进默认列表（整批置顶）
  *
- * 和 `addItemToDefaultList`（某站单条视频）是**同一件事的另一种入参**：
+ * 和 `addItemToList`（某站单条视频）是**同一件事的另一种入参**：
  * 落点一样、置顶规则一样、续播一样，区别只在「地址从哪来」——
  * 那边是某站解析，这边是文件路径（进 `videos.durl_url`，见 `localVideo.ts`）。
  *
@@ -775,9 +793,9 @@ export interface LocalFilesImportResult {
   skipped: Array<{ path: string; reason: string }>
 }
 
-export const addLocalFilesToDefault = (paths: string[]): LocalFilesImportResult => {
-  const list = ensureDefaultVideoList()
-  if (!list) throw new Error('默认列表创建失败')
+export const addLocalFilesTo = (listId: string, paths: string[]): LocalFilesImportResult => {
+  const list = listId ? findVideoList(listId) : ensureDefaultVideoList()
+  if (!list) throw new Error(listId ? '列表不存在' : '默认列表创建失败')
 
   const files: Array<{ bvid: string; filePath: string; title: string }> = []
   const skipped: Array<{ path: string; reason: string }> = []
@@ -969,14 +987,21 @@ export const convertVideoListToLocal = (id: string): { id: string; name: string 
   const newId = `bv_local_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
   const db = getDb()
   const now = Date.now()
+  /** 转成本地后**留在原位**（换 id 不该把列表挪到最下面） */
+  const order =
+    (
+      db.prepare(`SELECT sort_order FROM videolists WHERE id = ?`).get(id) as
+        | { sort_order: number }
+        | undefined
+    )?.sort_order ?? 0
 
   tx(() => {
     db.prepare(
       `INSERT INTO videolists
          (id, kind, source_id, mid, name, cover, item_count, loaded_page,
           has_more, skipped_total,
-          sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at)
-       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 0, 0, 0, 'off', 0, NULL, ?, ?)`,
+          sync_mode, sync_interval_ms, last_sync_at, created_at, updated_at, sort_order)
+       VALUES (?, 'local', NULL, NULL, ?, ?, ?, 0, 0, 0, 'off', 0, NULL, ?, ?, ?)`,
     ).run(
       newId,
       record.name,
@@ -984,6 +1009,7 @@ export const convertVideoListToLocal = (id: string): { id: string; name: string 
       record.itemCount,
       record.createdAt,
       now,
+      order,
     )
 
     /**
@@ -1234,8 +1260,7 @@ export const setItemFavorite = (listId: string, bvid: string, favorite: boolean)
   }
 }
 
-/** 从列表里删掉一条（只删关系；`videos` 的地址缓存留给 GC 判断） */
-export const removeVideoListItem = (listId: string, bvid: string): boolean => {
+/** 从列表里删掉一条（只删关系；`videos` 的地址缓存留给 GC 判断） */export const removeVideoListItem = (listId: string, bvid: string): boolean => {
   if (!listId || !bvid) return false
   /** 平台列表的条目是远端的投影：删了下次同步又回来，所以直接拒绝 */
   const record = findVideoList(listId)
@@ -1265,9 +1290,83 @@ export const removeVideoListItem = (listId: string, bvid: string): boolean => {
   }
 }
 
+/**
+ * 左栏（列表本身）拖动排序
+ *
+ * 传进来的是**完整顺序**（界面拖动后数组的样子），按下标写 `sort_order`。
+ * 不认识的 id 忽略；没传到的行保持原值 —— 不能把它们一起写成 0 堆到最前面。
+ */
+export const reorderVideoLists = (ids: string[]): boolean => {
+  const list = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && !!id)
+  if (list.length === 0) return false
+  try {
+    const stmt = getDb().prepare(`UPDATE videolists SET sort_order = ? WHERE id = ?`)
+    tx(() => {
+      list.forEach((id, index) => stmt.run(index, id))
+    })
+    return true
+  } catch (err) {
+    console.error('[videolist] 调整列表顺序失败:', err)
+    return false
+  }
+}
+
+/**
+ * 条目拖动排序
+ *
+ * ## 收藏条目**锁死**在最前
+ *
+ * 这个列表里「收藏」同时就是「置顶」：`setItemFavorite` 把它挪到 ord = 0 并置
+ * `favorites = 1`。如果允许把普通条目拖到收藏前面，收藏就不再是置顶了；而且
+ * 下次同步重建顺序时收藏区会被重新提到最前，用户手排的也白排。
+ *
+ * 所以这里**无条件**先把收藏条目按原来的相对顺序放回最前，其余条目才按传入顺序排；
+ * 前端也把收藏行做成不可拖、不可跨越，两边各一道闸。
+ */
+export const reorderVideoListItems = (listId: string, bvids: string[]): boolean => {
+  if (!listId) return false
+  try {
+    const db = getDb()
+    const rows = db
+      .prepare(`SELECT bvid, favorites FROM videolist_items WHERE list_id = ? ORDER BY ord ASC`)
+      .all(listId) as Array<{ bvid: string; favorites: number }>
+    if (rows.length === 0) return false
+
+    const exists = new Set(rows.map((row) => row.bvid))
+    /** 收藏区：顺序按原 `ord`（rows 已按它排序，filter 不会打乱） */
+    const favorites = rows.filter((row) => row.favorites === 1).map((row) => row.bvid)
+    const favoriteSet = new Set(favorites)
+
+    const rest: string[] = []
+    const seen = new Set<string>()
+    for (const bvid of Array.isArray(bvids) ? bvids : []) {
+      if (typeof bvid !== 'string' || !exists.has(bvid)) continue
+      if (favoriteSet.has(bvid) || seen.has(bvid)) continue
+      seen.add(bvid)
+      rest.push(bvid)
+    }
+    /** 前端只传了一部分时，剩下的接在末尾 —— 不能因为没出现在数组里就丢掉 */
+    for (const row of rows) {
+      if (favoriteSet.has(row.bvid) || seen.has(row.bvid)) continue
+      seen.add(row.bvid)
+      rest.push(row.bvid)
+    }
+
+    const stmt = db.prepare(
+      `UPDATE videolist_items SET ord = ? WHERE list_id = ? AND bvid = ?`,
+    )
+    tx(() => {
+      ;[...favorites, ...rest].forEach((bvid, index) => stmt.run(index, listId, bvid))
+    })
+    return true
+  } catch (err) {
+    console.error('[videolist] 调整条目顺序失败:', err)
+    return false
+  }
+}
+
 /** 删列表（连同条目关系与 `bv:` 候选行；被别的列表引用的不动） */
-export const removeVideoList = (id: string): boolean => {
-  /**
+export const removeVideoList = (id: string): boolean => {  /**
    * 默认列表**不许删**（用户要求：可以改名，不能删）
    *
    * 它是「拖入单条视频」的落点 —— 删掉之后下次拖视频还得悄悄再建一个，

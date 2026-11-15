@@ -16,6 +16,7 @@
     :mode="dialogMode"
     :detail="dialogDetail"
     :rows="dialogRows"
+    :rows-reorderable="selected?.kind === 'local'"
     :loading-rows="loadingItems"
     create-label="新建列表"
     switch-label="← 歌单管理"
@@ -34,6 +35,8 @@
     @switch="void ui.openManager('mv')"
     @play="onRowPlay($event)"
     @load-more="loadMore"
+    @reorder-lists="onReorderLists"
+    @reorder-rows="onReorderRows"
   >
     <template #form>
       <div v-if="creating" class="mgr-form">
@@ -556,6 +559,8 @@ export default defineComponent({
         playing: isActive && index === this.queue.currentIndex,
         missing: !!item.missing,
         missingHint: `文件不在这个位置了：${item.localPath || '（路径未知）'}`,
+        /** 收藏 = 置顶：主进程排序时会无条件把它们放回最前，所以界面也不给拖 */
+        locked: !!item.favorites,
       }));
     },
     /**
@@ -705,6 +710,54 @@ export default defineComponent({
         this.loadingItems = false;
       }
     },
+
+    // #region 拖动排序
+    /** 左栏拖动：把整个顺序交给主进程写 `sort_order` */
+    async onReorderLists({ from, to }: { from: number; to: number }): Promise<void> {
+      const ids = this.store.lists.map((item) => item.id);
+      if (from === to || from < 0 || to < 0 || from >= ids.length || to >= ids.length) return;
+      const [moved] = ids.splice(from, 1);
+      ids.splice(to, 0, moved);
+      await this.store.reorder(ids);
+    },
+
+    /**
+     * 条目拖动
+     *
+     * 收藏行拖不动（`locked`）；即使传过去，主进程也会把它们整体提到最前，
+     * 所以这里只需要处理普通条目，然后**重读一遍**拿库里的真实顺序。
+     */
+    async onReorderRows({ from, to }: { from: number; to: number }): Promise<void> {
+      const record = this.selected;
+      if (!record) return;
+      const bvids = this.items.map((item) => item.bvid);
+      if (from === to || from < 0 || to < 0 || from >= bvids.length || to >= bvids.length) return;
+      const [moved] = bvids.splice(from, 1);
+      bvids.splice(to, 0, moved);
+
+      await this.store.reorderItems(record.id, bvids);
+      await this.loadItems(record.id);
+
+      /**
+       * 正在播这个列表时，**队列顺序和播放位置都要跟着改**
+       *
+       * 否则「下一个视频」还会按旧顺序跳（下标已经指到别的条目上了），
+       * 重启续播也会指错一条。
+       */
+      if (this.isPlayingList(record.id)) {
+        const currentBvid = this.queue.songs[this.queue.currentIndex]?.bvid ?? '';
+        const index = currentBvid
+          ? this.items.findIndex((item) => item.bvid === currentBvid)
+          : -1;
+        this.queue.songs = [...this.items];
+        if (index >= 0) {
+          this.queue.currentIndex = index;
+          await api.savePlaybackProgress({ kind: 'ov', id: record.id, index });
+        }
+      }
+      await this.ui.loadBrowseList();
+    },
+    // #endregion
 
     // #region 播放
     /** 从这个列表「上次播到的那条」开始（位置在 `playback_state.source_index`） */

@@ -170,7 +170,10 @@ CREATE TABLE IF NOT EXISTS playlists (
   sync_interval_ms INTEGER NOT NULL DEFAULT 0,
   last_sync_at     INTEGER,
   created_at       INTEGER NOT NULL,
-  updated_at       INTEGER NOT NULL
+  updated_at       INTEGER NOT NULL,
+  -- 左栏（管理弹窗）里的排序，拖动改它。
+  -- 老库清一色 0，读的时候按 created_at 兜底（见 utils/playlist.ts 的 ORDER BY）
+  sort_order       INTEGER NOT NULL DEFAULT 0
   -- 没有 last_index：播到第几条是**播放状态**，只有一条（playback_state.source_index）
 );
 
@@ -353,7 +356,9 @@ CREATE TABLE IF NOT EXISTS videolists (
   last_sync_at INTEGER,
   -- 没有 last_index：见 playback_state.source_index（它是全局唯一的播放位置）
   created_at   INTEGER NOT NULL,
-  updated_at   INTEGER NOT NULL
+  updated_at   INTEGER NOT NULL,
+  -- 左栏（管理弹窗）里的排序，拖动改它（条目自己的顺序在 videolist_items.ord）
+  sort_order   INTEGER NOT NULL DEFAULT 0
 );
 
 -- 列表成员 + 顺序

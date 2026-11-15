@@ -14,6 +14,7 @@
     :mode="dialogMode"
     :detail="dialogDetail"
     :rows="dialogRows"
+    :rows-reorderable="!!selected && isLocal(selected.id)"
     current-hint="当前播放歌单"
     create-label="新建歌单"
     switch-label="视频管理 →"
@@ -28,6 +29,8 @@
     @sync-all="syncAll"
     @switch="void ui.openManager('ov')"
     @play="play($event.index)"
+    @reorder-lists="onReorderLists"
+    @reorder-rows="onReorderRows"
   >
     <!--
       编辑 / 新建（内联，不再单开弹窗）
@@ -218,6 +221,7 @@ import {
   parseCacheKey,
   songId,
   sourceOfSongId,
+  toCacheKey,
 } from '@common/types/playlist';
 import api from '../api/electron';
 import ManagerDialog from './ManagerDialog.vue';
@@ -398,6 +402,42 @@ export default defineComponent({
     },
   },
   methods: {
+    // #region 拖动排序
+    /** 左栏拖动：改数组顺序 + persist（主进程按下标写 `sort_order`） */
+    async onReorderLists({ from, to }: { from: number; to: number }): Promise<void> {
+      await this.store.move(from, to);
+    },
+
+    /**
+     * 曲目拖动
+     *
+     * 只对**本地歌单**生效：平台歌单的曲目是远端投影，排了下次同步就被覆盖，
+     * 与其让用户白拖一次，不如直接说清楚。
+     */
+    async onReorderRows({ from, to }: { from: number; to: number }): Promise<void> {
+      const record = this.selected;
+      if (!record) return;
+      if (!isLocalPlaylistId(record.id)) {
+        ElMessage.warning('平台歌单的曲目由平台决定，排了下次同步也会被覆盖');
+        return;
+      }
+      /** 正在播这一首就记住它（重排后下标全变，得按歌找回来） */
+      const playing =
+        this.queue.mode === 'mv' && this.store.currentId === record.id ? this.queue.currentKey : '';
+
+      const ok = await this.store.moveSong(record.id, from, to);
+      if (!ok) return;
+
+      const latest = this.store.playlists.find((item) => item.id === record.id);
+      if (!latest || !playing) return;
+      const index = latest.songs.findIndex((song) => toCacheKey(song) === playing);
+      if (index < 0) return;
+      this.queue.songs = [...latest.songs];
+      this.queue.currentIndex = index;
+      await api.savePlaybackProgress({ kind: 'mv', id: record.id, index });
+    },
+    // #endregion
+
     /** 打开时：默认选中当前歌单（或第一个），并清掉上次的编辑态 */
     onOpen() {
       this.editing = false;

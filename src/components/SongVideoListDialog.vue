@@ -48,6 +48,23 @@
         -->
         <div class="lt-side lt-end">
           <template v-if="isBrowsePanel">
+            <!--
+              添加视频：往**当前正在看的列表**里加
+
+              原来只能在「视频管理」弹窗里加，从播放界面点开列表时想加一条
+              得先绕一圈。这里放在放大镜左边，和「搜索」是一组动作：
+              一个找已有的、一个加新的。
+            -->
+            <button
+              v-if="mode === 'ov'"
+              class="lt-icon"
+              title="添加视频到当前列表"
+              @click="importVisible = true"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M8 3.2v9.6M3.2 8h9.6" />
+              </svg>
+            </button>
             <el-input
               v-if="searchOpen"
               ref="searchInput"
@@ -166,6 +183,19 @@
         </li>
       </ul>
     </div>
+
+    <!--
+      添加视频（复用视频管理里那个确认框）
+
+      `append-to-body` 是必须的：它挂在列表面板这个 el-dialog 里面，
+      不自带层叠会一直被父弹窗盖住。目标列表就是「正在看的那份」。
+    -->
+    <VideoImportDialog
+      v-model:visible="importVisible"
+      :list-id="ui.browseVideoListId"
+      :list-name="ui.browseName"
+      @done="onImported"
+    />
   </el-dialog>
 </template>
 
@@ -178,6 +208,7 @@ import { sanitizeTitleHtml, stripTags } from '../utils/title';
 import { useUiStore } from '../stores/ui';
 import { useQueueStore } from '../stores/queue';
 import { usePlaybackStore } from '../stores/playback';
+import VideoImportDialog from './VideoImportDialog.vue';
 
 /**
  * 视频列表项（某站搜索结果）
@@ -272,6 +303,7 @@ const durationText = (raw: number | null | undefined): string => formatDuration(
 
 export default defineComponent({
   name: 'SongVideoListDialog',
+  components: { VideoImportDialog },
   data() {
     return {
       /** 刷新图标正在转圈（0.5s） */
@@ -297,6 +329,8 @@ export default defineComponent({
        * 改成按地址记录，换一个地址就有一次新的机会。
        */
       failedCovers: {} as Record<string, boolean>,
+      /** 「添加视频」弹窗的开关（目标 = 正在看的那份列表） */
+      importVisible: false,
     };
   },
   computed: {
@@ -545,6 +579,10 @@ export default defineComponent({
      */
     onVisibleChange(visible: boolean): void {
       if (!visible) this.ui.listType = 'none';
+    },
+    /** 添加完一条/一批：重读列表，正在播的话顺带重定位队列下标 */
+    async onImported(): Promise<void> {
+      await this.ui.refreshBrowseAfterEdit();
     },
     /** 把第 index 行滚进视野（默认居中、平滑） */
     scrollToIndex(index: number, smooth = true): void {

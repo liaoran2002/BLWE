@@ -51,13 +51,25 @@
     <div class="mgr-body">
       <!-- 左：列表 -->
       <div class="mgr-side">
-        <div class="mgr-side-list">
+        <div class="mgr-side-list" @dragover="onListZoneDragOver" @drop="onListZoneDrop">
           <div
-            v-for="item in lists"
+            v-for="(item, listIndex) in lists"
             :key="item.id"
             class="mgr-row"
-            :class="{ sel: item.id === selectedId, cur: item.current }"
+            :class="{
+              sel: item.id === selectedId,
+              cur: item.current,
+              dragging: dragList === listIndex,
+              'drop-before': dropEdgeAt(listIndex, dragOverList, dropAfterList, 'before'),
+              'drop-after': dropEdgeAt(listIndex, dragOverList, dropAfterList, 'after'),
+            }"
+            title="拖动可调整顺序"
+            draggable="true"
             @click="$emit('update:selectedId', item.id)"
+            @dragstart="onListDragStart(listIndex, $event)"
+            @dragover="onListDragOver(listIndex, $event)"
+            @dragend="onListDragEnd"
+            @drop="onListDrop(listIndex, $event)"
           >
             <div class="mgr-row-main">
               <div class="mgr-row-name" :title="item.name">
@@ -151,13 +163,26 @@
             <span class="mgr-search-count">{{ filtered.length }} / {{ rows.length }}</span>
           </div>
 
-          <div class="mgr-items" @scroll="onItemsScroll">
+          <div class="mgr-items" @scroll="onItemsScroll" @dragover="onItemsZoneDragOver" @drop="onItemsZoneDrop">
             <div
               v-for="row in filtered"
               :key="row.key"
               class="mgr-item"
-              :class="{ playing: row.playing, missing: row.missing }"
+              :class="{
+                playing: row.playing,
+                missing: row.missing,
+                locked: row.locked,
+                dragging: dragRow === row.index,
+                'drop-before': dropEdgeAt(row.index, dragOverRow, dropAfterRow, 'before'),
+                'drop-after': dropEdgeAt(row.index, dragOverRow, dropAfterRow, 'after'),
+              }"
+              :draggable="canReorderRows && !row.locked"
+              :title="row.locked ? '收藏的条目固定在顶部，不能拖动' : ''"
               @click="$emit('play', row)"
+              @dragstart="onRowDragStart(row, $event)"
+              @dragover="onRowDragOver(row, $event)"
+              @dragend="onRowDragEnd"
+              @drop="onRowDrop(row, $event)"
             >
               <div class="mgr-idx">{{ row.index + 1 }}</div>
               <div class="mgr-thumb">
@@ -167,6 +192,7 @@
                   alt=""
                   referrerpolicy="no-referrer"
                   loading="lazy"
+                  draggable="false"
                   @error="onImgError(row.cover as string)"
                 />
               </div>
@@ -231,7 +257,28 @@
 import { defineComponent } from 'vue';
 import type { PropType } from 'vue';
 import { formatDuration } from '@common/utils/duration';
+import { markInternalDrag } from '../utils/dnd';
 import type { ManagerDetail, ManagerList, ManagerMode, ManagerRow } from '../types/manager';
+
+/**
+ * 拖动落点 → 目标下标
+ *
+ * `to` 用的是**先移出、再插入**的口径（store 那边就是 `splice(from,1)` 之后 `splice(to,0,x)`），
+ * 所以不能直接把「被悬停那一行的下标」当 `to` 交出去：
+ *
+ * | 落点 | `from < over` | `from > over` |
+ * | :--- | :--- | :--- |
+ * | 插在 over **之前** | `over - 1` | `over` |
+ * | 插在 over **之后** | `over` | `over + 1` |
+ *
+ * 前两种差一位，是因为被拖走的那一条在 from < over 时把 over 往前顶了一格。
+ * 也算出「等于 from」的情况（悬在自己上下半、或者本来就是那个位置）—— 调用方据此跳过，
+ * 免得白跑一次写库。
+ */
+const resolveDropIndex = (from: number, over: number, after: boolean): number => {
+  if (after) return over + (from < over ? 0 : 1);
+  return over + (from < over ? -1 : 0);
+};
 
 export default defineComponent({
   name: 'ManagerDialog',
@@ -264,6 +311,13 @@ export default defineComponent({
     mode: { type: String as PropType<ManagerMode>, default: 'empty' },
     detail: { type: Object as PropType<ManagerDetail | null>, default: null },
     rows: { type: Array as PropType<ManagerRow[]>, default: () => [] },
+    /**
+     * 条目能不能拖动排序
+     *
+     * 只有**本地**的列表 / 歌单才允许：平台那边的条目是远端投影，
+     * 排了下次同步就被覆盖。由父组件按当前选中项的类型传。
+     */
+    rowsReorderable: { type: Boolean, default: false },
     loadingRows: { type: Boolean, default: false },
     searchPlaceholder: { type: String, default: '搜索' },
     emptyListText: { type: String, default: '还没有内容' },
@@ -284,6 +338,10 @@ export default defineComponent({
     'switch',
     'play',
     'load-more',
+    /** 左栏列表被拖动排序（传原始下标） */
+    'reorder-lists',
+    /** 条目被拖动排序（传原始下标；收藏行不会发） */
+    'reorder-rows',
   ],
   data() {
     return {
@@ -295,6 +353,15 @@ export default defineComponent({
        * 切列表时行本身会被替换，所以按行记不会串到另一个列表去。
        */
       broken: {} as Record<string, boolean>,
+      /** 正在拖的左栏下标 / 悬停的落点下标（`null` = 没在拖） */
+      dragList: null as number | null,
+      dragOverList: -1,
+      /** 落点在下半部分？（决定插到那一行之前还是之后） */
+      dropAfterList: false,
+      /** 正在拖的条目下标 / 悬停的落点下标（都是 `row.index`，即原始下标） */
+      dragRow: null as number | null,
+      dragOverRow: -1,
+      dropAfterRow: false,
     };
   },
   computed: {
@@ -305,6 +372,17 @@ export default defineComponent({
       set(v: boolean) {
         this.$emit('update:visible', v);
       },
+    },
+    /**
+     * 条目能不能拖动排序
+     *
+     * 搜索时 `filtered` 只是原数组的子集，拖动它算出来的 from/to 与真实下标对不上，
+     * 挪过去会得到「看起来跳了一段」的结果。所以搜索状态下直接关掉拖动。
+     *
+     * 平台列表 / 平台歌单的条目也不给拖（`rowsReorderable` 由父组件判断）。
+     */
+    canReorderRows(): boolean {
+      return this.mode === 'detail' && this.rowsReorderable && !this.keyword.trim();
     },
     filtered(): ManagerRow[] {
       const kw = this.keyword.trim().toLowerCase();
@@ -341,6 +419,183 @@ export default defineComponent({
      * 留 80px 余量：等真正贴底才发请求，用户会看到一次明显停顿。
      * 加载中不再触发（父组件那边也会有 `loadingMore` 挡住重复请求）。
      */
+    // #region 拖动排序
+    /** 左栏开始拖 */
+    onListDragStart(index: number, event: DragEvent): void {
+      this.dragList = index;
+      this.dragOverList = -1;
+      this.dropAfterList = false;
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      /** 标记成「界面内排序」：全局拖入监听靠它放过这次拖动（见 `utils/dnd.ts`） */
+      markInternalDrag(event.dataTransfer);
+    },
+    onListDragOver(index: number, event: DragEvent): void {
+      if (this.dragList === null) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      /** 拖回自己身上没有落点可言：插到自己前/后都是原地 */
+      if (index === this.dragList) {
+        this.dragOverList = -1;
+        return;
+      }
+      this.dropAfterList = this.isLowerHalf(event);
+      this.dragOverList = index;
+    },
+    onListDragEnd(): void {
+      this.dragList = null;
+      this.dragOverList = -1;
+      this.dropAfterList = false;
+    },
+    onListDrop(index: number, event: DragEvent): void {
+      /**
+       * 不是「拖左栏」这条路（比如从资源管理器拖个视频落在列表上）：
+       * 什么都别做，尤其**不要 preventDefault** —— 那会让全局拖入以为这次松手没人要，
+       * 文件就静悄悄地不导入了。
+       */
+      if (this.dragList === null) return;
+      event.preventDefault();
+      const from = this.dragList;
+      const to = resolveDropIndex(from, index, this.isLowerHalf(event));
+      this.onListDragEnd();
+      if (to === from) return;
+      this.$emit('reorder-lists', { from, to });
+    },
+
+    /** 条目开始拖（收藏行 `draggable` 已经是 false，这里再挡一道） */
+    onRowDragStart(row: ManagerRow, event: DragEvent): void {
+      if (row.locked) return;
+      this.dragRow = row.index;
+      this.dragOverRow = -1;
+      this.dropAfterRow = false;
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move';
+        /** Firefox 不设数据就不发 drag 事件 */
+        event.dataTransfer.setData('text/plain', String(row.index));
+        markInternalDrag(event.dataTransfer);
+      }
+    },
+    onRowDragOver(row: ManagerRow, event: DragEvent): void {
+      if (this.dragRow === null) return;
+      /**
+       * 收藏行不能当落点：允许它的话，普通条目会插到收藏区里，
+       * 而主进程排序时又会把收藏整体提到最前 —— 用户看到的是「拖了没反应」。
+       */
+      if (row.locked) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      if (row.index === this.dragRow) {
+        this.dragOverRow = -1;
+        return;
+      }
+      this.dropAfterRow = this.isLowerHalf(event);
+      this.dragOverRow = row.index;
+    },
+    onRowDragEnd(): void {
+      this.dragRow = null;
+      this.dragOverRow = -1;
+      this.dropAfterRow = false;
+    },
+    onRowDrop(row: ManagerRow, event: DragEvent): void {
+      /** 同 `onListDrop`：外部拖进来的东西要留给全局拖入，这里不能 preventDefault */
+      if (this.dragRow === null) return;
+      if (row.locked) return;
+      event.preventDefault();
+      const from = this.dragRow;
+      const to = resolveDropIndex(from, row.index, this.isLowerHalf(event));
+      this.onRowDragEnd();
+      if (to === from) return;
+      this.$emit('reorder-rows', { from, to });
+    },
+
+    /**
+     * 事件是不是落在某一行**里面**（行自己的 dragover / drop 会先处理）
+     *
+     * 事件从行冒泡到这里时 `target` 还是行里的某个元素；落在行下面的空白处
+     * 或者「还有 N 条未加载」那条占位行上时，`closest` 就找不到了。
+     */
+    isInsideRow(event: DragEvent, selector: string): boolean {
+      const target = event.target as HTMLElement | null;
+      return !!target && typeof target.closest === 'function' && !!target.closest(selector);
+    },
+
+    /**
+     * 落在**列表末尾的空白处**：算作「放到最后一条后面」
+     *
+     * 没有这一段的话有个很坑的手感：内容比容器矮时，最后一条下面是一片空地，
+     * 拖到底部松手其实没落在任何一行上 —— 落点不处理，条目就弹回原位；
+     * 而高亮还亮着（`dragOverRow` 停在最后一条上没清），看起来像「明明亮了却没生效」。
+     */
+    onListZoneDragOver(event: DragEvent): void {
+      if (this.dragList === null) return;
+      if (this.isInsideRow(event, '.mgr-row')) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      this.dragOverList = this.lists.length - 1;
+      this.dropAfterList = true;
+    },
+    onListZoneDrop(event: DragEvent): void {
+      /** 行自己处理过的松手已经把 `dragList` 清空了，这里自然就不接手 */
+      if (this.dragList === null) return;
+      if (this.isInsideRow(event, '.mgr-row')) return;
+      event.preventDefault();
+      const from = this.dragList;
+      const to = this.lists.length - 1;
+      this.onListDragEnd();
+      if (to === from || to < 0) return;
+      this.$emit('reorder-lists', { from, to });
+    },
+
+    /** 条目区同理（见 `onListZoneDragOver`） */
+    onItemsZoneDragOver(event: DragEvent): void {
+      if (this.dragRow === null) return;
+      if (this.isInsideRow(event, '.mgr-item')) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      this.dragOverRow = this.rows.length - 1;
+      this.dropAfterRow = true;
+    },
+    onItemsZoneDrop(event: DragEvent): void {
+      if (this.dragRow === null) return;
+      if (this.isInsideRow(event, '.mgr-item')) return;
+      event.preventDefault();
+      const from = this.dragRow;
+      const to = this.rows.length - 1;
+      this.onRowDragEnd();
+      if (to === from || to < 0) return;
+      this.$emit('reorder-rows', { from, to });
+    },
+
+    /**
+     * 鼠标是不是在事件目标的下半部分
+     *
+     * 决定「插到这一行之前」还是「之后」：上半 → 之前，下半 → 之后。
+     * `currentTarget` 一定是挂了监听的整行（事件可能从缩略图 / 标题冒泡上来）。
+     */
+    isLowerHalf(event: DragEvent): boolean {
+      const el = event.currentTarget as HTMLElement | null;
+      if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+      const rect = el.getBoundingClientRect();
+      return event.clientY > rect.top + rect.height / 2;
+    },
+
+    /**
+     * 某一行该不该亮「上部分 / 下部分」
+     *
+     * 落点画在两条**之间的缝**上，所以一个插入点要让两行同时亮：
+     * 插在 k 和 k+1 中间时，k 的下半 + k+1 的上半一起亮；
+     * 插在最后一条之后时，只有最后那条的下半亮（下面没有行了）。
+     *
+     * @param index 行下标
+     * @param over  鼠标正悬停的那一行（`-1` = 没在拖 / 没有落点）
+     * @param after 鼠标悬停在这一行的下半部分
+     */
+    dropEdgeAt(index: number, over: number, after: boolean, side: 'before' | 'after'): boolean {
+      if (over < 0) return false;
+      if (side === 'after') return (over === index && after) || (over === index + 1 && !after);
+      return (over === index && !after) || (over === index - 1 && after);
+    },
+    // #endregion
+
     onItemsScroll(event: Event): void {
       if (!this.hasMore || this.loadingMore) return;
       const el = event.target as HTMLElement;
@@ -404,6 +659,7 @@ export default defineComponent({
   overflow-y: auto;
 }
 .mgr-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -417,6 +673,10 @@ export default defineComponent({
 }
 .mgr-row.sel {
   background: var(--panel-active);
+}
+/* 拖动排序：拖起来的那行淡一点，落点画在两条之间的缝上（见文件末尾 .drop-before/.drop-after） */
+.mgr-row.dragging {
+  opacity: 0.45;
 }
 .mgr-row.cur .mgr-row-name {
   font-weight: 600;
@@ -553,6 +813,7 @@ export default defineComponent({
   border-radius: 8px;
 }
 .mgr-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -568,6 +829,16 @@ export default defineComponent({
 }
 .mgr-item.playing {
   background: var(--panel-active);
+}
+/* 拖动排序（条目）：收藏行 `draggable` 为 false，光标也保持普通样式，别暗示能拖 */
+.mgr-item[draggable='true'] {
+  cursor: grab;
+}
+.mgr-item.dragging {
+  opacity: 0.45;
+}
+.mgr-item.locked {
+  cursor: default;
 }
 .mgr-item.playing .mgr-item-name {
   color: var(--accent-strong);
@@ -750,6 +1021,47 @@ export default defineComponent({
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/*
+ * 拖动排序的落点：**画在两条之间的缝上**
+ *
+ * 一个插入点要横跨相邻两行：上面那条的下部分 + 下面那条的上部分，各画一段
+ * 从缝往里渐隐的色带。两条贴在一起时，两段合成一条以缝为中心、两侧渐隐的宽线 —
+ * 眼睛看到的是「插在这里」，而不是「插在某一行的顶上」。
+ *
+ * 落在最后一条之后时只有它自己的下部分亮（下面没有行了），这条规则自动成立：
+ * 只有 `.drop-after`，没有下一行的 `.drop-before`。
+ */
+.mgr-row.drop-before::before,
+.mgr-row.drop-after::after,
+.mgr-item.drop-before::before,
+.mgr-item.drop-after::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 12px;
+  border-radius: 3px;
+  pointer-events: none;
+}
+.mgr-row.drop-before::before,
+.mgr-item.drop-before::before {
+  top: 0;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--accent) 55%, transparent),
+    transparent
+  );
+}
+.mgr-row.drop-after::after,
+.mgr-item.drop-after::after {
+  bottom: 0;
+  background: linear-gradient(
+    to top,
+    color-mix(in srgb, var(--accent) 55%, transparent),
+    transparent
+  );
 }
 
 /*

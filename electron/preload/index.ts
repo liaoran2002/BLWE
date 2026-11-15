@@ -26,6 +26,7 @@ import type {
   UserInfo,
 } from '@common/types/ipc'
 import type { RendererAPI, ScreenWorkArea } from '@common/types/api'
+import type { DataDirMode } from '@common/types/dataDir'
 import type { GetPlaylistDetailParams } from '@common/types/musicSdk'
 import type {
   PlaylistRecord,
@@ -145,9 +146,18 @@ const api = {
   /** 拖入歌单链接：导入（已有则同步）并设为当前 —— 会写库 */
   importMusicPlaylist: (url: string): Promise<IpcChannelMap['music:importPlaylist']['result']> =>
     rendererInvoke('music:importPlaylist', { url }),
-  /** 拖入单曲链接：追加进默认歌单并把它设为当前 —— 会写库 */
-  importMusicSong: (url: string): Promise<IpcChannelMap['music:importSong']['result']> =>
-    rendererInvoke('music:importSong', { url }),
+  /** 拖入单曲链接：追加进指定歌单（空 = 默认歌单）并把它设为当前 —— 会写库 */
+  importMusicSong: (
+    url: string,
+    playlistId?: string,
+  ): Promise<IpcChannelMap['music:importSong']['result']> =>
+    rendererInvoke('music:importSong', { url, playlistId }),
+  /** 把一整张歌单 / 一首单曲并进指定歌单（不新建） */
+  importMusicIntoPlaylist: (
+    playlistId: string,
+    url: string,
+  ): Promise<IpcChannelMap['music:importIntoPlaylist']['result']> =>
+    rendererInvoke('music:importIntoPlaylist', { playlistId, url }),
   // #endregion
 
   // #region 歌单 / 缓存
@@ -223,18 +233,20 @@ const api = {
     mode: VideoListSyncMode,
     intervalMs = 0,
   ): Promise<boolean> => rendererInvoke('videolists:setSyncMode', { id, mode, intervalMs }),
-  /** 拖入单条视频：放进默认列表（没有就现建），返回落点供播放 */
+  /** 拖入单条视频：放进指定列表（空 = 默认列表），返回落点供播放 */
   addVideoItemToDefault: (
     input: string,
+    listId?: string,
   ): Promise<IpcChannelMap['videolists:addItemToDefault']['result']> =>
-    rendererInvoke('videolists:addItemToDefault', { input }),
+    rendererInvoke('videolists:addItemToDefault', { input, listId }),
   /**
    * 拖入本地视频文件：登记 + 挂进默认列表，返回带 `url` 的条目供探针与起播
    */
   importLocalVideoFiles: (
     paths: string[],
+    listId?: string,
   ): Promise<IpcChannelMap['videolists:importLocal']['result']> =>
-    rendererInvoke('videolists:importLocal', { paths }),
+    rendererInvoke('videolists:importLocal', { paths, listId }),
   /**
    * 拖进来的 `File` → 真实磁盘路径
    *
@@ -259,6 +271,10 @@ const api = {
     rendererInvoke('videolists:loadMore', { id }),
   syncVideoList: (id: string): Promise<VideoListSyncResult> =>
     rendererInvoke('videolists:sync', { id }),
+  reorderVideoLists: (ids: string[]): Promise<boolean> =>
+    rendererInvoke('videolists:reorder', { ids }),
+  reorderVideoListItems: (id: string, bvids: string[]): Promise<boolean> =>
+    rendererInvoke('videolists:reorderItems', { id, bvids }),
   getVideoListItems: (id: string): Promise<VideoListItem[]> =>
     rendererInvoke('videolists:getItems', { id }),
 
@@ -310,6 +326,11 @@ const api = {
 
   // #region 应用
   openExternal: (url: string): Promise<boolean> => rendererInvoke('app:openExternal', { url }),
+  getDataDir: () => rendererInvoke('app:getDataDir'),
+  setDataDir: (choice: { mode: DataDirMode; customPath: string }) =>
+    rendererInvoke('app:setDataDir', choice),
+  pickDataDir: (): Promise<string | null> => rendererInvoke('app:pickDataDir'),
+  relaunchApp: (): Promise<void> => rendererInvoke('app:relaunch'),
   // #endregion
 
   // #region 壁纸

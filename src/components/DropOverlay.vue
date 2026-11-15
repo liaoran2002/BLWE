@@ -12,7 +12,40 @@
 -->
 <template>
   <div v-if="drop.dropActive" class="drop-overlay">
-    <div class="drop-card">
+    <!--
+      分栏：左边进默认列表、右边进当前列表
+
+      只在「当前在播的是本地列表 / 本地歌单，且不是默认那个」时出现
+      （判定在 `dropTargets` 里）。鼠标在哪半就高亮哪半 ——
+      遮罩本身 `pointer-events: none`，高亮靠 store 里 `dragover` 算出的 `dropHalf`。
+    -->
+    <template v-if="drop.dropTargets">
+      <!--
+        一条竖线把窗口分成两半，只有文字：鼠标在哪半，那半的名字亮起来，
+        另一半压暗。不做卡片 / 描边 / 缩放 —— 拖拽时眼睛只认「亮的那边」。
+      -->
+      <div class="drop-split">
+        <div class="drop-half" :class="{ on: drop.dropHalf === 'left' }">
+          <div class="drop-half-name">{{ drop.dropTargets.left.name }}</div>
+          <div class="drop-half-hint">默认</div>
+        </div>
+        <div class="drop-half" :class="{ on: drop.dropHalf === 'right' }">
+          <div class="drop-half-name">{{ drop.dropTargets.right.name }}</div>
+          <div class="drop-half-hint">当前</div>
+        </div>
+      </div>
+      <div class="drop-foot">
+        {{
+          drop.dropBusy
+            ? '正在导入…'
+            : drop.dropHalf
+              ? '松手导入到亮着的那一边'
+              : '左右两边是不同的落点，看准了再松手'
+        }}
+      </div>
+    </template>
+
+    <div v-else class="drop-card">
       <div class="drop-ring"></div>
       <div class="drop-title">
         {{ drop.dropBusy ? '正在导入…' : '松手即可导入并播放' }}
@@ -56,8 +89,10 @@ export default defineComponent({
   inset: 0;
   z-index: 3000;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 14px;
   /* 只做提示，绝不能吃掉鼠标事件（吃掉就收不到 drop 了） */
   pointer-events: none;
   background: rgba(0, 0, 0, 0.45);
@@ -97,5 +132,58 @@ export default defineComponent({
 .drop-sub {
   font-size: 12px;
   opacity: 0.75;
+}
+
+/* 分栏：整屏两半，中间一条竖线，两半各摆一组文字 */
+.drop-split {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: stretch;
+}
+.drop-half {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  user-select: none;
+  /* 没被指向的那半压暗：拖拽时只该有一个「亮的目标」 */
+  opacity: 0.35;
+  transition:
+    opacity 0.12s,
+    color 0.12s;
+}
+/* 竖线画在右半边的左边界上，自然贯穿整个窗口高度 */
+.drop-half + .drop-half {
+  border-left: 1px solid rgba(255, 255, 255, 0.45);
+}
+.drop-half.on {
+  opacity: 1;
+  color: var(--accent);
+}
+.drop-half-name {
+  font-size: 22px;
+  font-weight: 700;
+  max-width: 88%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drop-half-hint {
+  font-size: 12px;
+  opacity: 0.75;
+}
+.drop-foot {
+  position: absolute;
+  bottom: 40px;
+  font-size: 12px;
+  color: var(--glass-text);
+  opacity: 0.8;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.35);
 }
 </style>

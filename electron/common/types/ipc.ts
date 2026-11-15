@@ -110,6 +110,22 @@ export interface IpcChannelMap {
   // #region app
   /** 用系统默认浏览器打开链接（只允许 http/https），返回是否真的打开了 */
   'app:openExternal': { params: { url: string }; result: boolean }
+  /** 读「配置文件位置」这一项（当前目录 / 三种来源各自的路径 / 有没有手动选过） */
+  'app:getDataDir': { params: void; result: import('./dataDir').DataDirInfo }
+  /**
+   * 写入「配置文件位置」的选择
+   *
+   * **下一次启动才生效**（运行中换 userData 等于搬着开着的库跑）。
+   * 目录建不出来 / 不可写时直接回 `ok:false`，不写指针 —— 免得下次启动静默回退。
+   */
+  'app:setDataDir': {
+    params: { mode: import('./dataDir').DataDirMode; customPath: string }
+    result: { ok: boolean; error?: string }
+  }
+  /** 弹系统文件夹选择框；用户取消返回 null */
+  'app:pickDataDir': { params: void; result: string | null }
+  /** 重启应用（改完配置文件位置后用它生效） */
+  'app:relaunch': { params: void; result: void }
   // #endregion
 
   // #region 检查更新
@@ -310,8 +326,19 @@ export interface IpcChannelMap {
    * `index` 是它最终落在第几首（主进程顺手把播放位置写成它，
    * 渲染层拿这个 id 去 `onPlaylistSwitch` 就能从这一首起播）。
    */
+  /**
+   * 把一整张歌单 / 一首单曲并进**指定的本地歌单**
+   *
+   * 和 `music:importPlaylist`（导入成新歌单）不同：这条是「往已有歌单里加歌」，
+   * 拖到右半边「当前歌单」时走的就是它。
+   */
+  'music:importIntoPlaylist': {
+    params: { playlistId: string; url: string }
+    result: { added: number; duplicated: number; name: string; kind: 'song' | 'playlist' }
+  }
   'music:importSong': {
-    params: { url: string }
+    /** `playlistId` 为空 = 默认歌单；拖动导入时会传「当前歌单」的 id */
+    params: { url: string; playlistId?: string }
     result: {
       record: import('./playlist').PlaylistRecord
       index: number
@@ -422,7 +449,8 @@ export interface IpcChannelMap {
    * 渲染层不该知道。这里一次调用搞定，返回 `listId` 供它去播放。
    */
   'videolists:addItemToDefault': {
-    params: { input: string }
+    /** `listId` 为空 = 默认列表 */
+    params: { input: string; listId?: string }
     result: {
       listId: string
       listName: string
@@ -440,7 +468,8 @@ export interface IpcChannelMap {
    * 不该由它自己拼协议名 —— 协议名是主进程的实现细节。
    */
   'videolists:importLocal': {
-    params: { paths: string[] }
+    /** `listId` 为空 = 默认列表 */
+    params: { paths: string[]; listId?: string }
     result: {
       listId: string
       listName: string
@@ -469,6 +498,10 @@ export interface IpcChannelMap {
     params: { id: string }
     result: import('./playlist').VideoListSyncResult
   }
+  /** 左栏拖动排序（传完整顺序） */
+  'videolists:reorder': { params: { ids: string[] }; result: boolean }
+  /** 条目拖动排序（收藏条目由主进程锁在最前） */
+  'videolists:reorderItems': { params: { id: string; bvids: string[] }; result: boolean }
   /**
    * 取某个列表的条目（**已在库里，不联网**）
    *

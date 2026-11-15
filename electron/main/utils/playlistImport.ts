@@ -23,7 +23,12 @@ import { randomUUID } from 'node:crypto'
 import type { MusicImportPreview, PlaylistRecord, PlaylistSong } from '@common/types/playlist'
 import { isLocalPlaylistId, mergePlaylistSongs, playlistKey } from '@common/types/playlist'
 import { classifyMusicInput, resolvePlaylist, resolveSong } from '../music'
-import { appendSongToDefaultPlaylist, getPlaylists, savePlaylists, toPlaylistSongs } from './playlist'
+import {
+  appendSongToPlaylist,
+  getPlaylists,
+  savePlaylists,
+  toPlaylistSongs,
+} from './playlist'
 
 export const importMusicPlaylist = async (
   url: string,
@@ -98,14 +103,15 @@ export const importMusicPlaylist = async (
  * 的意图是「我想听这首」，不是「帮我建个歌单」—— 上次这么干的人
  * 会在歌单列表里攒出十几个只有一首歌的歌单。
  *
- * 默认歌单由 `appendSongToDefaultPlaylist` 保证存在（没有就现建、且删不掉），
+ * 目标是默认歌单时由 `ensureDefaultPlaylist` 保证存在（没有就现建、且删不掉），
  * 去重也在那边做（按 `songs.id` + `歌名-歌手` 两层，见那里的注释）。
  *
  * 返回的 `index` 就是要播的位置：主进程已经把它写进 `playback_state`
  * （`mv` + 默认歌单 id + 这个下标），渲染层拿 `record.id` 调 `onPlaylistSwitch`
  * 就会从这一首起播。
  */
-export const importSongToDefault = async (
+export const importSongTo = async (
+  playlistId: string,
   url: string,
 ): Promise<{ record: PlaylistRecord; index: number; added: boolean; songName: string }> => {
   const input = (url ?? '').trim()
@@ -115,11 +121,45 @@ export const importSongToDefault = async (
   const [parsed] = toPlaylistSongs([song])
   if (!parsed) throw new Error('这首歌的信息不完整（缺歌名），无法加入歌单')
 
-  const result = appendSongToDefaultPlaylist(parsed)
+  const result = appendSongToPlaylist(playlistId, parsed)
   console.log(
-    `[playlist] ${result.added ? '已加入' : '已存在'}《${parsed.name}》→ 默认歌单（第 ${result.index + 1} 首）`,
+    `[playlist] ${result.added ? '已加入' : '已存在'}《${parsed.name}》→《${result.record.name}》` +
+      `（第 ${result.index + 1} 首）`,
   )
   return { ...result, songName: parsed.name }
+}
+
+/** 旧名字（拖入单曲的老路）：落到默认歌单 */
+export const importSongToDefault = (
+  url: string,
+): ReturnType<typeof importSongTo> => importSongTo('', url)
+
+/**
+ * 把「一整张歌单 / 一首单曲」的链接**并进指定的本地歌单**
+ *
+ * 和 `importMusicPlaylist`（导入成一个**新**歌单）是两件事：
+ * 这里是「往我已有的歌单里加歌」，所以目标是 `playlistId`，去重规则不变。
+ * 目标必须是本地歌单 —— 平台歌单的曲目由平台决定，加了也会被下次同步冲掉。
+ */
+export const importMusicIntoPlaylist = async (
+  playlistId: string,
+  url: string,
+): Promise<{ added: number; duplicated: number; name: string; kind: 'song' | 'playlist' }> => {
+  const preview = await previewMusicImport(url)
+  if (preview.type === 'none') throw new Error('没认出这是什么链接')
+
+  if (preview.type === 'song') {
+    const result = appendSongToPlaylist(playlistId, preview.song)
+    return {
+      added: result.added ? 1 : 0,
+      duplicated: result.added ? 0 : 1,
+      name: result.record.name,
+      kind: 'song',
+    }
+  }
+
+  const result = addSongsToPlaylist(playlistId, preview.songs)
+  return { ...result, kind: 'playlist' }
 }
 
 /**

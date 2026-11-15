@@ -206,6 +206,59 @@ export const usePlaylistStore = defineStore('playlists', () => {
   }
 
   /**
+   * 拖动排序：歌单自己的顺序（左栏）
+   *
+   * 数组顺序**就是**顺序：`persist()` 全量覆盖时按下标写成 `sort_order`，
+   * 所以这里只挪数组、再存一次，不需要额外的接口。
+   */
+  const move = async (from: number, to: number): Promise<boolean> => {
+    const list = [...playlists.value]
+    if (
+      !Number.isInteger(from) ||
+      !Number.isInteger(to) ||
+      from < 0 ||
+      to < 0 ||
+      from >= list.length ||
+      to >= list.length ||
+      from === to
+    ) {
+      return false
+    }
+    const [item] = list.splice(from, 1)
+    list.splice(to, 0, item)
+    playlists.value = list
+    await persist()
+    return true
+  }
+
+  /**
+   * 拖动排序：某个歌单里的曲目
+   *
+   * 只允许**本地歌单** —— 平台歌单的曲目是远端的投影，排了下次同步就没。
+   */
+  const moveSong = async (playlistId: string, from: number, to: number): Promise<boolean> => {
+    if (!isLocalPlaylistId(playlistId)) return false
+    const target = playlists.value.find((p) => p.id === playlistId)
+    if (!target) return false
+    const songs = [...target.songs]
+    if (
+      !Number.isInteger(from) ||
+      !Number.isInteger(to) ||
+      from < 0 ||
+      to < 0 ||
+      from >= songs.length ||
+      to >= songs.length ||
+      from === to
+    ) {
+      return false
+    }
+    const [song] = songs.splice(from, 1)
+    songs.splice(to, 0, song)
+    await updatePlaylist(playlistId, { songs })
+    return true
+  }
+
+  /**
    * 把平台歌单转成本地歌单（**不可逆**）
    *
    * 主进程会换一个新 id（`pl_<uuid>`），所以这里要做三件事：
@@ -329,6 +382,8 @@ export const usePlaylistStore = defineStore('playlists', () => {
     convertToLocal,
     removePlaylist,
     setCurrent,
+    move,
+    moveSong,
     sync,
     syncAll,
     getStartupSyncIds,

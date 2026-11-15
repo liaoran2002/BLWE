@@ -284,13 +284,13 @@ return { info, songs, total, page, limit, source, id }
 
 | 表 / 视图 | 内容 |
 | :--- | :--- |
-| `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at）；**播放位置不在这里** |
+| `playlists` | 歌单（id / name / url / sync_mode / sync_interval_ms / last_sync_at / created_at / updated_at / **sort_order**）；**播放位置不在这里** |
 | `songs` | **歌曲实体，全局唯一**（id / name / singer / album / cover / duration）；**duration 存秒** |
 | `playlist_songs` | 歌单 ⨯ 歌曲的**成员关系 + 顺序**，PK `(playlist_id, ord)`，只有 `song_id` |
 | `song_videos` | **候选关系**：哪首歌的候选里有它 / 排第几 / 收藏没有；PK `(search_key, bvid)`；另有 `title_hl` 存带 `<em>` 的标题 |
 | `videos` | **视频实体 + 播放地址**，PK `bvid`，全局一份（同一个 bvid 被两首歌引用也只存一份 dash） |
 | `song_meta` | 每首歌的 `selected_bvid` + `search_login_state`，PK `search_key` |
-| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）；**播放位置不在这里** |
+| `videolists` | **某站视频列表**（`bv_fav_123` / `bv_season_789` / `bv_space_<mid>`）：kind（fav / season / series / **space**）/ source_id / mid / name / **item_count（远端总数）** / **loaded_page（已加载到第几页）** / **has_more（接口说还有下一页吗）** / **skipped_total（累计跳过的条目数）** / **sync_mode + sync_interval_ms**（和歌单同一套三档策略）/ **sort_order**；**播放位置不在这里** |
 | `playback_state` | **单行表**（`id` 恒为 1）：`source_kind`（`ov` / `mv`）+ `source_id` + `source_index`，回答「上次在播哪条线的哪个列表的第几条」。秒数不在这里 —— 在 `userData/last_position` 文件 |
 | `videolist_items` | 列表成员 + 顺序，PK `(list_id, ord)` |
 | `song_videos_view` | **视图**：把 `song_videos` ⨯ `videos` 还原成**旧 `videos` 的 15 列形状**（旧读路径一行不用改） |
@@ -571,15 +571,17 @@ lx 的 `my_list_music_info` 仍然**按歌单各存一份**（实测 684 行 / 6
 | 导出 | 作用 |
 | :--- | :--- |
 | `videoListIdOf(kind, sourceId)` | 列表主键：`bv_<kind>_<平台 id>`（重复导入命中同一行） |
-| `getVideoLists()` | 侧边栏用（按 `created_at` 排序，顺序必须稳定） |
+| `getVideoLists()` | 侧边栏用。按 `sort_order` 排（用户拖出来的）；老库这列全 0 → 退化成「本地列表优先 + `created_at`」 |
 | `findVideoList(id)` | 按 id 找一条（同步时要用 `kind` / `source_id` / `mid` 重打接口） |
 | `getVideoListItems(id)` | 条目（**纯读库，不联网**，LEFT JOIN `videos` 取标题封面） |
 | `addVideoList(kind, sourceId, mid)` | 拉取 + 落库（**一个事务**，见下） |
 | `syncVideoList(id)` | 重新同步 + 播放位置按 bvid 重定位 |
 | `removeVideoList(id)` | 删列表 + 条目关系（`videos` 实体留给 GC 判断，被别的列表引用的不动） |
-| `setVideoListIndex(id, index)` | 记录播到第几条 |
 | `ensureDefaultVideoList({create})` | 取「默认列表」：设置 → 最早的本地列表 → 新建（见下） |
-| `addItemToDefaultList(input)` | 拖入单条视频：加进默认列表并返回 `listId` 供播放 |
+| `addItemToList(listId, input)` | 拖入单条视频：加进**指定**列表（空 = 默认列表），返回 `listId` 供播放 |
+| `addLocalFilesTo(listId, paths)` | 拖入本地文件：登记 + 挂进指定列表（空 = 默认列表） |
+| `reorderVideoLists(ids)` | 左栏拖动排序：传完整顺序，按下标写 `sort_order` |
+| `reorderVideoListItems(listId, bvids)` | 条目拖动排序：**收藏条目无条件按原顺序提回最前**（前端也不给拖） |
 
 **平台列表是懒加载的（`item_count` 是远端口径）**：导入 / 拖入只拉**第 1 页**（收藏夹 40 条、合集系列 30 条），
 `loaded_page` 记已拉了几页，界面末尾一行「还有 N 条未加载 · 点击加载」，滚到底自动触发。
@@ -848,14 +850,16 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 > 正好破坏「退出时不闪一下」。
 
 
-### `portable.ts` —— 便携版数据目录
+### `portable.ts` —— 数据目录（userData）定位
 
-**职责**：判定数据目录 + 改写 `userData`。导出 `setupUserDataPath()` / `isPortable()`。
+**职责**：决定 userData 路径并改写它。导出 `setupUserDataPath()` / `isPortable()` /
+`getDataDirInfo()` / `setDataDir()`。
 
-**三条优先级规则**：
+**优先级（上优先于下）**：
 
 | 情况 | 用哪个目录 |
 | :--- | :--- |
+| 用户在「设置 → 数据 → 配置文件位置」里选过 | **听用户的**：`appdata` / `portable` / `custom` |
 | `%APPDATA%/BiLiWallpaperEngine` 里**已经有数据** | 就用它（安装版 / 便携版共用一份） |
 | 没有数据，且当前是便携版 | exe 同级的 **`blwedata/`**（`PORTABLE_DATA_DIR_NAME`） |
 | 没有数据，且是安装版 | 默认的 `%APPDATA%/BiLiWallpaperEngine` |
@@ -866,6 +870,25 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
 > （README 里曾写成 `-desktop`，那是**错的**，排查时按那个路径去找会**一无所获**。）
 >
 > 实际路径：`C:\Users\<用户>\AppData\Roaming\BiLiWallpaperEngine\blwe.db`
+
+**手动选择存哪**：`%APPDATA%/BLWE/data-dir.json`，内容 `{ mode, customPath }`。
+
+- **不能**放数据目录里：它要回答「数据目录是哪个」，存进去就是自指，
+  用户一换目录指针自己就被留在旧目录里，下次启动读不到。
+- **不能**放 exe 同级：安装版装在 `/Program Files` 时那里不可写。
+- 只在用户**真的改过**这一项时才创建 —— 纯绿色版用户不会在 APPDATA 留痕迹。
+
+**「自定义」会先归一化**（`resolveCustomDir`）：选中的文件夹名就是 `blwedata`，
+或者它里面已经有一个 `blwedata/` 子目录 → 用那个 `blwedata`；否则才把选中的目录当数据目录。
+这样「指着原来那份数据说我要用这个」能直接生效，而不是在旁边再造一个空目录；
+`setDataDir()` 与 `setupUserDataPath()` 都过这一步（指针被手改过也不会读错位置）。
+
+**改完不立刻生效**：`setupUserDataPath()` 只在启动时跑一次；运行中换 userData
+等于把开着的 SQLite 连接和已读进内存的配置一起搬家。所以 `setDataDir()` 只写指针，
+界面固定提示「重启生效」（用户点「立即重启」才 `app.relaunch()`）。
+
+**落盘前先 `mkdir` + `access(W_OK)`**：目录建不出来/不可写就当场回 `ok:false`，
+而不是写进指针、下次启动静默回退 —— 那会让用户以为「设置没保存」。
 
 **关键设计**：
 
@@ -878,6 +901,8 @@ relocateLocalVideo(bvid, newPath) → 只改 durl_url，**bvid 不变**
   便携版就会去 exe 同级再建一个空库 —— 用户看到的是「**歌单全没了**」。
 - **两个 `setPath` 都要改**（`appData` + `userData`）：只改 userData 的话，
   Electron 内部仍可能往 Roaming 里写东西。
+- **默认 userData 要在任何 `setPath` 之前抓一份**（`appdataDir`）：
+  设置界面要显示「APPDATA 是哪」，改过之后 `getPath` 就再也拿不到它了。
 
 ### `updater.ts` —— 在线更新（只检查 + 提示）
 
@@ -1277,7 +1302,7 @@ isVideoItem(item)   // 'title' in item
 | **`system.ts`** | SMTC、任务栏进度、托盘状态同步、播放位置落盘、定时同步 | 14 |
 | **`session.ts`** | 登录态、用户信息、扫码登录、退出确认 | 5 |
 | **`sleep.ts`** | 定时暂停 / 定时关闭（含每秒推的状态快照） | 4 |
-| **`drop.ts`** | 拖入导入：分类 → 四路分派（歌单 / 单曲 /某站列表 / 单条视频）→ 本地文件探针 | 12 |
+| **`drop.ts`** | 拖入导入：分类 → 四路分派（歌单 / 单曲 /某站列表 / 单条视频）→ 本地文件探针。**分栏落点**也在这里：`dropTargets` 算出左右两个目标（只在「当前在播的是本地列表/本地歌单且不是默认那个」时非空），`dropHalf` 记鼠标在哪半（`dragover` 里按 `clientX` 算，遮罩是 `pointer-events: none`，不能靠 hover）。四个 `document` 级处理器都要先放行**界面内的排序拖动**（`isInternalDrag`），且 `dragover` 不能写 `dropEffect`（会让排序的松手不派发 `drop`，见 `utils/dnd.ts`） | 12 |
 | **`bootstrap.ts`** | **不是 store**：`boot.attachVideo()` / `bootstrap()` / `teardown()` / `init()`，只做编排、不留状态 | 9 |
 | `constants.ts` | 缓冲 / 预热 / 卡顿 / 冷却的常量（playback 与 ui 共用） | — |
 | `setting.ts` | 配置的响应式副本（主进程那份是权威） | — |
@@ -1308,12 +1333,12 @@ queue 只回答「列表里有什么」。依赖方向因此是 `playback → qu
 | `VideoControls.vue` | 播放控制栏；`mode` 只影响文案（上一个视频 / 下一首）与「歌曲列表」按钮是否渲染；两个列表按钮的图标与名字**固定**，不随模式变；壁纸 / 锁定时整条 `wm-hidden` 也在这里判 |
 | `SettingsDialog.vue` | 设置弹窗（**左栏目录 + 右栏一页到底**） |
 | `SleepTimerPanel.vue` | 定时暂停弹窗（时长草稿 + 三个复选框，**只有确认才写回 store**） |
-| `ManagerDialog.vue` | **两个管理器共用的弹窗**（960 宽 / 内容区 62vh）：标题栏、左列表（含「默认」「本地」「平台」标签、正在播放圆点、同步中转圈）、右侧三态（表单 / 详情 / 空态）、搜索、**条目行**、空态、底部「新建 / 全部同步 / 换个管理器」。它不知道歌和视频的区别 —— 只认 `src/types/manager.ts` 里归一化过的数据；表单、详情头按钮、行尾按钮通过 `#form` / `#actions` / `#row-actions` 三个 slot 交给调用方。**样式不 scoped**，类名统一 `mgr-` 前缀，这样父组件写 `<div class="mgr-field">` 就能直接复用字段样式 |
+| `ManagerDialog.vue` | **两个管理器共用的弹窗**（960 宽 / 内容区 62vh）：标题栏、左列表（含「默认」「本地」「平台」标签、正在播放圆点、同步中转圈）、右侧三态（表单 / 详情 / 空态）、搜索、**条目行**、空态、底部「新建 / 全部同步 / 换个管理器」。**左栏与条目都支持拖动排序**（原生 HTML5 drag，不引第三方库）：左栏无条件可拖；条目要三项同时满足 —— `rowsReorderable`（父组件按「是不是本地的列表/歌单」传，平台的条目是远端投影，排了下次同步就没）、不在搜索状态（`filtered` 只是子集，下标对不上）、非收藏行（`locked` 既不能拖也不能当落点）。**落点画在两条之间的缝上**：悬停某行上半 = 插它前面、下半 = 插它后面，一个插入点让上面那条的下部分 + 下面那条的上部分一起亮，拖到末尾只有最后一条的下半亮。行级 drop 只覆盖「正好落在行上」，所以两个滚动容器（`.mgr-side-list` / `.mgr-items`）也挂上 dragover/drop，落在行下方的空白或「还有 N 条未加载」上算放到末尾。拖完只 `emit('reorder-lists' / 'reorder-rows', { from, to })`，`to` 是「先移出再插入」的下标（换算见 `resolveDropIndex`），存哪、怎么存由调用方决定。它不知道歌和视频的区别 —— 只认 `src/types/manager.ts` 里归一化过的数据；表单、详情头按钮、行尾按钮通过 `#form` / `#actions` / `#row-actions` 三个 slot 交给调用方。**样式不 scoped**，类名统一 `mgr-` 前缀，这样父组件写 `<div class="mgr-field">` 就能直接复用字段样式 |
 | `PlaylistManager.vue` | 歌单管理：只提供数据（`shellLists` / `shellDetail` / `shellRows`）与表单 —— 表单内容**原样**交给主进程、不做字段转换（见下）；**按歌单类型分流**（平台歌单只给同步方式 + 「转成本地歌单」，本地歌单给改名 + 链接导入器）；详情头按钮 `同步 · 编辑 · 从这里播放 · 删除`；**本地歌单的曲目行尾有「×」可删单条**（平台歌单不渲染，删除会走 `store.removeSongAt`，按**下标**删，正在播则重载队列）。UI 全部由 `ManagerDialog` 渲染，**没有自己的样式块** |
 | `VideoListManager.vue` | **视频管理**：只提供数据与表单/按钮。**「新建列表」一张表单收口四种来源**（空列表 / 粘贴链接 / 收藏夹 / 订阅合集，后两者是**封面网格**选片、选中高亮）；**同步方式三选一**（手动 / 启动时 / 定时 + 间隔），本地列表没有这一栏；详情头按钮 `同步（仅平台）· 编辑 · 添加视频（仅本地）· 从这里播放 · 删除`；**「添加视频」走 `VideoImportDialog` 先预览再落库**（单条是视频详情，合集/收藏夹是列表详情 + 每条视频）；行尾走 `#row-actions`：收藏（置顶）/ 定位 / 移除；**本地文件丢失的条目置灰 + 「文件丢失」标 + 「定位」重选路径**。样式只留视频独有的三块（行尾按钮、收藏夹/订阅封面网格、`<code>`） |
 | `VideoImportDialog.vue` | 「添加视频」确认框（贴链接 → 预览 → 确认落库）。预览只读，取消不留痕迹；确认后写的是**本地列表**（单条置顶、一批追加末尾），不涉及歌曲搜索 |
 | `SongVideoListDialog.vue` | 列表面板，两种形态按 `listType` 切换：`songList` 歌单（MV）/ `videoList` 视频列表（MV = 这首歌的备选，OV = 当前合集）；点一行 / 刷新 / 爱心 / 加号都直接调 store |
-| `DropOverlay.vue` | 拖入遮罩（整窗虚线框 + 「松手即可导入并播放」），`dropActive` / `dropBusy` 来自 store |
+| `DropOverlay.vue` | 拖入遮罩。平时是整窗虚线框 + 「松手即可导入并播放」；**分栏时**变成「中间一条竖线 + 左右两组文字」（左 = 默认列表、右 = 当前列表），鼠标在哪半那半亮、另一半压暗 —— 判定与高亮状态都在 store 里（`dropTargets` / `dropHalf`），因为遮罩本身 `pointer-events: none`，没法用 hover |
 | `AddVideoDialog.vue` | 「添加视频」弹窗（粘贴链接 → 解析 → 收藏） |
 | `AboutDialog.vue` | 关于弹窗：标题 / 描述 / 仓库链接 / **版本号 + 「检查更新」**（不显示指纹）/ 致谢 |
 | `PlaylistPanel.vue` | 左上角歌单入口 |
@@ -1485,6 +1510,7 @@ const addPlaylist = async (input: {
 | `videoQuality.ts` | 按解码分辨率兜底清晰度标签 |
 | `errorText.ts` | 把 `catch` 到的任意东西转成一行文案（`errMsg`）。两个管理器 + 添加视频弹窗共用 —— 以前这个方法在三个文件里各抄一份 |
 | `datetime.ts` | 时间显示（`formatSyncTime`：时间戳 → `2026-11-01 15:20`，空值 → 「从未」）。两个管理器的「上次同步」共用 |
+| `dnd.ts` | **排序拖动与「拖入导入」的分界线**：`markInternalDrag` 在 `dragstart` 往 `dataTransfer` 写自定义类型 `application/x-blwe-reorder`，`isInternalDrag` 在全局拖入的四个处理器里把它放行。用自定义类型而不是全局布尔：拖到一半源元素被重渲染、`dragend` 不来时，布尔会永久卡住「正在拖动」，之后外部拖入全被吞 |
 
 **`sleepTimer.ts` 的关键设计**：
 
