@@ -1580,27 +1580,25 @@ export const playbackActions: ThisType<PlaybackContext> = {
       this.seekAfterLoadFor = songName;
     }
   
-    // 交给 playCandidate 解析并起播：它顺手回填标题/封面/清晰度，地址过期会自动重取
-    await this.playCandidate(cachedBvid);
+    /**
+     * 交给 `playCandidate` 解析并起播：它顺手回填标题/封面/清晰度，地址过期会自动重取
+     *
+     * ★ 候选**随这次解析一起交给引擎**（`LoadOptions.candidates`）
+     *
+     * 以前是「等起播之后再往 `queueStore.videoList` 里塞」——界面这一份看着是对的，
+     * 但引擎那份 `current.candidates` 还空着（`playCandidate` 走的是「在当前这一条里
+     * 换 bvid」，候选沿用上一份）。于是用户点列表里另一个视频时，引擎又吐出一份空候选，
+     * `onEngineStream` 按「视频条目」的规则把 `videoList` 清空 —— 视频列表突然变空。
+     *
+     * 现在只有一份候选（引擎那份），起播时 `onEngineStream` 会自己铺到界面上。
+     */
+    await this.playCandidate(cachedBvid, { candidates });
     if (this.currentBvid === cachedBvid && (this.videoUrl || this.dashSource)) {
-      /**
-       * ★ 候选列表必须在**起播之后**铺
-       *
-       * `playCandidate` 走的是「在当前这一条里换 bvid」那条路，候选沿用
-       * `engine.current.candidates` —— 而刚启动时 `current` 还是 null，
-       * 于是 `onEngineStream` 收到的是空候选，按「视频条目」的规则把
-       * `videoList` 清空了。之前在这里（起播之前）赋值，正好被它冲掉，
-       * 结果续播后打开视频列表只有孤零零一条。
-       */
-      this.queueStore.videoList = candidates;
-      this.queueStore.videoListKeyword = songName;
-      this.queueStore.currentVideoIndex = candidates.findIndex((v) => v.bvid === cachedBvid);
-  
       // 记住的视频不在这轮搜索结果里 -> 补成列表第一项，别让「正在播的」在列表里找不到
       if (this.queueStore.currentVideoIndex < 0) {
         this.queueStore.videoList = [
           { bvid: cachedBvid, title: this.queueStore.videoName, pic: this.videoPic || null },
-          ...candidates,
+          ...this.queueStore.videoList,
         ];
         this.queueStore.currentVideoIndex = 0;
       }
@@ -1611,7 +1609,7 @@ export const playbackActions: ThisType<PlaybackContext> = {
     const first = candidates[0];
     if (!first || first.bvid === cachedBvid) return false;
     console.warn('[resume] 记住的视频已失效，改用搜索结果第一条', first.bvid);
-    await this.playCandidate(first.bvid);
+    await this.playCandidate(first.bvid, { candidates });
     return Boolean(this.videoUrl || this.dashSource);
   },
 

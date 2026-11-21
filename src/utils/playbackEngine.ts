@@ -74,6 +74,14 @@ export interface LoadOptions {
   qn?: number
   /** 指定音质 */
   audioId?: number
+  /**
+   * 这次解析的候选视频（歌才有）
+   *
+   * 只给「候选已经在调用方手里」的路径用 —— 目前就是续播：那边为了挑
+   * 「上次播的那个视频」本来就要搜一次，搜索结果直接带进来，引擎就不用
+   * 退回去吃 `current.candidates` 那份空的（见 `playCandidate` 里的说明）。
+   */
+  candidates?: BiliVideo[]
 }
 
 /**
@@ -189,8 +197,21 @@ export class PlaybackEngine {
   async playCandidate(bvid: string, options: LoadOptions = {}): Promise<boolean> {
     const item = this.current?.item ?? this.host.queue()[this.host.index()]
     if (!item) return false
+    /**
+     * 候选列表：这次调用可以带一份进来
+     *
+     * ★ 不带的话会掉进一个很隐蔽的坑：续播时调用方搜完直接把候选铺到界面上，
+     * 但引擎这边的 `current` 还是 null（刚启动）——于是这条流 `candidates` 为空，
+     * 界面记的是「有列表」、引擎记的是「没列表」。等用户点列表里另一个视频，
+     * 这里读到 `current.candidates` 还是空的，宿主的 `onStream` 就把界面那份
+     * 列表**清空**了：视频列表突然变空。
+     *
+     * 不从 `lastOptions` 透传：那个是「重新解析/降级」的默认参数，候选属于
+     * 这一次调用的入参，混进去会让下一次换源沿用别的歌的列表。
+     */
+    const { candidates: seeded, ...rest } = options
     const token = ++this.token
-    this.lastOptions = options
+    this.lastOptions = rest
     try {
       const cacheKey = isVideoItem(item) ? '' : toCacheKey(item)
       const res = await this.host.withNet(() =>
@@ -205,7 +226,7 @@ export class PlaybackEngine {
       )
       if (token !== this.token) return false
       this.throwIfBroken(bvid, res)
-      const candidates = this.current?.candidates ?? []
+      const candidates = seeded && seeded.length > 0 ? seeded : this.current?.candidates ?? []
       const picked = candidates.find((c) => c.bvid === bvid)
       const stream: ResolvedStream = {
         key: keyOf(item),
